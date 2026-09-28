@@ -554,22 +554,32 @@ input[type="checkbox"] {
   display: none;
 }
 
-/* The sign-in button. The widget does NOT replace or restyle this: the script
-   is loaded bare and Telegram.Login.auth drives the flow, so the button stays
-   ours to render. It used to carry the class tg-auth-button, which is the
-   legacy widget's hook for finding a button to bind itself to - naming it that
-   is how the widget took over the click and the login callback stopped
-   firing. */
+/* The sign-in button.
+ *
+ * These are the widget's own measurements, read off the button the widget drew
+ * when it was allowed to render one: #119AF5 on white, a 22px radius on a 44px
+ * height, 16px/600, flex-centred, 0 28px padding. There is no logo in it - the
+ * widget never drew one, it only kept our text and added a click ripple.
+ *
+ * So the old appearance is reproduced here rather than handed back to the
+ * widget. The script is loaded bare and Telegram.Login.auth drives the flow, so
+ * nothing can take the click away again. The class stays "login-button" and
+ * must not become "tg-auth-button": that name is the legacy widget's hook for
+ * finding a button to bind itself to, which is exactly what broke the login. */
 .login-button {
-  display: block;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   width: 100%;
-  min-height: 44px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--secondary);
-  color: var(--foreground);
-  font: inherit;
-  font-size: 14px;
+  height: 44px;
+  padding: 0 28px;
+  border: 0;
+  border-radius: 22px;
+  background: #119af5;
+  color: #fff;
+  font-family: -apple-system, system-ui, Roboto, Arial, sans-serif;
+  font-size: 16px;
+  font-weight: 600;
   cursor: pointer;
 }
 
@@ -579,7 +589,11 @@ input[type="checkbox"] {
 }
 
 .login-button:not(:disabled):hover {
-  background: var(--muted);
+  background: #0e8bdd;
+}
+
+.login-button:not(:disabled):active {
+  background: #0b7cc4;
 }
 
 /* --- message feed ---------------------------------------------------------- */

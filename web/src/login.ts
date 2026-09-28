@@ -134,7 +134,7 @@ export function mountLogin(root: HTMLElement, onOk: () => void): void {
   const button = h(
     "button",
     { class: "login-button", type: "button", disabled: true },
-    "Continue with Telegram",
+    "Sign in with Telegram",
   );
   button.disabled = true;
 
