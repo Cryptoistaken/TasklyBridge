@@ -638,6 +638,18 @@ func (s *adminServer) messages(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
+	// before is the "load older" cursor. It was documented, the page has always
+	// sent it, and the handler ignored it - so clicking "load more" refetched
+	// the same newest 50 messages for ever and the list never grew. An
+	// unparseable cursor is treated as absent rather than as an error, so a
+	// stale bookmark shows the newest page instead of nothing.
+	var before time.Time
+	if v := r.URL.Query().Get("before"); v != "" {
+		if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+			before = t
+		}
+	}
+
 	// The transcript is the audit file, not the messages table. Nothing has
 	// ever inserted into that table, so this endpoint returned an empty list on
 	// every call and the page has been blank since it was built - while the
@@ -645,7 +657,7 @@ func (s *adminServer) messages(w http.ResponseWriter, r *http.Request) {
 	// whole time.
 	items := []map[string]any{}
 	if s.audit != nil {
-		if got := s.audit.recent(limit); got != nil {
+		if got := s.audit.recent(limit, before); got != nil {
 			items = got
 		}
 	}

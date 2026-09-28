@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -78,10 +77,15 @@ func newAudit(dir string) *audit {
 // so it has been empty since it was built. The transcript that does exist is
 // this file, written on every one of the four legs, so that is what it reads.
 //
+// before is the "load older" cursor. It is compared against the emitted `at`,
+// which carries milliseconds precisely so that two events logged in the same
+// second still get distinct cursors; truncating to whole seconds would make the
+// page either repeat or skip a pair of them.
+//
 // The whole file is scanned. It is one file per process start, so the cost
 // grows with uptime rather than with traffic, and this is an admin page: it
 // would need an index only if a process were left running for months.
-func (a *audit) recent(n int) []map[string]any {
+func (a *audit) recent(n int, before time.Time) []map[string]any {
 	if a == nil || a.path == "" || n <= 0 {
 		return nil
 	}
@@ -94,10 +98,12 @@ func (a *audit) recent(n int) []map[string]any {
 	// The date lives in the filename; each line only carries the time.
 	day := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(a.path), auditPrefix), ".jsonl")
 
-	// Read the tail only. A line that is still being appended to can be
-	// truncated, and a partial line must not take the page down with it.
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	// The tail is trimmed AFTER the cursor filter, not before. Trimming first
+	// keeps the newest n events overall, so a cursor that points past them
+	// matches nothing and "load older" returns an empty page forever. What has
+	// to be held is the newest n events that are older than the cursor.
 	all := make([]event, 0, n+1)
 	for sc.Scan() {
 		line := sc.Bytes()
@@ -108,6 +114,14 @@ func (a *audit) recent(n int) []map[string]any {
 		if json.Unmarshal(line, &ev) != nil {
 			continue // a torn line must not break the page
 		}
+		// Strictly older than the cursor. Equal would repeat the cursor's own
+		// message on every click and the list would never advance.
+		if !before.IsZero() {
+			t, err := time.Parse(time.RFC3339Nano, auditTimestamp(day, ev.Time))
+			if err == nil && !t.Before(before) {
+				continue
+			}
+		}
 		all = append(all, ev)
 		if len(all) > n {
 			all = all[1:]
@@ -117,28 +131,28 @@ func (a *audit) recent(n int) []map[string]any {
 	out := make([]map[string]any, 0, len(all))
 	for i := len(all) - 1; i >= 0; i-- {
 		ev := all[i]
-		// Keep the id unique within the file: two events can share a timestamp.
+		at := auditTimestamp(day, ev.Time)
+		// The id is unique within the file: two events can share a timestamp.
 		out = append(out, map[string]any{
-			"id":         ev.Time + "-" + strconv.Itoa(i),
+			"id":         at + "-" + ev.Time,
 			"account_id": sessionAccountID(),
 			"user_id":    ev.UserID,
 			"leg":        ev.Leg,
 			"direction":  directionOf(ev.Leg),
 			"text":       ev.Text,
 			"buttons":    []string{},
-			"at":         auditTimestamp(day, ev.Time),
+			"at":         at,
 		})
 	}
 	return out
 }
 
-// auditTimestamp joins the filename's date to the line's time in the same shape
-// the page's Date parser expects, which is what the messages table used to
-// return: 2026-09-28T13:17:41Z.
+// auditTimestamp joins the filename's date to the line's time, in the shape the
+// page's Date parser expects: 2026-09-28T13:17:41.469Z.
+//
+// Milliseconds are kept because `at` doubles as the pagination cursor, and two
+// events in the same second would otherwise be indistinguishable to `?before=`.
 func auditTimestamp(day, clock string) string {
-	if len(clock) >= 8 {
-		clock = clock[:8] // drop the milliseconds
-	}
 	if day == "" {
 		return clock
 	}
