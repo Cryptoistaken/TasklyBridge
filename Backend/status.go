@@ -73,8 +73,12 @@ func runStatus() error {
 	fmt.Println("Database")
 	// Split by write volume: the critical store holds what is hard to
 	// recreate, the log store takes the constant stream of transcripts.
-	reportStore("critical (Neon)", getenv("DATABASE_URL"))
-	reportStore("logs (high volume)", getenv("LOGS_DATABASE_URL"))
+	//
+	// The labels come from the same constants -migrate prints. They used to be
+	// written out again here, which is how "critical (Neon)" came to be
+	// reported in production while the service was pointed at Railway Postgres.
+	reportStore(storeCritical, getenv("DATABASE_URL"))
+	reportStore(storeLogs, getenv("LOGS_DATABASE_URL"))
 	return nil
 }
 

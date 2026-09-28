@@ -156,7 +156,12 @@ func openDB(dsn string) (*sql.DB, error) {
 
 // storeNames are the labels used in status output.
 const (
-	storeCritical = "critical (Neon)"
+	// Labels name the role, never the vendor. This one used to say
+	// "critical (Neon)" and reported Neon in production while the service was
+	// pointed at Railway Postgres the whole time, so the command whose job is
+	// to state what is configured was confidently wrong. The host is printed
+	// from the DSN on the next line anyway.
+	storeCritical = "critical"
 	storeLogs     = "logs (high volume)"
 )
 
