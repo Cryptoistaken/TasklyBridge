@@ -1,6 +1,49 @@
 // Typed client for the admin API. Every type mirrors docs/api.md exactly.
 // Nothing here invents a field the contract has not agreed on.
 
+export interface OverviewAccounts {
+  total: number;
+  connected: number;
+  degraded: number;
+  banned: number;
+  dead: number;
+}
+
+export interface OverviewUsers {
+  total: number;
+  joined: number;
+  waiting: number;
+}
+
+export interface OverviewTask {
+  available: boolean;
+  name: string;
+  sell_bdt: number;
+  /** The provider's price in dollars. Read it only when cost_known is true. */
+  provider_cost: number;
+  /** False when the price watcher has no snapshot yet. Not the same as zero. */
+  cost_known: boolean;
+  margin_bdt: number;
+  /** False when the cost is unknown, or no bdt_rate is configured to convert it. */
+  margin_known: boolean;
+  selling_at_loss: boolean;
+}
+
+export interface Overview {
+  accounts: OverviewAccounts;
+  users: OverviewUsers;
+  task: OverviewTask;
+  balance_total: number;
+  alerts_unread: number;
+  withdraw_dry_run: boolean;
+  last_checked: string;
+}
+
+export interface List<T> {
+  items: T[];
+  total: number;
+}
+
 export type AccountState = "free" | "connected" | "degraded" | "banned" | "dead";
 
 export interface Account {
@@ -45,6 +88,10 @@ export interface Task {
   /** False when the cost is unknown, or no bdt_rate is configured to convert it. */
   margin_known: boolean;
   hidden: string[];
+}
+
+export interface TaskList extends List<Task> {
+  bdt_rate: number;
 }
 
 // A stored Telegram session. `bytes` is the size of the credential blob;
@@ -134,16 +181,6 @@ export interface Terms {
   source: string;
 }
 
-export interface Preview {
-  dry_run: boolean;
-  fee: number;
-  minimum: number;
-  net: number;
-  fee_heavy: boolean;
-  balance: number;
-  warnings: string[];
-}
-
 export interface Settings {
   bound_user_id: number;
   admin_ids: number[];
@@ -155,59 +192,11 @@ export interface Settings {
   audit_retained_days: number;
 }
 
-export interface OverviewAccounts {
-  total: number;
-  connected: number;
-  degraded: number;
-  banned: number;
-  dead: number;
-}
-
-export interface OverviewUsers {
-  total: number;
-  joined: number;
-  waiting: number;
-}
-
-export interface OverviewTask {
-  available: boolean;
-  name: string;
-  sell_bdt: number;
-  /** The provider's price in dollars. Read it only when cost_known is true. */
-  provider_cost: number;
-  /** False when the price watcher has no snapshot yet. Not the same as zero. */
-  cost_known: boolean;
-  margin_bdt: number;
-  /** False when the cost is unknown, or no bdt_rate is configured to convert it. */
-  margin_known: boolean;
-  selling_at_loss: boolean;
-}
-
-export interface Overview {
-  accounts: OverviewAccounts;
-  users: OverviewUsers;
-  task: OverviewTask;
-  balance_total: number;
-  alerts_unread: number;
-  withdraw_dry_run: boolean;
-  last_checked: string;
-}
-
-export interface List<T> {
-  items: T[];
-  total: number;
-}
-
-export interface TaskList extends List<Task> {
-  bdt_rate: number;
-}
-
 // SSE payloads, /api/events. Each is a partial record: the contract shows a
 // subset of fields per event, so the dashboard fills the rest at render time.
 export type SseMessage = Partial<Message> & Pick<Message, "account_id" | "leg" | "text" | "at">;
 export type SseAccount = Partial<Account> & Pick<Account, "id" | "state">;
 export type SseAlert = Partial<Alert> & Pick<Alert, "level" | "kind" | "message">;
-export type SseWithdrawal = Partial<Withdrawal> & Pick<Withdrawal, "id" | "status">;
 
 export class ApiError extends Error {
   constructor(
@@ -243,9 +232,7 @@ export async function api<T>(method: string, path: string, body?: unknown): Prom
     throw new ApiError("Cannot reach the server. Is the Go backend running?", 0);
   }
 
-  // 401 means exactly one thing in this API: not authenticated. A rejected
-  // login code or 2FA password is 403 (docs/api.md), so this never fires for
-  // those and there is no opt-out to remember.
+  // 401 means exactly one thing in this API: not authenticated.
   if (res.status === 401) {
     onUnauthorized?.();
     throw new ApiError("unauthorized", 401);
@@ -271,15 +258,4 @@ export async function api<T>(method: string, path: string, body?: unknown): Prom
 export const get = <T>(path: string): Promise<T> => api<T>("GET", path);
 export const post = <T>(path: string, body?: unknown): Promise<T> => api<T>("POST", path, body);
 export const put = <T>(path: string, body: unknown): Promise<T> => api<T>("PUT", path, body);
-
-// The boot request doubles as the auth probe. Handing its result to the
-// Overview page saves one round trip on every page load.
-let pendingOverview: Overview | null = null;
-export function stashOverview(o: Overview): void {
-  pendingOverview = o;
-}
-export function takeOverview(): Overview | null {
-  const o = pendingOverview;
-  pendingOverview = null;
-  return o;
-}
+export const del = <T>(path: string): Promise<T> => api<T>("DELETE", path);
