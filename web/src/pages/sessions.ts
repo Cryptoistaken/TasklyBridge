@@ -7,7 +7,7 @@
 // attempt id is held, in memory, because it has to survive the re-render
 // between steps.
 
-import { ApiError, api, get, takeOverview, type List, type Session, type SessionCreate, type SessionDelete } from "../api";
+import { ApiError, api, get, takeOverview, type Session, type SessionCreate, type SessionDelete, type SessionList } from "../api";
 import {
   chip,
   dot,
@@ -21,12 +21,13 @@ import {
   subRow,
   table,
   td,
+  usd,
   when,
   wrapTable,
   type Page,
 } from "../ui";
 
-const COLUMNS = 6;
+const COLUMNS = 7;
 // Deleting logs the account out, so the second click has to be a deliberate
 // one: a fast double-click lands inside this window and does nothing.
 const ARM_DELAY = 750;
@@ -51,6 +52,10 @@ let input: HTMLInputElement | null = null;
 let btn: HTMLButtonElement | null = null;
 
 let items: Session[] = [];
+// The server's own total, rendered as sent. A total built on an unread
+// balance is never presented as complete.
+let totalBalance = 0;
+let balanceKnown = true;
 
 // Delete: the first click arms a row, the second confirms it. Held here, in
 // memory only, like everything else on this page.
@@ -82,6 +87,11 @@ function stateChip(s: Session): HTMLElement {
   return h("span", { class: "chip " + (tone === "ok" ? "" : tone) }, dot(tone), s.state);
 }
 
+/** An unknown balance is "unread", never a confident $0.0000. */
+function balanceCell(s: Session): HTMLElement {
+  return s.balance_known ? h("span", { class: "mono" }, usd(s.balance)) : h("span", { class: "mono muted" }, "unread");
+}
+
 function deleteWarning(s: Session): string {
   const cost =
     "The account will have to be signed in again, and the service will need a new session created.";
@@ -99,6 +109,7 @@ function row(s: Session): HTMLTableRowElement[] {
     { "data-id": s.id },
     td(s.phone || "—", "mono nowrap"),
     td(stateChip(s)),
+    td(balanceCell(s), "num"),
     td(fmtBytes(s.bytes), "num mono"),
     td(when(s.updated_at), "mono nowrap muted"),
     td(idle ? chip("not in use", "bad") : h("span", { class: "chip" }, dot("ok"), "in use")),
@@ -131,6 +142,7 @@ function renderList(): void {
         [
           { label: "Phone" },
           { label: "State" },
+          { label: "Balance", num: true },
           { label: "Size", num: true },
           { label: "Updated" },
           { label: "In use" },
@@ -151,13 +163,21 @@ function renderStats(): void {
       { label: "Stored", value: String(items.length) },
       { label: "In use", value: String(items.length - idle) },
       { label: "Not in use", value: String(idle), bad: idle > 0, sub: "stored, but idle — a trap" },
+      {
+        label: "Total balance",
+        value: usd(totalBalance),
+        bad: !balanceKnown,
+        sub: balanceKnown ? "as the server reported it" : "incomplete — at least one balance is unread",
+      },
     ]),
   );
 }
 
 async function refresh(): Promise<void> {
-  const list = await get<List<Session>>("/api/sessions");
+  const list = await get<SessionList>("/api/sessions");
   items = list.items;
+  totalBalance = list.total_balance;
+  balanceKnown = list.balance_known;
   renderStats();
   renderList();
 }
@@ -445,6 +465,8 @@ export const sessions: Page = {
     input = null;
     btn = null;
     items = [];
+    totalBalance = 0;
+    balanceKnown = true;
     armed = null;
     armedAt = 0;
     deleting = false;

@@ -547,6 +547,32 @@ input[type="checkbox"] {
   margin-top: 6px;
 }
 
+/* The Telegram widget replaces this button's contents and styles it itself, so
+   these rules only cover the moment before the script arrives and the state
+   after it fails. Keeping them on the tokens means the pre-load button is not
+   a white box on a black page. */
+.tg-auth-button {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--secondary);
+  color: var(--foreground);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.tg-auth-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.tg-auth-button:not(:disabled):hover {
+  background: var(--muted);
+}
+
 /* --- message feed ---------------------------------------------------------- */
 
 .feed {

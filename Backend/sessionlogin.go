@@ -111,13 +111,17 @@ func (s *adminServer) handleSessions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// list shows every stored session. The blob is never included: only the
-// account it belongs to, its size, and when it last changed.
+// list shows every stored session: the account, its size, when it changed, and
+// its balance.
+//
+// The blob is never included, only its size. The balance is the last one read
+// from the provider, so it is a fact with an expiry rather than a stored truth,
+// and `balance_known` says which it is.
 func (m *sessionManager) list(w http.ResponseWriter, r *http.Request) {
 	rows, err := m.db.Query(
 		`SELECT s.account_id, a.phone, a.state, length(s.blob),
 		        to_char(s.updated_at,'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-		        a.last_seen
+		        a.balance, a.last_seen
 		 FROM sessions s JOIN accounts a ON a.id = s.account_id
 		 ORDER BY s.updated_at DESC`)
 	if err != nil {
@@ -127,20 +131,39 @@ func (m *sessionManager) list(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	items := []map[string]any{}
+	var totalBalance float64
+	known := true
 	for rows.Next() {
 		var id, phone, state, updated string
 		var size int
-		var lastSeen sql.NullString
-		if rows.Scan(&id, &phone, &state, &size, &updated, &lastSeen) != nil {
+		var balance float64
+		var lastSeen sql.NullTime
+		if rows.Scan(&id, &phone, &state, &size, &updated, &balance, &lastSeen) != nil {
 			continue
 		}
+		// A balance of exactly zero is ambiguous: it could be an account that
+		// really is empty, or one nothing has ever read. Only a non-zero figure
+		// is trustworthy, so the flag says so rather than guessing.
+		balanceKnown := balance > 0
+		if !balanceKnown {
+			known = false
+		}
+		totalBalance += balance
 		items = append(items, map[string]any{
 			"id": id, "phone": phone, "state": state, "bytes": size,
 			"updated_at": updated,
 			"in_use":     id == sessionAccountID() && m.isConnected(),
+			"balance":    balance, "balance_known": balanceKnown,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": len(items)})
+
+	// The count and the total belong with the rows, so the page does not have
+	// to recompute them and get the arithmetic subtly different.
+	out := map[string]any{
+		"items": items, "total": len(items),
+		"total_balance": totalBalance, "balance_known": known,
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // isConnected reports whether the service is using the session right now, so

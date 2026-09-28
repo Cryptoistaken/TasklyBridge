@@ -1,66 +1,72 @@
-// Sign-in: the Telegram Login Widget, and nothing else.
+// Sign-in: the official Telegram Login Widget, and nothing else.
 //
-// There is no password field. A shared password on a panel that can move money
-// is the weakest link in the chain, and this panel can withdraw. The widget
-// proves identity to Telegram and Telegram proves it to us, so there is no
-// secret of ours to leak, share, or forget to rotate.
+// The widget script is loaded the way Telegram documents it, with
+// data-client-id, data-onauth and a button carrying the tg-auth-button class.
+// Telegram then renders and owns its own button, so the branding and the
+// in-Telegram experience are the real thing rather than a lookalike.
 //
-// Flow, matching the implementation in C:\Studio\Tools\SheetSubmit:
-//   1. fetch the client id from the backend
-//   2. load https://oauth.telegram.org/js/telegram-login.js
-//   3. Telegram.Login.auth({client_id, scope}, callback) hands back an id_token
-//   4. POST it to the backend, which verifies the signature against Telegram's
-//      JWKS before issuing a session cookie
+// Two deliberate choices:
 //
-// The id_token is never stored, never logged, and never persisted. It is
-// handed straight to the backend and forgotten.
+//   - data-request-access is "read", not "write". The panel only needs to know
+//     who is signing in. Requesting write access would let this page act as the
+//     user, which is not something a dashboard that can move money should ask
+//     for.
+//   - there is no password. A shared password on a panel that can withdraw is
+//     the weakest link in the chain, and this way there is no secret of ours to
+//     leak, share, or forget to rotate.
+//
+// The id_token is handed straight to the backend and forgotten: never stored,
+// never logged, never put in a URL.
 
 import { h } from "./ui";
 
 const WIDGET_SRC = "https://oauth.telegram.org/js/telegram-login.js";
-const AUTH_TIMEOUT_MS = 120_000;
 
+// The widget's data-onauth attribute names a global, so the callback has to
+// exist on window rather than being a closure.
 declare global {
   interface Window {
-    Telegram?: {
-      Login?: {
-        auth: (
-          options: { client_id: number; scope: string[] },
-          callback: (data: { id_token?: string; error?: string }) => void,
-        ) => void;
-        init?: (
-          options: { client_id: number; scope: string[] },
-          callback: (data: { id_token?: string; error?: string }) => void,
-        ) => void;
-        open?: (
-          callback: (data: { id_token?: string; error?: string }) => void,
-        ) => void;
-      };
-    };
+    onTelegramAuth?: (data: { id_token?: string; error?: string }) => void;
   }
 }
 
-function loadWidget(): Promise<boolean> {
-  // Telegram's own script may already be present when the page is opened from
-  // inside the Telegram app, in which case re-adding it is pointless.
-  if (window.Telegram?.Login) return Promise.resolve(true);
+let scriptLoading: Promise<boolean> | null = null;
 
-  return new Promise((resolve) => {
+function loadWidget(clientId: string): Promise<boolean> {
+  // The script must exist before the widget can bind, and it must not be added
+  // twice: a second copy would leave two widgets fighting over the click.
+  if (scriptLoading) return scriptLoading;
+
+  scriptLoading = new Promise((resolve) => {
     const s = document.createElement("script");
     s.src = WIDGET_SRC;
     s.async = true;
-    s.onload = () => resolve(Boolean(window.Telegram?.Login));
+    s.dataset.clientId = clientId;
+    s.dataset.onauth = "onTelegramAuth";
+    s.dataset.requestAccess = "read";
+    s.onload = () => resolve(true);
     s.onerror = () => resolve(false);
     document.head.appendChild(s);
   });
+  return scriptLoading;
 }
 
 export function mountLogin(root: HTMLElement, onOk: () => void): void {
+  // A previous mount may have left a callback behind. Clearing it first means a
+  // stale token can never be posted by a page that has already gone.
+  delete window.onTelegramAuth;
+
   const status = h("p", { class: "muted small" });
   const err = h("p", { class: "warn small", role: "alert" });
   err.hidden = true;
 
-  const button = h("button", { class: "btn primary", type: "button" }, "Sign in with Telegram") as HTMLButtonElement;
+  // Telegram looks for this class and replaces the button's contents with its
+  // own. Until the script arrives it is an ordinary disabled button.
+  const button = h(
+    "button",
+    { class: "tg-auth-button", "data-style": "shine", type: "button", disabled: true },
+    "Sign in with Telegram",
+  );
   button.disabled = true;
 
   const card = h("div", { class: "card login-card" },
@@ -73,74 +79,11 @@ export function mountLogin(root: HTMLElement, onOk: () => void): void {
   root.replaceChildren(card);
 
   function fail(message: string): void {
-    button.disabled = false;
     err.textContent = message;
     err.hidden = false;
   }
 
-  async function signIn(): Promise<void> {
-    button.disabled = true;
-    err.hidden = true;
-    status.textContent = "Opening Telegram...";
-
-    // The client id is public: it names the application, not a user.
-    let clientId: number;
-    try {
-      const res = await fetch("/api/auth/telegram/config");
-      if (!res.ok) throw new Error("login is not configured on the server");
-      const body = (await res.json()) as { clientId?: string | number };
-      clientId = Number(body.clientId);
-      if (!Number.isSafeInteger(clientId) || clientId <= 0) {
-        throw new Error("the server returned an invalid client id");
-      }
-    } catch (e) {
-      fail(e instanceof Error ? e.message : "Could not reach the sign-in service.");
-      return;
-    }
-
-    if (!(await loadWidget())) {
-      fail("Telegram sign-in could not be loaded. Check your connection.");
-      return;
-    }
-
-    const widget = window.Telegram?.Login;
-    if (!widget) {
-      fail("Telegram sign-in is unavailable right now.");
-      return;
-    }
-
-    status.textContent = "Waiting for Telegram...";
-
-    let idToken: string;
-    try {
-      idToken = await new Promise<string>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("Sign-in timed out.")), AUTH_TIMEOUT_MS);
-        const done = (data: { id_token?: string; error?: string }) => {
-          clearTimeout(timer);
-          if (data?.error) return reject(new Error(String(data.error)));
-          if (!data?.id_token) return reject(new Error("Telegram returned no token."));
-          resolve(data.id_token);
-        };
-        try {
-          const options = { client_id: clientId, scope: ["profile", "phone"] };
-          if (widget.auth) widget.auth(options, done);
-          else if (widget.init && widget.open) {
-            widget.init(options, done);
-            widget.open(done);
-          } else {
-            reject(new Error("Telegram sign-in is unavailable right now."));
-          }
-        } catch (e) {
-          clearTimeout(timer);
-          reject(e instanceof Error ? e : new Error(String(e)));
-        }
-      });
-    } catch (e) {
-      fail(e instanceof Error ? e.message : "Sign-in failed.");
-      status.textContent = "";
-      return;
-    }
-
+  async function exchange(idToken: string): Promise<void> {
     status.textContent = "Checking with the server...";
 
     let res: Response;
@@ -151,19 +94,15 @@ export function mountLogin(root: HTMLElement, onOk: () => void): void {
         body: JSON.stringify({ id_token: idToken }),
       });
     } catch {
-      fail("Could not reach the server.");
       status.textContent = "";
+      fail("Could not reach the server.");
       return;
     }
-
-    // The token is not kept past this point regardless of the outcome.
-    idToken = "";
 
     if (res.ok) {
       onOk();
       return;
     }
-
     status.textContent = "";
     const body = (await res.json().catch(() => ({}))) as { error?: string; name?: string };
     if (res.status === 403) {
@@ -173,21 +112,38 @@ export function mountLogin(root: HTMLElement, onOk: () => void): void {
     fail(body.error || body.name || "Sign-in failed.");
   }
 
-  button.addEventListener("click", () => void signIn());
+  window.onTelegramAuth = (data) => {
+    if (data?.error) {
+      err.hidden = false;
+      err.textContent = String(data.error);
+      status.textContent = "";
+      return;
+    }
+    const idToken = data?.id_token;
+    if (!idToken) {
+      fail("Telegram returned no token.");
+      return;
+    }
+    void exchange(idToken);
+  };
 
-  // Warm the widget up so the button is ready to use.
-  void (async () => {
+  // The client id is public: it names the application, not a user.
+  (async () => {
     try {
       const res = await fetch("/api/auth/telegram/config");
       if (!res.ok) throw new Error("not configured");
       const body = (await res.json()) as { clientId?: string | number };
-      if (!Number.isSafeInteger(Number(body.clientId))) throw new Error("no client id");
-      if (await loadWidget()) {
-        button.disabled = false;
-        status.textContent = "";
-      } else {
+      const clientId = String(body.clientId ?? "").trim();
+      if (!clientId) throw new Error("no client id");
+
+      status.textContent = "";
+      if (!(await loadWidget(clientId))) {
         fail("Telegram sign-in could not be loaded. Check your connection.");
+        return;
       }
+      // The widget binds by looking for the button, so it is enabled once the
+      // script is in place. Telegram replaces its label on first click.
+      button.disabled = false;
     } catch {
       fail("Sign-in is not configured on the server.");
     }

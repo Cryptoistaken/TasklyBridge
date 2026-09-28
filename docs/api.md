@@ -179,16 +179,27 @@ upload: a new account has no session file, so the whole sign-in happens here.
       "state": "connected",
       "bytes": 4197,
       "updated_at": "2026-09-28T14:05:44Z",
-      "in_use": true
+      "in_use": true,
+      "balance": 0.375,
+      "balance_known": true
     }
   ],
-  "total": 1
+  "total": 1,
+  "total_balance": 0.375,
+  "balance_known": true
 }
 ```
 
 `in_use` is true when the service is actually connected with that session, not
 merely when a row exists. `bytes` is the size of the credential blob; **the
 blob itself is never returned**.
+
+`balance` is the last figure read from the provider, so it is a fact with an
+expiry rather than a stored truth. `balance_known` is **false** when the balance
+is zero, because a zero is ambiguous: it could be an account that really is
+empty, or one nothing has ever read. `total_balance` and the top-level
+`balance_known` are provided so a page shows the count, the per-account balances
+and the total without recomputing any of it.
 
 #### `POST /api/sessions`
 
@@ -244,6 +255,115 @@ and say plainly when the session being removed is the one currently in use.
 admin session without having to inspect the body. An earlier draft of this
 document used `401` for both, which made a wrong code indistinguishable from an
 expired cookie and would have logged an admin out mid-task.
+
+### `POST /api/withdrawals`
+
+One endpoint, two behaviours, chosen by `confirm`. The same call previews or
+executes, so the numbers an operator approves are the numbers that are used.
+
+```json
+{
+  "account_ids": ["primary"],
+  "wallet": "0x...",
+  "amounts": { "primary": 0.375 },
+  "confirm": false
+}
+```
+
+Balances and the provider's fee and minimum are **read live** for every call, so
+a preview is never built on a stored number. Nothing is sent beyond reading.
+
+**Preview** (`confirm` false, or omitted):
+
+```json
+{
+  "dry_run": true,
+  "preview": {
+    "wallet": "0x...",
+    "method": "USDT (BEP-20)",
+    "network": "BSC",
+    "fee": 0.025,
+    "minimum": 0.2,
+    "lines": [
+      {
+        "account_id": "primary",
+        "phone": "+8801...",
+        "balance": 0.375,
+        "amount": 0.375,
+        "fee": 0.025,
+        "net": 0.35,
+        "problem": ""
+      }
+    ],
+    "totals": {
+      "accounts": 1,
+      "total_balance": 0.375,
+      "total_amount": 0.375,
+      "total_fee": 0.025,
+      "total_net": 0.35,
+      "known_balance": true
+    },
+    "warnings": [
+      "The fee is charged per account, so withdrawing from several accounts costs several fees.",
+      "There is no confirmation on the provider's side. Sending the amount IS the withdrawal."
+    ]
+  }
+}
+```
+
+Field notes that matter for the display:
+
+- `net` is `amount - fee`, because the provider **deducts** the fee from the
+  amount rather than adding it. $0.3750 arrives as $0.3500.
+- `problem` is set on a line that cannot be withdrawn, with the reason. An
+  unwithdrawable line contributes **nothing** to the totals, so the summary
+  never promises money that will not arrive.
+- `known_balance` is `false` when any balance could not be read. A total built on
+  a partial picture must not be presented as complete.
+
+**Execute** (`confirm` true). Returns `409` when `WITHDRAW_DRY_RUN` is on.
+
+```json
+{
+  "ok": true,
+  "results": [
+    { "account_id": "primary", "phone": "+8801...", "amount": 0.375,
+      "fee": 0.025, "net": 0.35, "status": "created",
+      "detail": "✅ Withdrawal request created! ..." }
+  ],
+  "totals": { "amount": 0.375, "fee": 0.025, "net": 0.35 },
+  "note": "the provider accepted these. It does not confirm arrival, so nothing here proves the money landed."
+}
+```
+
+`status` is `created`, `skipped` or `failed`. Accounts are processed one at a
+time and a failure on one does not stop the others.
+
+`409` also when a withdrawal is already running. Only one may run at a time:
+two concurrent flows would interleave two provider conversations and could pay
+the wrong amount.
+
+#### Live progress
+
+An executing withdrawal pushes progress on the existing SSE stream, so the
+dashboard updates without polling:
+
+```
+event: message
+data: {"type":"withdrawal","progress":{
+  "step":"account","state":"running","account":"primary",
+  "phone":"+8801...","amount":0.375,"fee":0.025,"net":0.35}}
+
+event: message
+data: {"type":"withdrawal","progress":{"step":"done","state":"done",
+  "detail":"$0.3750 requested, $0.0250 in fees, $0.3500 to arrive"}}
+```
+
+`state` is `running`, `created`, `skipped`, `failed` or `done`. `step` is
+`start`, `account`, `skip` or `done`.
+
+**`created` means the provider accepted the request. It is not a receipt.** The
+provider never confirms the money arrived, and nothing in this API can.
 
 ### `/api/messages`
 
@@ -333,32 +453,23 @@ dashboard must not imply otherwise.
 Read from the provider's own message on every call. `source` is always
 `provider-message` — the numbers are never configured.
 
-### `POST /api/withdrawals/preview`
+### `GET /api/withdrawals/terms`
+
+Read from the provider's own message on every call, by navigating the provider.
+`source` is always `provider-message` — the numbers are never configured. It
+moves nothing.
 
 ```json
-{ "account_id": "a1", "amount": 0.375 }
+{ "fee": 0.025, "minimum": 0.2, "method": "USDT (BEP-20)",
+  "network": "BSC", "source": "provider-message" }
 ```
 
-```json
-{
-  "dry_run": true,
-  "fee": 0.025,
-  "minimum": 0.2,
-  "net": 0.35,
-  "fee_heavy": false,
-  "balance": 0.375,
-  "warnings": ["Fee is deducted from the amount.", "No confirmation step exists."]
-}
-```
-
-Walks the flow and sends **nothing**. This is the only place a mistake gets
-caught, so the dashboard must call it before offering the real button.
-
-### `POST /api/withdrawals`
-
-Same body. Returns the same shape as `/withdrawals` for the created record.
-`400` when `amount` is below the minimum, exceeds the balance, or the wallet
-fails validation. `409` when `WITHDRAW_DRY_RUN` is on.
+**There is no `POST /api/withdrawals/preview` and no separate
+`POST /api/withdrawals`.** Previewing and executing are the same endpoint,
+`POST /api/withdrawals`, chosen by `confirm`. An earlier draft of this document
+described them separately; that draft was wrong, because two endpoints would
+mean the numbers an operator approved and the numbers that are used could come
+from different code paths.
 
 ### `/api/settings`
 
@@ -391,12 +502,18 @@ data: {"id":"a1","state":"degraded","flood_wait_seconds":30}
 event: alert
 data: {"level":"critical","kind":"unavailable","message":"..."}
 
-event: withdrawal
-data: {"id":"w1","status":"created","net":0.35}
+event: message
+data: {"type":"withdrawal","progress":{"step":"account","state":"created",
+  "account":"primary","amount":0.375,"fee":0.025,"net":0.35}}
 ```
 
+Withdrawal progress arrives as a **`message` event whose data has
+`type: "withdrawal"`**, not as a separate `withdrawal` event. An earlier draft of
+this document documented a bare `{id, status, net}` frame; no such frame is ever
+emitted, and a client listening for one would sit waiting.
+
 The dashboard opens this once on load and updates in place. A reconnect
-resyncs via `GET /api/messages` and `GET /api/alerts`.
+resyncs via `GET /api/messages`, `GET /api/alerts` and `GET /api/withdrawals`.
 
 ## Errors
 

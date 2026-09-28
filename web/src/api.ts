@@ -52,6 +52,16 @@ export interface Session {
   bytes: number;
   updated_at: string;
   in_use: boolean;
+  // Last figure read from the provider. `balance_known` is false when the
+  // balance is zero, because a zero is ambiguous: empty, or never read.
+  balance: number;
+  balance_known: boolean;
+}
+
+/** GET /api/sessions carries the count and total so no page recomputes them. */
+export interface SessionList extends List<Session> {
+  total_balance: number;
+  balance_known: boolean;
 }
 
 /** POST /api/sessions answers one of three shapes; which fields are set says which. */

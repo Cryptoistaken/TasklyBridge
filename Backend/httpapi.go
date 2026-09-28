@@ -39,6 +39,10 @@ type adminServer struct {
 	secret  []byte
 	db      *sql.DB
 	clients map[chan []byte]struct{}
+	// withdrawing is a mutex for the whole money path. Two concurrent
+	// withdrawals would interleave two conversations with the provider and
+	// could pay the wrong amount, so only one may run at a time.
+	withdrawing bool
 	// sessions drives creating a Telegram session from the dashboard.
 	sessions *sessionManager
 	mu       sync.Mutex
@@ -255,7 +259,7 @@ func (s *adminServer) handleAPI(w http.ResponseWriter, r *http.Request) {
 	case path == "/alerts":
 		s.alerts(w, r)
 	case path == "/withdrawals":
-		s.withdrawals(w, r)
+		s.handleWithdrawals(w, r)
 	case path == "/withdrawals/terms":
 		s.withdrawalTerms(w, r)
 	case path == "/settings":
@@ -317,6 +321,21 @@ func (s *adminServer) overview(w http.ResponseWriter, r *http.Request) {
 		task["sell_bdt"] = job.SellBDT
 	}
 	out["task"] = task
+
+	// The balance total carries the same honesty flag: a zero the provider has
+	// never confirmed must not be shown as a real figure. Named distinctly from
+	// the account count above, which is an int.
+	balanceSum, balanceKnown := 0.0, false
+	if s.db != nil {
+		var v float64
+		if err := s.db.QueryRowContext(r.Context(),
+			`SELECT COALESCE(SUM(balance),0) FROM accounts`).Scan(&v); err == nil && v > 0 {
+			balanceSum, balanceKnown = v, true
+		}
+	}
+	out["balance_total"] = balanceSum
+	out["balance_known"] = balanceKnown
+
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -329,15 +348,30 @@ func (s *adminServer) accounts(w http.ResponseWriter, r *http.Request) {
 	if s.tgt == nil {
 		state = "degraded"
 	}
+	// The stored balance, with the same honesty flag the sessions endpoint
+	// uses. A zero is ambiguous, so it is never presented as a real figure.
+	var balance float64
+	known := false
+	if s.db != nil {
+		var v float64
+		err := s.db.QueryRowContext(r.Context(),
+			`SELECT balance FROM accounts WHERE id = $1`, sessionAccountID()).Scan(&v)
+		if err == nil && v > 0 {
+			balance, known = v, true
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items": []map[string]any{{
 			"id": sessionAccountID(), "phone": accountPhone(), "state": state,
-			"balance": 0.0, "assigned_user_id": boundUserID,
-			"messages_sent": 0, "flood_wait_seconds": 0,
+			"balance": balance, "balance_known": known,
+			"assigned_user_id": boundUserID,
+			"messages_sent":    0, "flood_wait_seconds": 0,
 			"last_seen": time.Now().UTC().Format(time.RFC3339),
 			"note":      sessionNote(has, size),
 		}},
-		"total": 1,
+		"total":         1,
+		"total_balance": balance,
+		"balance_known": known,
 	})
 }
 
@@ -483,16 +517,28 @@ func (s *adminServer) unreadAlerts() int {
 	return n
 }
 
-func (s *adminServer) withdrawals(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"items": []map[string]any{}, "total": 0})
-}
-
+// withdrawalTerms reads the provider's live fee and minimum.
+//
+// This navigates the provider, so it costs messages and tells the operator the
+// real numbers rather than a stored copy that may be stale. It moves nothing.
 func (s *adminServer) withdrawalTerms(w http.ResponseWriter, r *http.Request) {
-	// The fee and minimum are read from the provider on every withdrawal, never
-	// from configuration. This endpoint reports only what is known locally, and
-	// says so rather than inventing a number.
+	if s.tgt == nil || s.tgt.api == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "not connected, so the provider's terms cannot be read",
+		})
+		return
+	}
+	terms, err := s.readWithdrawTerms()
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": "could not read the provider's terms: " + err.Error(),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"source": "provider-message", "note": "read live from the provider during a withdrawal",
+		"fee": terms.Fee, "minimum": terms.Minimum,
+		"method": terms.Method, "network": "BSC",
+		"source": "provider-message",
 	})
 }
 
