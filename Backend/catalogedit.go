@@ -12,6 +12,14 @@ import (
 
 // setEnabled shows or hides a job. Jobs are matched on the display name, which
 // is what the operator sees in the dashboard.
+//
+// The in-memory catalogue is updated too, and that is not a nicety. The
+// dashboard endpoint answers from c.jobs, not from the file, so without this the
+// toggle persisted correctly and then reported the old value back: the button
+// flipped, the page disagreed with the server, and the row only corrected itself
+// on the next reload. Anything else reading the catalogue in this process - the
+// availability check especially - would keep offering a job the operator had
+// just hidden.
 func (c *catalog) setEnabled(name string, enabled bool) error {
 	raw, err := readCatalogFile(c.path)
 	if err != nil {
@@ -22,6 +30,11 @@ func (c *catalog) setEnabled(name string, enabled bool) error {
 	}
 	if err := writeCatalogFile(c.path, raw); err != nil {
 		return err
+	}
+	for i := range c.jobs {
+		if matchesJobName(c.jobs[i], name) {
+			c.jobs[i].Enabled = enabled
+		}
 	}
 	state := "hidden"
 	if enabled {
