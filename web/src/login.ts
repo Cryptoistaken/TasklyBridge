@@ -76,7 +76,10 @@ export function mountLogin(root: HTMLElement, onOk: () => void): void {
     status,
     err,
   );
-  root.replaceChildren(card);
+  // The centering lives on .login in the stylesheet, so the card has to sit
+  // inside that wrapper. Replacing the root with the card alone left the card
+  // pinned to the top-left of the page.
+  root.replaceChildren(h("div", { class: "login" }, card));
 
   function fail(message: string): void {
     err.textContent = message;
