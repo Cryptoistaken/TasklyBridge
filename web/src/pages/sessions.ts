@@ -79,6 +79,10 @@ let busy = false;
 // --- list -------------------------------------------------------------------
 
 function fmtBytes(n: number): string {
+  // An absent size would fail the < 1024 test, fall through to the division
+  // and then throw on toFixed. The blob size is the one field here that is not
+  // guaranteed, so it is checked rather than assumed.
+  if (typeof n !== "number" || !Number.isFinite(n)) return "unknown";
   return n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KB`;
 }
 

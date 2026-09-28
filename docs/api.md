@@ -46,20 +46,28 @@ HMAC-signed with `ADMIN_SESSION_SECRET`.
 | `DELETE` | `/api/sessions/{id}` | remove a stored session |
 | `GET` | `/api/overview` | everything for the Overview page, one call |
 | `GET` | `/api/accounts` | the account pool |
-| `GET` | `/api/accounts/{id}` | one account, with its recent traffic |
 | `GET` | `/api/users` | end users and their joined job |
-| `GET` | `/api/users/{id}` | one user, with their message history |
 | `GET` | `/api/tasks` | the catalogue: offered, hidden, cost vs sell |
 | `POST` | `/api/tasks/{id}/enabled` | `{"enabled":false}` hides a job |
 | `GET` | `/api/messages` | recent messages, newest first, `?limit=` `?before=` |
 | `GET` | `/api/alerts` | price and availability history |
 | `GET` | `/api/withdrawals` | withdrawal history with the provider's confirmation |
 | `GET` | `/api/withdrawals/terms` | the provider's live fee and minimum |
-| `POST` | `/api/withdrawals/preview` | dry run, see the screen, send nothing |
-| `POST` | `/api/withdrawals` | actually withdraw from one account |
+| `POST` | `/api/withdrawals` | preview with `confirm:false`, execute with `confirm:true` |
 | `GET` | `/api/settings` | non-secret configuration |
 | `PUT` | `/api/settings` | the editable subset |
+| `GET` | `/api/sessions` | list stored Telegram sessions |
+| `POST` | `/api/sessions` | start or continue creating a session |
+| `DELETE` | `/api/sessions/{id}` | remove a stored session |
+| `GET` | `/api/session` | plain status check for the create flow |
 | `GET` | `/api/events` | **SSE** live feed |
+| `POST` | `/api/logout` | clears the cookie |
+
+`Backend/apicontract_test.go` calls every row of this table against a real
+Postgres and fails if one is not routed, so this list and the router cannot
+drift apart again without a test going red. Two rows that used to be here —
+`GET /api/accounts/{id}` and `GET /api/users/{id}` — were never implemented and
+nothing ever called them. They were removed rather than built.
 
 ## `POST /webhook`
 
@@ -114,7 +122,9 @@ Every list endpoint returns `{"items":[...], "total":N}`.
     "name": "Facebook 2fa",
     "sell_bdt": 5,
     "provider_cost": 0.05,
+    "cost_known": true,
     "margin_bdt": -0.2,
+    "margin_known": true,
     "selling_at_loss": true
   },
   "balance_total": 0.0,
@@ -126,6 +136,33 @@ Every list endpoint returns `{"items":[...], "total":N}`.
 
 `selling_at_loss` is `true` when `provider_cost` converts to more Taka than
 `sell_bdt`. **It is the single most important field on this page.**
+
+### The `*_known` flags
+
+`provider_cost`, `margin_bdt` and `selling_at_loss` come from the price
+watcher's last poll, and **every one of them is genuinely unknown until that
+poll has run.** The keys are always present and always numbers, so the page can
+never crash on them, and the flags say whether to believe them:
+
+| Flag | `false` means |
+| --- | --- |
+| `cost_known` | the watcher has written no snapshot yet, so there is no provider price |
+| `margin_known` | the cost is unknown, **or** no `bdt_rate` is configured to convert dollars to Taka |
+
+`/api/tasks` carries the same pair as `provider_price_known` and `margin_known`.
+
+**A flag is never collapsed into a zero.** This is not a style preference. The
+page formats money with `value.toFixed(2)`, so when `/api/overview` omitted
+these keys entirely the whole dashboard died with *"Cannot read properties of
+undefined (reading 'toFixed')"* — while `tsc`, `bun build`, `go vet` and the Go
+tests were all green. Worse, the earlier version of `/api/tasks` sent
+`provider_price: 0.0` and `margin_bdt` equal to the sell price, which renders as
+a provider giving the job away free and makes `selling_at_loss` impossible to
+trigger. Unknown must read as unknown.
+
+`apicontract_test.go` enforces this: it fails on a missing key, on a non-number
+where a number is documented, and on **any JSON null anywhere in a response**,
+because the dashboard has no null handling at all.
 
 ### `/api/accounts`
 

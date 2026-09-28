@@ -39,7 +39,11 @@ export interface Task {
   available: boolean;
   provider_name: string;
   provider_price: number;
+  /** False when the price watcher has no snapshot. Never read the price as if it were known. */
+  provider_price_known: boolean;
   margin_bdt: number;
+  /** False when the cost is unknown, or no bdt_rate is configured to convert it. */
+  margin_known: boolean;
   hidden: string[];
 }
 
@@ -169,8 +173,13 @@ export interface OverviewTask {
   available: boolean;
   name: string;
   sell_bdt: number;
+  /** The provider's price in dollars. Read it only when cost_known is true. */
   provider_cost: number;
+  /** False when the price watcher has no snapshot yet. Not the same as zero. */
+  cost_known: boolean;
   margin_bdt: number;
+  /** False when the cost is unknown, or no bdt_rate is configured to convert it. */
+  margin_known: boolean;
   selling_at_loss: boolean;
 }
 

@@ -49,9 +49,14 @@ function row(t: Task): HTMLTableRowElement[] {
     ),
     // Our static price. Taka, bright: this is what a user is charged.
     td(bdt(t.sell_bdt), "num mono"),
-    // The provider's dollar cost. Muted, dollar signs: our cost, never a sell price.
-    td(usd(t.provider_price), "num mono muted"),
-    td(bdt(t.margin_bdt), "num mono" + (t.margin_bdt < 0 ? " warn" : "")),
+    // The provider's dollar cost. Muted, dollar signs: our cost, never a sell
+    // price. It reads as unknown rather than $0.0000 when the watcher has no
+    // snapshot, because a zero here would look like a healthy margin.
+    td(usd(t.provider_price_known ? t.provider_price : null), "num mono muted"),
+    td(
+      bdt(t.margin_known ? t.margin_bdt : null),
+      "num mono" + (t.margin_known && t.margin_bdt < 0 ? " warn" : ""),
+    ),
     td(stateChip(t)),
     td(
       h("button", {

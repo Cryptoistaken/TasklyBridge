@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -301,6 +302,8 @@ func (s *adminServer) handleAPI(w http.ResponseWriter, r *http.Request) {
 		s.users(w, r)
 	case path == "/tasks":
 		s.tasks(w, r)
+	case strings.HasPrefix(path, "/tasks/") && strings.HasSuffix(path, "/enabled"):
+		s.setTaskEnabled(w, r, strings.TrimSuffix(strings.TrimPrefix(path, "/tasks/"), "/enabled"))
 	case path == "/messages":
 		s.messages(w, r)
 	case path == "/alerts":
@@ -361,12 +364,7 @@ func (s *adminServer) overview(w http.ResponseWriter, r *http.Request) {
 		"last_checked":     time.Now().UTC().Format(time.RFC3339),
 	}
 
-	task := map[string]any{"available": false, "sell_bdt": 0.0}
-	if s.cat != nil && len(s.cat.jobs) > 0 {
-		job := s.cat.jobs[0]
-		task["name"] = job.Name
-		task["sell_bdt"] = job.SellBDT
-	}
+	task := s.jobBlock()
 	out["task"] = task
 
 	// The balance total carries the same honesty flag: a zero the provider has
@@ -454,19 +452,83 @@ func (s *adminServer) users(w http.ResponseWriter, r *http.Request) {
 
 func (s *adminServer) tasks(w http.ResponseWriter, r *http.Request) {
 	items := []map[string]any{}
+	// One snapshot for the whole list: every row describes the same job we
+	// sell, and re-reading the file per row could straddle a poll and show two
+	// different costs on one page.
+	st := readJobState()
 	if s.cat != nil {
 		for _, j := range s.cat.jobs {
+			// provider_price and margin come from the watcher's snapshot, and
+			// they are reported as unknown when there is none. This used to
+			// send provider_price 0.0 and margin_bdt equal to the sell price,
+			// which is a cost of zero invented from nothing: the page showed
+			// the provider giving the job away free and a margin equal to the
+			// whole sell price, and no loss banner could ever fire.
+			price, priceKnown := st.Cost, st.Known
+			margin, marginKnown := 0.0, false
+			if st.Known && s.cat.bdtRate > 0 {
+				costBDT := st.Cost * s.cat.bdtRate
+				margin, marginKnown = j.SellBDT-costBDT, true
+			}
 			items = append(items, map[string]any{
 				"id": j.Name, "require_all": j.RequireAll, "name": j.Name,
 				"sell_bdt": j.SellBDT, "enabled": j.Enabled,
-				"available": s.jobAvailable(), "provider_name": "",
-				"provider_price": 0.0, "margin_bdt": j.SellBDT, "hidden": []string{},
+				"available": st.Available, "provider_name": "",
+				"provider_price": price, "provider_price_known": priceKnown,
+				"margin_bdt": margin, "margin_known": marginKnown,
+				"hidden": []string{},
 			})
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items": items, "total": len(items), "bdt_rate": catBdtRate(s.cat),
 	})
+}
+
+// setTaskEnabled turns a job on or off from the dashboard.
+//
+// The Tasks page has always had a toggle wired to this and it 404'd, because
+// the route was documented in docs/api.md and never built. Hiding a job is
+// configuration, not code, so it edits task.json through the same path the
+// operator CLI uses rather than growing a second mechanism.
+func (s *adminServer) setTaskEnabled(w http.ResponseWriter, r *http.Request, rawName string) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+	if s.cat == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "no catalogue is loaded"})
+		return
+	}
+	var req struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := decodeJSON(r, &req); err != nil || req.Enabled == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": `send {"enabled":true} or {"enabled":false}`})
+		return
+	}
+	name, err := url.PathUnescape(rawName)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad job name"})
+		return
+	}
+	if err := s.cat.setEnabled(name, *req.Enabled); err != nil {
+		// The name is the caller's, so saying which jobs exist is the only way
+		// they can tell a typo from a missing job.
+		names := make([]string, 0, len(s.cat.jobs))
+		for _, j := range s.cat.jobs {
+			names = append(names, j.Name)
+		}
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"error": err.Error(), "jobs": names,
+		})
+		return
+	}
+	s.audit.log(legInternal, "task-toggle", 0, "job enabled="+strconv.FormatBool(*req.Enabled),
+		map[string]string{"job": name})
+	// Re-read rather than echoing: the file is the truth and the point of the
+	// call is to know what was actually persisted.
+	s.tasks(w, r)
 }
 
 func catBdtRate(c *catalog) float64 {
@@ -476,16 +538,91 @@ func catBdtRate(c *catalog) float64 {
 	return c.bdtRate
 }
 
-func (s *adminServer) jobAvailable() bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if s.db == nil {
-		return false
+// jobState is the provider's last known price for the job we sell.
+//
+// It is read from availability.json, which is the file the price watcher
+// actually writes. It used to be read from the job_availability table, and that
+// was wrong in a way nobody could see: nothing has ever written that table, so
+// the read always came back empty, jobAvailable always returned false, and the
+// dashboard reported every job as UNAVAILABLE from a table that had never held
+// a row. The state was real the whole time, one directory away.
+type jobState struct {
+	Available bool
+	// Cost is the provider's price in dollars: our cost, never a sell price.
+	Cost float64
+	// Known is false when there is no snapshot yet, which is different from a
+	// cost of zero. A zero would read as "the provider gives it away free" and
+	// would make the margin look perfect.
+	Known bool
+}
+
+// readJobState loads the watcher's snapshot.
+//
+// A missing or unreadable file is not an error: the watcher rewrites it within
+// one poll of a fresh deploy, so "not known yet" is a normal state to be in.
+func readJobState() jobState {
+	raw, err := os.ReadFile(filepath.Join(outDir, "availability.json"))
+	if err != nil {
+		return jobState{}
 	}
-	var v bool
-	err := s.db.QueryRowContext(ctx,
-		`SELECT available FROM job_availability ORDER BY at DESC LIMIT 1`).Scan(&v)
-	return err == nil && v
+	var st struct {
+		Available bool    `json:"available"`
+		Cost      float64 `json:"cost"`
+		At        string  `json:"at"`
+	}
+	if json.Unmarshal(raw, &st) != nil {
+		return jobState{}
+	}
+	// A snapshot that claims a cost but carries no timestamp cannot be trusted
+	// as current, and a zero cost with no timestamp is indistinguishable from
+	// the zero value.
+	return jobState{Available: st.Available, Cost: st.Cost, Known: st.At != ""}
+}
+
+// jobBlock builds the catalogue's numbers for the API.
+//
+// The cost comes from the provider and the sell price is ours, so margin is
+// sell minus cost. The conversion to Taka needs a configured rate; without one
+// the margin is reported as unknown rather than guessed, which is the rule for
+// every other derived figure here.
+//
+// Nothing is ever defaulted to a real-looking number. A cost that is not known
+// is reported as not known, because a fabricated zero would show a healthy
+// margin forever and the loss banner could never fire.
+func (s *adminServer) jobBlock() map[string]any {
+	st := readJobState()
+	out := map[string]any{
+		"available":       st.Available,
+		"name":            "",
+		"sell_bdt":        0.0,
+		"provider_cost":   0.0,
+		"cost_known":      false,
+		"margin_bdt":      0.0,
+		"margin_known":    false,
+		"selling_at_loss": false,
+	}
+	if s.cat == nil || len(s.cat.jobs) == 0 {
+		return out
+	}
+	job := s.cat.jobs[0]
+	out["name"] = job.Name
+	out["sell_bdt"] = job.SellBDT
+
+	if !st.Known {
+		return out
+	}
+	out["provider_cost"] = st.Cost
+	out["cost_known"] = true
+
+	if s.cat.bdtRate <= 0 {
+		// costInBDT's own rule: without a rate the comparison cannot be made.
+		return out
+	}
+	costBDT := st.Cost * s.cat.bdtRate
+	out["margin_bdt"] = job.SellBDT - costBDT
+	out["margin_known"] = true
+	out["selling_at_loss"] = costBDT > job.SellBDT
+	return out
 }
 
 func (s *adminServer) messages(w http.ResponseWriter, r *http.Request) {

@@ -42,10 +42,29 @@ export function h<K extends keyof HTMLElementTagNameMap>(
 
 // --- formatters -------------------------------------------------------------
 
+/**
+ * A dash for a figure that is not known, rather than a zero.
+ *
+ * These two formatters are called from about thirty-five places and every one
+ * of them assumed a number would always be there. GET /api/overview once
+ * omitted provider_cost and margin_bdt entirely, the Overview page called
+ * toFixed on undefined, and the whole dashboard died with "Cannot read
+ * properties of undefined (reading 'toFixed')" - while tsc, bun build, go vet
+ * and the Go tests were all green.
+ *
+ * So a missing figure renders as unknown. It must never render as $0.0000:
+ * a zero cost would read as the provider giving the job away free and would
+ * quietly make a loss look like a profit.
+ */
+const UNKNOWN = "—";
+
 /** Provider dollars, 4dp: $0.3750. This is our COST, never our sell price. */
-export const usd = (n: number): string => "$" + n.toFixed(4);
+export const usd = (n: number | null | undefined): string =>
+  typeof n === "number" && Number.isFinite(n) ? "$" + n.toFixed(4) : UNKNOWN;
+
 /** Our Taka figures, 2dp: 5.00tk. */
-export const bdt = (n: number): string => n.toFixed(2) + "tk";
+export const bdt = (n: number | null | undefined): string =>
+  typeof n === "number" && Number.isFinite(n) ? n.toFixed(2) + "tk" : UNKNOWN;
 
 export function when(iso: string): string {
   const d = new Date(iso);

@@ -6,10 +6,6 @@ import { bdt, h, pageHead, statRow, usd, when, type Page } from "../ui";
 
 let view: HTMLElement | null = null;
 
-/** The provider's cost in Taka. The payload has no rate, so invert the margin. */
-function costBdt(o: Overview): number {
-  return o.task.sell_bdt - o.task.margin_bdt;
-}
 
 function lossBanner(o: Overview): HTMLElement | null {
   const t = o.task;
@@ -22,6 +18,18 @@ function lossBanner(o: Overview): HTMLElement | null {
     h("span", { class: "banner-text" }, `${t.name}: we charge ${bdt(t.sell_bdt)} but pay ${bdt(costBdt(o))} (provider ${usd(t.provider_cost)}).`),
     h("span", { class: "banner-text" }, `Losing ${bdt(loss)} on every sale.`),
   );
+}
+
+/**
+ * The provider's cost in Taka, or null when it cannot be known yet.
+ *
+ * The payload has no separate cost field, so it is derived from the margin the
+ * backend already computed. Null rather than a number when the margin is not
+ * known, because a zero here would say the job is free.
+ */
+function costBdt(o: Overview): number | null {
+  if (!o.task.margin_known) return null;
+  return o.task.sell_bdt - o.task.margin_bdt;
 }
 
 function body(o: Overview): HTMLElement {
@@ -49,9 +57,13 @@ function body(o: Overview): HTMLElement {
       },
       {
         label: "Margin",
-        value: bdt(t.margin_bdt),
-        sub: `sell ${bdt(t.sell_bdt)} · cost ${usd(t.provider_cost)} ≈ ${bdt(costBdt(o))}`,
-        bad: t.margin_bdt < 0,
+        // Unknown until the watcher has polled. It must not read as a healthy
+        // zero-margin while the cost is simply not known yet.
+        value: bdt(t.margin_known ? t.margin_bdt : null),
+        sub: t.cost_known
+          ? `sell ${bdt(t.sell_bdt)} · cost ${usd(t.provider_cost)} ≈ ${bdt(costBdt(o))}`
+          : `sell ${bdt(t.sell_bdt)} · provider cost not polled yet`,
+        bad: t.margin_known && t.margin_bdt < 0,
       },
       {
         label: "Users",
@@ -70,7 +82,7 @@ function body(o: Overview): HTMLElement {
     h(
       "p",
       { class: "muted small", style: "margin-top:16px" },
-      h("span", { class: "mono", text: usd(t.provider_cost) }),
+      h("span", { class: "mono", text: usd(t.cost_known ? t.provider_cost : null) }),
       " is the provider's cost in dollars — our cost, not our sell price. Sell price is the static Taka figure.",
     ),
   );

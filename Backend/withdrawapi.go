@@ -26,9 +26,52 @@ type withdrawalRequest struct {
 	Confirm bool `json:"confirm"`
 }
 
+// withdrawalHistory lists past withdrawals, newest first.
+//
+// Every column is read as a nullable scan target and defaulted only where the
+// database guarantees a value. "created" is not "paid": the provider confirms a
+// request was created and never confirms the money arrived, so that word is
+// passed through untouched rather than dressed up as a success.
+func (s *adminServer) withdrawalHistory(w http.ResponseWriter, r *http.Request) {
+	items := []map[string]any{}
+	if s.db != nil {
+		rows, err := s.db.QueryContext(r.Context(), `
+			SELECT id, account_id, amount, fee, net, dry_run, status, confirmation,
+			       to_char(at,'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+			  FROM withdrawals ORDER BY at DESC LIMIT 200`)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var id, account, status, confirmation, at string
+				var amount, fee, net float64
+				var dry bool
+				if rows.Scan(&id, &account, &amount, &fee, &net, &dry, &status, &confirmation, &at) != nil {
+					continue
+				}
+				items = append(items, map[string]any{
+					"id": id, "account_id": account, "wallet": "",
+					"amount": amount, "fee": fee, "net": net,
+					"dry_run": dry, "status": status,
+					"confirmation": confirmation, "at": at,
+				})
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": len(items)})
+}
+
 func (s *adminServer) handleWithdrawals(w http.ResponseWriter, r *http.Request) {
+	// GET is the history, POST is preview-or-execute. The handler used to
+	// reject everything that was not a POST, so the Withdrawals page called
+	// GET /api/withdrawals twice and got 405 both times: the history never
+	// loaded and the page had nothing to show. The read and the write share a
+	// path on purpose, so this is a method switch rather than a second route.
+	if r.Method == http.MethodGet {
+		s.withdrawalHistory(w, r)
+		return
+	}
 	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "GET or POST only"})
 		return
 	}
 	var req withdrawalRequest
