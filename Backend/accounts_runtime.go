@@ -44,6 +44,27 @@ func withTargets(ctx context.Context, a *audit, admin *adminServer, cat *catalog
 	admin.sessions = newSessionManager(admin.db, a)
 	admin.fleet = fl
 	admin.webhookSecret = hookSecret
+
+	// The owner column is applied HERE as well as under -migrate, and that
+	// duplication is the point.
+	//
+	// It was only ever in the -migrate path, which is a flag somebody has to
+	// remember, and nobody did. The first deploy of the account code therefore
+	// started, logged "column a.owner_user_id does not exist", and quietly fell
+	// back to a single account: the bot looked completely healthy and the feature
+	// was simply absent. A migration that only runs when asked is a migration
+	// that will be forgotten.
+	//
+	// Both statements are IF NOT EXISTS, so this is a no-op on every boot after
+	// the first, and a failure to get DDL is logged rather than fatal: a managed
+	// database can refuse it, and that must not take the bridge down.
+	if err := ensureOwnerColumn(ctx, admin.db); err != nil {
+		a.log(legInternal, "schema", 0, "could not add accounts.owner_user_id: "+err.Error(), nil)
+	}
+	if err := ensureOwnerIndex(ctx, admin.db); err != nil {
+		a.log(legInternal, "schema", 0, "accounts owner index: "+err.Error(), nil)
+	}
+
 	go func() {
 		if err := startAdmin(ctx, admin); err != nil {
 			a.log(legInternal, "admin-stopped", 0, err.Error(), nil)
