@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { get, type Account, type List, type SseAccount } from "@/lib/api";
+import { get, post, type Account, type List, type SseAccount } from "@/lib/api";
 import { fmtDuration, usd, when } from "@/lib/format";
 import { subscribe } from "@/lib/bus";
 import { PageHeader } from "@/components/PageHeader";
@@ -25,6 +25,39 @@ function FloodWait({ seconds }: { seconds: number }): React.JSX.Element {
 export function AccountsPage(): React.JSX.Element {
   const [items, setItems] = useState<Account[] | null>(null);
   const [error, setError] = useState("");
+  // drafts holds the in-progress user id per account row, and busy marks the
+  // row whose assignment is in flight. Neither belongs in the item itself:
+  // typing must not round-trip through the server on every keystroke.
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<string>("");
+  const [flash, setFlash] = useState("");
+
+  // assign binds an account to an end user, or releases it with 0.
+  //
+  // This is the control that makes more than one user possible. The server
+  // refuses when that user is already served by another account, and the reason
+  // is shown rather than swallowed: two accounts serving one user is how the
+  // provider ends up reading one person's job as another's cancel.
+  const assign = async (accountID: string, userID: number): Promise<void> => {
+    setBusy(accountID);
+    setFlash("");
+    setError("");
+    try {
+      await post(`/api/accounts/${encodeURIComponent(accountID)}/assign`, { user_id: userID });
+      const fresh = await get<List<Account>>("/api/accounts");
+      setItems(fresh.items);
+      setDrafts((p) => ({ ...p, [accountID]: "" }));
+      setFlash(
+        userID
+          ? `${accountID} now serves user ${userID}. The bot will route their messages to it.`
+          : `${accountID} released. Nobody is served by it until it is assigned.`,
+      );
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
+    }
+  };
 
   useEffect(() => {
     let live = true;
@@ -47,7 +80,7 @@ export function AccountsPage(): React.JSX.Element {
     };
   }, []);
 
-  if (error) {
+  if (error && !items) {
     return (
       <div>
         <PageHeader title="Accounts" />
@@ -74,14 +107,35 @@ export function AccountsPage(): React.JSX.Element {
 
   return (
     <div>
-      <PageHeader title="Accounts" sub="one row per phone number · state is what costs money" />
+      <PageHeader
+        title="Accounts"
+        sub="one row per Telegram account · each one serves exactly one end user"
+      />
       <StatGrid>
         <StatTile label="Total" value={String(items.length)} />
-        <StatTile label="Connected" value={String(n((a) => a.state === "connected"))} />
+        <StatTile
+          label="Assigned"
+          value={String(n((a) => Boolean(a.assigned_user_id)))}
+          sub="accounts with an end user"
+        />
+        <StatTile
+          label="With session"
+          value={String(n((a) => a.has_session))}
+          sub="ready to connect"
+        />
         <StatTile label="Free" value={String(n((a) => a.state === "free"))} />
-        <StatTile label="Degraded" value={String(n((a) => a.state === "degraded"))} sub="flood-wait or at risk" />
-        <StatTile label="Banned / dead" value={String(bad)} bad={bad > 0} />
+        <StatTile
+          label="Banned / dead"
+          value={String(bad)}
+          bad={bad > 0}
+        />
       </StatGrid>
+      {error ? <Alert variant="destructive" className="mt-5">{error}</Alert> : null}
+      {flash ? (
+        <p className="mt-5 text-sm text-muted-foreground" role="status">
+          {flash}
+        </p>
+      ) : null}
       <div className="mt-7">
         <DataTable
           columns={[
@@ -113,11 +167,37 @@ export function AccountsPage(): React.JSX.Element {
               <Td>
                 {a.assigned_user_id ? (
                   <div>
-                    <div>{a.assigned_user_name || "—"}</div>
-                    <div className="font-mono text-xs text-muted-foreground">{a.assigned_user_id}</div>
+                    <div className="font-mono text-xs">{a.assigned_user_id}</div>
+                    <button
+                      className="text-xs text-muted-foreground underline"
+                      type="button"
+                      onClick={() => void assign(a.id, 0)}
+                      disabled={busy === a.id}
+                    >
+                      release
+                    </button>
                   </div>
                 ) : (
-                  <span className="text-muted-foreground">—</span>
+                  <div>
+                    <span className="text-muted-foreground">unassigned</span>
+                    <div className="mt-1 flex items-center gap-1">
+                      <input
+                        className="w-24 rounded-[var(--radius)] border border-border bg-background px-1.5 py-0.5 font-mono text-xs"
+                        placeholder="telegram id"
+                        value={drafts[a.id] ?? ""}
+                        inputMode="numeric"
+                        onChange={(e) => setDrafts((p) => ({ ...p, [a.id]: e.target.value }))}
+                      />
+                      <button
+                        className="rounded-[var(--radius)] border border-border px-1.5 py-0.5 text-xs"
+                        type="button"
+                        disabled={busy === a.id || !(drafts[a.id] ?? "").trim()}
+                        onClick={() => void assign(a.id, Number((drafts[a.id] ?? "").trim()))}
+                      >
+                        {busy === a.id ? "…" : "assign"}
+                      </button>
+                    </div>
+                  </div>
                 )}
               </Td>
               <Td num className="font-mono">

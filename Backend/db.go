@@ -192,6 +192,15 @@ func runMigrate() error {
 	if _, err := db.ExecContext(ctx, criticalSchema); err != nil {
 		return fmt.Errorf("apply critical schema: %w", err)
 	}
+	// CREATE TABLE IF NOT EXISTS never adds a column to a table that already
+	// exists, so the owner column is applied separately. Both statements are
+	// idempotent, so this runs on every boot without effect after the first.
+	if err := ensureOwnerColumn(ctx, db); err != nil {
+		fmt.Printf("note: %v; falling back to a single account bound by BOUND_USER_ID\n", err)
+	}
+	if err := ensureOwnerIndex(ctx, db); err != nil {
+		fmt.Printf("note: accounts owner index: %v\n", err)
+	}
 	tables, err := verifySchema(ctx, db)
 	if err != nil {
 		return err

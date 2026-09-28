@@ -190,14 +190,57 @@ type handler struct {
 	audit *audit
 	store *store
 	tgt   *target
+	// fleet routes an end user to the account that serves them. It is the
+	// replacement for a single boundUser comparison: with one account the two
+	// behave identically, and with several it is the only thing that can
+	// express "which account is this person using".
+	fleet *fleet
 	// boundUser is the one Telegram user this MTProto account serves. The
 	// account holds per-user state, so it cannot be shared between users.
+	//
+	// It is still consulted, as the fallback when an account has no owner
+	// recorded: a single-account deployment created before owner_user_id
+	// existed must keep working, and a database that cannot be read must not
+	// lock everybody out of the bot.
 	boundUser int64
 	// cat is the sellable catalogue: which provider jobs we offer, what we
 	// call them, and what end users are charged.
 	cat *catalog
 	// alerts reaches admins only, never end users. Used for cost warnings.
 	alerts notifier
+}
+
+// targetFor resolves the account that must act on this end user's message.
+//
+// The order is deliberate. An explicit assignment wins, because that is the
+// multi-account case and the operator set it. Failing that, boundUser is
+// honoured so a single-account deployment behaves exactly as it did before
+// owner_user_id existed. Failing both, the message is refused.
+//
+// It is also the replacement for the two `userID != h.boundUser` checks that
+// used to sit inline in the message and callback paths, which meant the rule
+// was written twice and could only ever compare against one id.
+func (h *handler) targetFor(userID int64) (*target, bool) {
+	if h.fleet != nil {
+		if t, ok := h.fleet.forUser(userID); ok {
+			return t, true
+		}
+		// The bound-user fallback applies only to an account NOBODY owns. Once an
+		// operator assigns that account to somebody else, the previous user must
+		// stop being routed onto it, or the assignment means nothing and two
+		// people drive one provider conversation.
+		if h.boundUser != 0 && userID == h.boundUser &&
+			h.tgt != nil && h.tgt.api != nil &&
+			h.fleet.isUnowned(h.tgt.accountID) {
+			return h.tgt, true
+		}
+		return nil, false
+	}
+	// No fleet: a plain single-account deployment, unchanged.
+	if h.boundUser != 0 && userID == h.boundUser && h.tgt != nil && h.tgt.api != nil {
+		return h.tgt, true
+	}
+	return nil, false
 }
 
 func (h *handler) handle(u inboundUpdate) {
@@ -221,9 +264,11 @@ func (h *handler) onMessage(m *botMessage) {
 	}
 	h.audit.log(legUserToBot, kind, userID, m.Text, nil)
 
-	// One account serves one user, so anyone else is told the truth rather
-	// than queued for an account that does not exist yet.
-	if userID != h.boundUser {
+	// One account serves one user. This resolves WHICH account, and every
+	// action below is then performed on that one, so two users never drive the
+	// same provider conversation.
+	tgt, ok := h.targetFor(userID)
+	if !ok {
 		h.reply(userID, notWhitelisted)
 		return
 	}
@@ -235,25 +280,25 @@ func (h *handler) onMessage(m *botMessage) {
 
 	switch cmd {
 	case "/start":
-		h.showTasks(userID)
+		h.showTasks(userID, tgt)
 	case "/exitjob", "/exit_job", "/stop":
-		h.exitJob(userID)
+		h.exitJob(userID, tgt)
 	case "":
-		h.forwardText(userID, m.Text)
+		h.forwardText(userID, m.Text, tgt)
 	default:
-		h.forwardText(userID, m.Text)
+		h.forwardText(userID, m.Text, tgt)
 	}
 }
 
 // showTasks lists the job list read live from the provider.
-func (h *handler) showTasks(userID int64) {
+func (h *handler) showTasks(userID int64, tgt *target) {
 	if j, ok := h.store.get(userID); ok {
 		h.reply(userID, fmt.Sprintf(
 			"✅ You are in the *%s* task.\n\nSend your 2FA key, or /exitjob to leave.", j.TaskName))
 		return
 	}
 
-	live, err := h.tgt.fetchTasks(catalogGroupFor(h.cat))
+	live, err := tgt.fetchTasks(catalogGroupFor(h.cat))
 	if err != nil {
 		h.audit.log(legInternal, "tasklist-error", userID, err.Error(), nil)
 		h.reply(userID, "Could not read the job list from the provider. Try again in a moment.")
@@ -354,25 +399,30 @@ func (h *handler) onCallback(c *botCallback) {
 	h.audit.log(legUserToBot, "tap", userID, c.Data, nil)
 	h.bot.answerCallback(c.ID, "")
 
-	if userID != h.boundUser {
+	// Resolved the same way a message is, so a button tap cannot reach an
+	// account the person does not own. This check used to be written out a
+	// second time here, which meant the rule existed in two places and could
+	// only ever compare against one id.
+	tgt, ok := h.targetFor(userID)
+	if !ok {
 		h.reply(userID, notWhitelisted)
 		return
 	}
 
 	switch {
 	case strings.HasPrefix(c.Data, "job:"):
-		h.joinJob(userID, c.Data)
+		h.joinJob(userID, c.Data, tgt)
 	case c.Data == "exit":
-		h.exitJob(userID)
+		h.exitJob(userID, tgt)
 	}
 }
 
-func (h *handler) joinJob(userID int64, data string) {
+func (h *handler) joinJob(userID int64, data string, tgt *target) {
 	idx, err := strconv.Atoi(strings.TrimPrefix(data, "job:"))
 	if err != nil {
 		return
 	}
-	live, err := h.tgt.fetchTasks(catalogGroupFor(h.cat))
+	live, err := tgt.fetchTasks(catalogGroupFor(h.cat))
 	if err != nil {
 		h.audit.log(legInternal, "tasklist-error", userID, err.Error(), nil)
 		h.reply(userID, "Could not read the job list from the provider. Try again in a moment.")
@@ -407,7 +457,7 @@ func (h *handler) joinJob(userID int64, data string) {
 	_ = h.bot.sendMessage(userID, confirmation, exitKeyboard())
 
 	// Drive the provider, then forward whatever it says.
-	res, err := h.tgt.joinTask(task)
+	res, err := tgt.joinTask(task)
 	if err != nil {
 		h.audit.log(legInternal, "join-error", userID, err.Error(), nil)
 		h.reply(userID, "The provider could not start that job. Send /exitjob and try again.")
@@ -427,7 +477,7 @@ func (h *handler) joinJob(userID int64, data string) {
 	_ = h.bot.sendMessage(userID, body, exitKeyboard())
 }
 
-func (h *handler) exitJob(userID int64) {
+func (h *handler) exitJob(userID int64, tgt *target) {
 	j, ok := h.store.get(userID)
 	if !ok {
 		h.reply(userID, "You are not in a job right now. Send /start to see the list.")
@@ -442,12 +492,12 @@ func (h *handler) exitJob(userID int64) {
 }
 
 // forwardText relays free text to the provider unchanged.
-func (h *handler) forwardText(userID int64, text string) {
+func (h *handler) forwardText(userID int64, text string, tgt *target) {
 	if _, ok := h.store.get(userID); !ok {
 		h.reply(userID, "Join a job first: send /start and tap one.")
 		return
 	}
-	if _, err := h.tgt.forward("forward", text); err != nil {
+	if _, err := tgt.forward("forward", text); err != nil {
 		h.audit.log(legInternal, "forward-error", userID, err.Error(), nil)
 		h.reply(userID, "Could not reach the provider. Try again in a moment.")
 	}

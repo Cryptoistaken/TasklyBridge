@@ -291,17 +291,28 @@ func fail(err error) {
 // admin is nil in -list mode, which simply means no dashboard and no HTTP
 // server. hookSecret is empty when there is no webhook, in which case the
 // caller polls instead.
+// withTarget runs a single MTProto client for one account. It is what -list
+// uses, and the single-account path still works exactly as it did.
+//
+// For more than one account use withTargets, which supervises one client per
+// account and routes updates through the fleet.
 func withTarget(ctx context.Context, a *audit, admin *adminServer, cat *catalog, st *store, hookSecret string, fn func(*target) error) error {
+	return runAccount(ctx, a, admin, cat, hookSecret, defaultAccountID, fn)
+}
+
+// runAccount runs one account's MTProto client, reconnecting until the context
+// ends. onConnect fires once the account is authorized and its provider peer is
+// resolved, which is the point at which the target becomes usable.
+func runAccount(ctx context.Context, a *audit, admin *adminServer, cat *catalog, hookSecret, accountID string, onConnect func(*target) error) error {
 	arrivals := make(chan seqMsg, 64)
 	var targetID int64
 
-	tgt := &target{arrivals: arrivals, audit: a, timeout: waitTimeout}
+	tgt := &target{accountID: accountID, arrivals: arrivals, audit: a, timeout: waitTimeout}
 
 	// The session comes from the critical store when there is one, and from
-	// disk otherwise. Reading a file would work right up until the first
-	// deploy, at which point the container has no session and the account
-	// would have to be signed in again by hand.
-	storage := sessionStorage(ctx, a)
+	// disk otherwise. It is bound to THIS account, which is what lets several
+	// accounts hold several sessions without them colliding.
+	storage := sessionStorageFor(ctx, a, accountID)
 
 	client := telegram.NewClient(apiID, apiHash, telegram.Options{
 		SessionStorage: storage,
@@ -320,7 +331,8 @@ func withTarget(ctx context.Context, a *audit, admin *adminServer, cat *catalog,
 			select {
 			case arrivals <- seqMsg{seq: tgt.seq, msg: m}:
 			default:
-				a.log(legInternal, "inbox-full", 0, "a reply was dropped", nil)
+				a.log(legInternal, "inbox-full", 0,
+					"a reply was dropped on "+accountID, nil)
 			}
 			return nil
 		}),
@@ -329,7 +341,7 @@ func withTarget(ctx context.Context, a *audit, admin *adminServer, cat *catalog,
 	return client.Run(ctx, func(ctx context.Context) error {
 		status, err := client.Auth().Status(ctx)
 		if err != nil {
-			return fmt.Errorf("auth: %w", err)
+			return fmt.Errorf("auth on %s: %w", accountID, err)
 		}
 		if !status.Authorized {
 			// A missing session is a state, not a fatal error.
@@ -339,16 +351,16 @@ func withTarget(ctx context.Context, a *audit, admin *adminServer, cat *catalog,
 			// add a session. So: say so loudly, keep serving, and wait for one
 			// to arrive at POST /api/session.
 			a.log(legInternal, "no-session", 0,
-				"no Telegram session stored. The bot is idle but the dashboard is up. "+
+				"no Telegram session stored for "+accountID+". The bot is idle but the dashboard is up. "+
 					"Add a session at POST /api/session, or run: cli session push",
-				map[string]string{"service": "still serving", "bot": "idle"})
+				map[string]string{"service": "still serving", "account": accountID})
 			// Hold the connection open with no account. The HTTP server runs
 			// alongside this, so the dashboard stays reachable.
 			select {
 			case <-ctx.Done():
 				return nil
 			case <-reconnectSignal:
-				a.log(legInternal, "retrying", 0, "a session arrived, reconnecting", nil)
+				a.log(legInternal, "retrying", 0, "a session arrived, reconnecting "+accountID, nil)
 				return errReconnect
 			}
 		}
@@ -368,36 +380,15 @@ func withTarget(ctx context.Context, a *audit, admin *adminServer, cat *catalog,
 
 		tgt.ctx, tgt.api, tgt.peer = ctx, client.API(), peer
 
-		// The dashboard and the Bot API webhook both live inside this, so there
-		// is one process: one MTProto connection, one session, one lock.
 		// The -list mode passes a nil admin, which simply means no dashboard.
 		if admin == nil {
-			return fn(tgt)
+			return onConnect(tgt)
 		}
 		// Remember the live connection so the sessions page can show which
 		// stored session is actually in use rather than merely present.
 		currentTarget = tgt
 		admin.tgt = tgt
-		admin.webhookSecret = hookSecret
-		// The store is opened BEFORE the session manager is built, because the
-		// manager is handed the handle. Built in the other order it received a
-		// nil *sql.DB, and GET /api/sessions dereferenced it and panicked on
-		// the first call - a 502 on a page that had never worked. The contract
-		// tests did not catch it because they wire the manager with a real
-		// handle: they verify the handler, not this ordering.
-		if admin.db, err = openCriticalStore(); err != nil {
-			a.log(legInternal, "admin-db", 0, "no critical store: "+err.Error(), nil)
-		} else {
-			defer admin.db.Close()
-		}
-		admin.sessions = newSessionManager(admin.db, a)
-		go func() {
-			if err := startAdmin(ctx, admin); err != nil {
-				a.log(legInternal, "admin-stopped", 0, err.Error(), nil)
-			}
-		}()
-
-		return fn(tgt)
+		return onConnect(tgt)
 	})
 }
 
@@ -553,25 +544,25 @@ func run() error {
 	fmt.Printf("state file : %s\n", filepath.Join(outDir, "state.json"))
 	fmt.Printf("updates    : %s\n", updateSourceName(hookSecret != ""))
 
-	// One MTProto client for the life of the process, shared by the update
-	// source and every provider action. A second client on the same session
-	// would fight over the auth key, so withTarget is entered exactly once and
-	// the update loop lives inside it.
+	// One MTProto client per stored account, supervised for the life of the
+	// process. A second client on the same session would fight over the auth
+	// key, so each account is entered exactly once and reconnects on its own.
 	//
-	// A reconnect is not fatal. When no session is stored the process stays up
-	// serving the dashboard, and a session uploaded over HTTP asks for a
-	// reconnect rather than needing a redeploy.
+	// A reconnect is not fatal, and neither is one account failing: when no
+	// session is stored the process stays up serving the dashboard, and a
+	// session uploaded over HTTP asks for a reconnect rather than needing a
+	// redeploy.
 	for ctx.Err() == nil {
-		err := withTarget(ctx, a, admin, cat, st, hookSecret, func(t *target) error {
+		err := withTargets(ctx, a, admin, cat, st, hookSecret, func(fl *fleet) error {
 			note := &botNotifier{bot: bot, admins: adminIDs, a: a}
 			w := newWatcher(outDir, a, note, watchEvery, watchForJob, catalogSubject(cat))
 			fmt.Printf("watching   : %q every %s (min 5m)\n", watchForJob, watchEvery)
-			go w.run(ctx, t, cat)
+			go w.run(ctx, func() *target { return fleetWatchTarget(fl) }, cat)
 
 			// One handler for both update sources, built once the provider is
 			// connected. The webhook needs it to exist before the HTTP server
 			// begins accepting deliveries.
-			h := &handler{bot: bot, audit: a, store: st, tgt: t,
+			h := &handler{bot: bot, audit: a, store: st, fleet: fl,
 				boundUser: boundUserID, cat: cat, alerts: note}
 			admin.dispatch = h.handle
 

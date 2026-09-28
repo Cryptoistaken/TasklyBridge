@@ -48,6 +48,9 @@ type adminServer struct {
 	// update to the same handler the long poller uses.
 	webhookSecret string
 	dispatch      func(inboundUpdate)
+	// fleet routes an end user to the account that serves them, and is how the
+	// dashboard reports how many accounts are live. nil in tests and in -list.
+	fleet *fleet
 	// note sends operator-facing announcements to ADMIN_USER_IDS and nowhere
 	// else. Hiding or showing a job is a decision with consequences for what
 	// users are offered, so the people who can make it are told when it happens.
@@ -319,6 +322,9 @@ func (s *adminServer) handleAPI(w http.ResponseWriter, r *http.Request) {
 		s.overview(w, r)
 	case path == "/accounts":
 		s.accounts(w, r)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/assign"):
+		s.assignAccountHandler(w, r,
+			strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/assign"))
 	case path == "/users":
 		s.users(w, r)
 	case path == "/tasks":
@@ -405,40 +411,136 @@ func (s *adminServer) overview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// accounts lists every Telegram account this bridge holds.
+//
+// It used to return a single hardcoded row with a made-up phone and
+// assigned_user_id echoed from BOUND_USER_ID, so the page showed "unknown" for
+// a number that was stored and an owner that did not exist. Both are now real
+// data read from the accounts table.
 func (s *adminServer) accounts(w http.ResponseWriter, r *http.Request) {
-	has, size := 0, 0
-	if h, sz, err := HasSession(context.Background(), s.db, sessionAccountID()); err == nil && h {
-		has, size = 1, sz
+	list, err := listAccounts(r.Context(), s.db)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError,
+			map[string]any{"error": "could not read accounts"})
+		return
 	}
-	state := "connected"
-	if s.tgt == nil {
-		state = "degraded"
-	}
-	// The stored balance, with the same honesty flag the sessions endpoint
-	// uses. A zero is ambiguous, so it is never presented as a real figure.
-	var balance float64
-	known := false
-	if s.db != nil {
-		var v float64
-		err := s.db.QueryRowContext(r.Context(),
-			`SELECT balance FROM accounts WHERE id = $1`, sessionAccountID()).Scan(&v)
-		if err == nil && v > 0 {
-			balance, known = v, true
+
+	items := make([]map[string]any, 0, len(list))
+	var total float64
+	known := true
+	live := 0
+	for _, a := range list {
+		state := a.State
+		connected := false
+		if s.fleet != nil {
+			if _, ok := s.fleet.get(a.ID); ok {
+				connected = true
+				live++
+			}
+		} else if s.tgt != nil && s.tgt.accountID == a.ID {
+			connected = true
+			live++
+		}
+		if !connected && state != "banned" && state != "dead" {
+			state = "idle"
+		}
+		note := a.Note
+		if !a.HasSession {
+			note = "no session stored - the dashboard is where one is added"
+		}
+		items = append(items, map[string]any{
+			"id": a.ID, "phone": a.Phone, "state": state,
+			"balance": a.Balance, "balance_known": a.BalanceKnown,
+			// 0 rather than null: the frontend renders "unassigned" for it, and
+			// a JSON null here would be a crash on a page that has no null
+			// handling at all.
+			"assigned_user_id":   a.Owner,
+			"has_session":        a.HasSession,
+			"session_bytes":      a.Bytes,
+			"connected":          connected,
+			"messages_sent":      0,
+			"flood_wait_seconds": 0,
+			"last_seen":          a.LastSeen,
+			"note":               note,
+		})
+		if a.BalanceKnown {
+			total += a.Balance
+		} else {
+			// A total that silently skips an unread balance understates what is
+			// there, which is the one number an operator acts on.
+			known = false
 		}
 	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"items": []map[string]any{{
-			"id": sessionAccountID(), "phone": accountPhone(), "state": state,
-			"balance": balance, "balance_known": known,
-			"assigned_user_id": boundUserID,
-			"messages_sent":    0, "flood_wait_seconds": 0,
-			"last_seen": time.Now().UTC().Format(time.RFC3339),
-			"note":      sessionNote(has, size),
-		}},
-		"total":         1,
-		"total_balance": balance,
-		"balance_known": known,
+		"items":         items,
+		"total":         len(items),
+		"total_balance": total,
+		"balance_known": known && len(items) > 0,
+		"live":          live,
+		"bound_user":    boundUserID,
 	})
+}
+
+// assignAccountHandler binds an account to an end user, or releases it.
+//
+// The conflict check happens before the write so the dashboard can explain
+// rather than return a bare 500: two accounts serving one user is the exact
+// situation that made the provider read one person's job as another's cancel.
+func (s *adminServer) assignAccountHandler(w http.ResponseWriter, r *http.Request, rawID string) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+	var req struct {
+		UserID int64 `json:"user_id"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest,
+			map[string]any{"error": `send {"user_id":12345}, or 0 to release`})
+		return
+	}
+	id, err := url.PathUnescape(rawID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad account id"})
+		return
+	}
+	if req.UserID != 0 {
+		if held, ok := ownedElsewhere(r.Context(), s.db, id, req.UserID); ok {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":   "that user is already served by another account",
+				"account": held,
+			})
+			return
+		}
+	}
+	if err := assignAccount(r.Context(), s.db, id, req.UserID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": err.Error()})
+		return
+	}
+	// The fleet's in-memory index is the thing every message consults, so a
+	// change here has to reach it or the assignment would only take effect
+	// after a restart.
+	if s.fleet != nil {
+		s.fleet.reassign(id, req.UserID)
+	}
+	s.audit.log(legInternal, "account-assign", 0,
+		describeAssignment(id, req.UserID, adminUID(r)),
+		map[string]string{"account": id, "user_id": strconv.FormatInt(req.UserID, 10)})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": id, "user_id": req.UserID})
+}
+
+// describeAssignment is one audit line, with no secret in it.
+func describeAssignment(accountID string, userID int64, by string) string {
+	target := "released"
+	if userID != 0 {
+		target = "now serves user " + strconv.FormatInt(userID, 10)
+	}
+	who := ""
+	if by != "" {
+		who = " by admin " + by
+	}
+	return accountID + " " + target + who
 }
 
 // sessionNote reports the presence of a session without revealing it. The blob

@@ -1,12 +1,28 @@
 import { Card } from "@/components/ui/card";
 import { SectionTitle } from "@/components/PageHeader";
 
-/** Labelled form control, matching the old .field layout. */
-export function Field({ label, children }: { label: string; children: React.ReactNode }): React.JSX.Element {
+/**
+ * Labelled form control, matching the old .field layout.
+ *
+ * hint is the small print under the control. It exists because some of these
+ * fields have a consequence that is not obvious from the label - naming an
+ * account decides which session it overwrites - and a field that quietly
+ * destroys the previous one is worth a sentence.
+ */
+export function Field({
+  label,
+  hint,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+}): React.JSX.Element {
   return (
     <label className="block">
       <span className="mb-1.5 block text-[11px] tracking-[0.06em] text-muted-foreground uppercase">{label}</span>
       {children}
+      {hint ? <span className="mt-1.5 block text-xs text-muted-foreground">{hint}</span> : null}
     </label>
   );
 }

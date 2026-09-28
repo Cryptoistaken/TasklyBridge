@@ -45,6 +45,11 @@ type loginAttempt struct {
 	storage   *captureStorage
 	needsPass bool
 	cancel    context.CancelFunc
+	// account is which stored session this login will become. Carried on the
+	// attempt rather than on the manager, because several logins can be in
+	// flight for different accounts at once and they must not share a
+	// destination.
+	account string
 }
 
 // captureStorage holds the session blob in memory until the login completes,
@@ -80,6 +85,10 @@ type sessionManager struct {
 	db    *sql.DB
 	audit *audit
 
+	// account is which stored session a login is for. It is set per request by
+	// the create call, because the Sessions page chooses the account: creating a
+	// session for an account that already has one would overwrite it, which is
+	// what happened while there was only ever the default.
 	mu       sync.Mutex
 	attempts map[string]*loginAttempt
 }
@@ -128,42 +137,41 @@ func (m *sessionManager) list(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"error": "no database, so sessions cannot be listed"})
 		return
 	}
-	rows, err := m.db.Query(
-		`SELECT s.account_id, a.phone, a.state, length(s.blob),
-		        to_char(s.updated_at,'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-		        a.balance, a.last_seen
-		 FROM sessions s JOIN accounts a ON a.id = s.account_id
-		 ORDER BY s.updated_at DESC`)
+	// Every account, not every stored session. An account whose sign-in was
+	// started and abandoned has no session row, and it must still be listed -
+	// that is how the operator sees a half-finished login. A JOIN would hide it,
+	// which is the same class of bug as the Messages page: asking a table that
+	// cannot hold the answer.
+	list, err := listAccounts(r.Context(), m.db)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "could not read sessions"})
 		return
 	}
-	defer rows.Close()
 
 	items := []map[string]any{}
 	var totalBalance float64
-	known := true
-	for rows.Next() {
-		var id, phone, state, updated string
-		var size int
-		var balance float64
-		var lastSeen sql.NullTime
-		if rows.Scan(&id, &phone, &state, &size, &updated, &balance, &lastSeen) != nil {
-			continue
-		}
+	known := len(list) > 0
+	for _, a := range list {
 		// A balance of exactly zero is ambiguous: it could be an account that
 		// really is empty, or one nothing has ever read. Only a non-zero figure
 		// is trustworthy, so the flag says so rather than guessing.
-		balanceKnown := balance > 0
-		if !balanceKnown {
+		balanceKnown := a.BalanceKnown
+		if balanceKnown {
+			totalBalance += a.Balance
+		} else {
 			known = false
 		}
-		totalBalance += balance
+		inUse := a.HasSession && m.isConnected()
+		if inUse {
+			inUse = m.inUseAccount() == a.ID
+		}
 		items = append(items, map[string]any{
-			"id": id, "phone": phone, "state": state, "bytes": size,
-			"updated_at": updated,
-			"in_use":     id == sessionAccountID() && m.isConnected(),
-			"balance":    balance, "balance_known": balanceKnown,
+			"id": a.ID, "phone": a.Phone, "state": a.State, "bytes": a.Bytes,
+			"updated_at":  a.UpdatedAt,
+			"has_session": a.HasSession,
+			"owner":       a.Owner,
+			"in_use":      inUse,
+			"balance":     a.Balance, "balance_known": balanceKnown,
 		})
 	}
 
@@ -176,11 +184,22 @@ func (m *sessionManager) list(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// isConnected reports whether the service is using the session right now, so
-// the dashboard can warn before a session is replaced.
+// isConnected reports whether the service is using a session right now, so the
+// dashboard can warn before one is replaced.
 func (m *sessionManager) isConnected() bool {
 	// The running target is the authority; a stored row is not.
 	return currentTarget != nil && currentTarget.api != nil
+}
+
+// inUseAccount is which account the running client belongs to. With several
+// accounts live, "connected" is no longer one yes/no for the whole service, and
+// a page that said a single account was in use when three were would be wrong
+// about the other two.
+func (m *sessionManager) inUseAccount() string {
+	if currentTarget == nil || currentTarget.api == nil {
+		return ""
+	}
+	return currentTarget.accountID
 }
 
 func (m *sessionManager) create(w http.ResponseWriter, r *http.Request) {
@@ -189,10 +208,18 @@ func (m *sessionManager) create(w http.ResponseWriter, r *http.Request) {
 		Code     string `json:"code"`
 		Password string `json:"password"`
 		Attempt  string `json:"attempt"`
+		// Account names which stored session this sign-in is for. Optional and
+		// defaulted, so a dashboard that has not been updated keeps working
+		// against a new backend.
+		Account string `json:"account"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body"})
 		return
+	}
+	accountID := normaliseAccountID(body.Account)
+	if accountID == "" {
+		accountID = defaultAccountID
 	}
 
 	// Each step is a separate call, and which step this is depends on what is
@@ -200,7 +227,7 @@ func (m *sessionManager) create(w http.ResponseWriter, r *http.Request) {
 	// afterwards, so two admins cannot interleave into one login.
 	switch {
 	case body.Attempt == "":
-		m.startLogin(w, body.Phone)
+		m.startLogin(w, body.Phone, accountID)
 	case body.Code != "":
 		m.submitCode(w, body.Attempt, body.Code)
 	case body.Password != "":
@@ -212,8 +239,60 @@ func (m *sessionManager) create(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// normaliseAccountID makes an account id safe to use as a filename and a URL
+// segment, because it arrives from a request body.
+//
+// The operator may send a phone number or a name, and the Sessions page offers
+// both, so both are accepted. Only a leading + or an all-digit value counts as
+// a phone number: treating "any string containing a dash" as one turned
+// "backup-1" into a different account, and a name that reduced to nothing fell
+// back to the default account and overwrote the session already stored there.
+func normaliseAccountID(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	// A phone number derives its id; it is never used verbatim.
+	if strings.HasPrefix(s, "+") || allDigits(s) {
+		return accountIDForPhone(s)
+	}
+	// A name is lowercased and stripped to characters that are safe in a path.
+	// The acct- prefix puts it in a different space from a derived phone id, so
+	// a name can never collide with a number.
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
+		if b.Len() >= 56 {
+			break
+		}
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	return "acct-" + b.String()
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // startLogin sends Telegram's login code to a phone number.
-func (m *sessionManager) startLogin(w http.ResponseWriter, phone string) {
+// startLogin sends Telegram's login code to a phone number, for a named account.
+//
+// accountID travels with the attempt rather than being looked up at the end, so
+// a login in flight cannot be redirected onto a different account by a second
+// request while it waits for the code.
+func (m *sessionManager) startLogin(w http.ResponseWriter, phone, accountID string) {
 	phone = strings.TrimSpace(phone)
 	if !strings.HasPrefix(phone, "+") || len(phone) < 8 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -227,10 +306,24 @@ func (m *sessionManager) startLogin(w http.ResponseWriter, phone string) {
 		})
 		return
 	}
+	if accountID == "" {
+		accountID = defaultAccountID
+	}
+	// The account row is created up front, so a half-finished login leaves a
+	// visible, obviously-empty account rather than nothing at all. That is what
+	// the operator needs to see to know a sign-in was started and abandoned.
+	if err := ensureAccountRow(context.Background(), m.db, accountID, phone); err != nil {
+		m.audit.log(legInternal, "session-create", 0, "could not create the account: "+err.Error(),
+			map[string]string{"phone": phone, "account": accountID})
+		writeJSON(w, http.StatusInternalServerError,
+			map[string]any{"error": "could not create the account"})
+		return
+	}
 
 	att := &loginAttempt{
 		id:      newAttemptID(),
 		phone:   phone,
+		account: accountID,
 		started: time.Now(),
 		storage: &captureStorage{},
 	}
@@ -353,10 +446,24 @@ func (m *sessionManager) finishLogin(w http.ResponseWriter, att *loginAttempt, c
 		return
 	}
 
-	// The live account is the one the bridge is using, so a new sign-in
-	// replaces it. Creating extra accounts is a future feature; pretending it
-	// works would be worse than saying so.
-	accountID := sessionAccountID()
+	// Which account this sign-in belongs to. It comes from the attempt, which
+	// got it from the create request, which got it from the operator choosing
+	// an account on the Sessions page.
+	//
+	// It used to be the single hardcoded id, with a comment saying extra
+	// accounts were a future feature. That is why creating a second session
+	// silently overwrote the first: one slot, keyed on the account id.
+	accountID := att.account
+	if accountID == "" {
+		accountID = defaultAccountID
+	}
+	// The row has to exist before the session can reference it.
+	if err := ensureAccountRow(ctx, m.db, accountID, att.phone); err != nil {
+		m.audit.log(legInternal, "session-create", 0, "could not create the account row: "+err.Error(),
+			map[string]string{"phone": att.phone, "account": accountID})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "could not create the account"})
+		return
+	}
 	if err := storeSessionBytes(ctx, m.db, accountID, blob); err != nil {
 		m.audit.log(legInternal, "session-create", 0, "could not store: "+err.Error(),
 			map[string]string{"phone": att.phone})
@@ -370,11 +477,12 @@ func (m *sessionManager) finishLogin(w http.ResponseWriter, att *loginAttempt, c
 	}
 
 	m.audit.log(legInternal, "session-create", 0, "session created",
-		map[string]string{"phone": att.phone, "bytes": fmt.Sprint(len(blob))})
+		map[string]string{"phone": att.phone, "bytes": fmt.Sprint(len(blob)),
+			"account": accountID})
 	requestReconnect()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "bytes": len(blob), "phone": att.phone,
+		"ok": true, "bytes": len(blob), "phone": att.phone, "account": accountID,
 		"note": "session created and stored. The service is reconnecting.",
 	})
 }

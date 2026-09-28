@@ -55,6 +55,11 @@ export interface Account {
   balance: number;
   /** False when the provider has not stated this balance, so `balance` is 0. */
   balance_known: boolean;
+  /** False when no session is stored, so the account cannot connect yet. */
+  has_session: boolean;
+  /** True when the MTProto client for this account is connected right now. */
+  connected?: boolean;
+  session_bytes?: number;
   assigned_user_id?: number | null;
   assigned_user_name?: string;
   messages_sent: number;

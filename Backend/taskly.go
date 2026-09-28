@@ -57,12 +57,18 @@ func parseTask(label string) (Task, bool) {
 // client. Telegram only delivers updates to the client that is actually
 // running, so this must share the running client rather than open its own.
 type target struct {
-	ctx      context.Context
-	api      *tg.Client
-	peer     tg.InputPeerClass
-	arrivals chan seqMsg
-	audit    *audit
-	timeout  time.Duration
+	// accountID is which stored session this client is. It is the key into both
+	// the sessions table and the fleet, and it is the only thing that tells one
+	// live account from another: two targets share the same peer, because they
+	// are two Telegram accounts talking to the same provider bot. That is the
+	// case this whole file exists to support.
+	accountID string
+	ctx       context.Context
+	api       *tg.Client
+	peer      tg.InputPeerClass
+	arrivals  chan seqMsg
+	audit     *audit
+	timeout   time.Duration
 	// last holds the most recent replies, so the keyboard currently on screen
 	// can be searched before sending anything.
 	last []*tg.Message

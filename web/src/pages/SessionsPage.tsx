@@ -63,6 +63,10 @@ export function SessionsPage(): React.JSX.Element {
   const [limited, setLimited] = useState(false);
   const [busy, setBusy] = useState(false);
   const [value, setValue] = useState("");
+  // newAccount is the account this sign-in is for. Left blank the server uses
+  // the default account, which is what an operator adding a second number does
+  // NOT want: it would overwrite the session that is already there.
+  const [newAccount, setNewAccount] = useState("");
 
   async function refresh(): Promise<void> {
     const l = await get<SessionList>("/api/sessions");
@@ -138,7 +142,11 @@ export function SessionsPage(): React.JSX.Element {
         return;
       }
       setPhone(p);
-      body = { phone: p };
+      // The account is named on the first step, and rides with the attempt from
+      // then on. Without it every sign-in landed on the one hardcoded account
+      // and overwrote the session already there, which is why a second account
+      // could not be created at all.
+      body = { phone: p, account: newAccount.trim() };
     } else if (step === "code") {
       if (!attempt) {
         restart("That sign-in attempt is gone. Start again from the phone number.");
@@ -290,6 +298,27 @@ export function SessionsPage(): React.JSX.Element {
                         disabled={limited || busy}
                       />
                     </Field>
+                    {/* Only on the first step: the account is named once and
+                        then carried by the attempt. Blank means the default
+                        account, which is what an operator adding a SECOND
+                        number must not do, because it would overwrite the
+                        session already stored there. */}
+                    {step === "phone" ? (
+                      <Field
+                        label="Account name (optional)"
+                        hint="Leave blank for the default account. To add another account, name it so this session is stored separately."
+                      >
+                        <input
+                          className={inputCls}
+                          type="text"
+                          placeholder="e.g. backup-1"
+                          spellCheck={false}
+                          value={newAccount}
+                          onChange={(e) => setNewAccount(e.target.value)}
+                          disabled={limited || busy}
+                        />
+                      </Field>
+                    ) : null}
                   </div>
                   <div className="mt-4 flex flex-wrap items-center gap-3">
                     <Button type="submit" variant="default" disabled={limited || busy}>

@@ -194,6 +194,15 @@ func describe(c change) string {
 
 // check performs one poll and alerts on any difference.
 func (w *watcher) check(ctx context.Context, t *target, cat *catalog) {
+	// No account connected yet. That is a normal state on a cold start and
+	// after every deploy until a session is stored, and the poll simply waits
+	// for the next tick. It must not be an error, because a dashboard with no
+	// session yet is exactly when the operator is watching these logs.
+	if t == nil {
+		w.audit.log(legInternal, "watch-wait", 0,
+			"no connected account to poll yet; the price watch waits", nil)
+		return
+	}
 	tasks, err := t.fetchTasks("cookie")
 	if err != nil {
 		w.audit.log(legInternal, "watch-error", 0, "poll failed: "+err.Error(), nil)
@@ -354,8 +363,16 @@ func (w *watcher) setAvailability(available bool, cost float64) {
 // run polls until the context ends. The interval is deliberately slow: every
 // poll is three automated messages to the provider, and an account that
 // automates too eagerly is exactly how an account gets banned.
-func (w *watcher) run(ctx context.Context, t *target, cat *catalog) {
-	w.check(ctx, t, cat)
+// run polls until the context ends, resolving the account to poll through on
+// each tick rather than being handed one at startup.
+//
+// That matters because accounts connect and disconnect independently now. A
+// target captured once would keep polling a connection that had gone away, and
+// the watch would go quiet for the rest of the process's life after the first
+// reconnect. resolve may return nil, which check treats as nothing connected
+// yet rather than as an error.
+func (w *watcher) run(ctx context.Context, resolve func() *target, cat *catalog) {
+	w.check(ctx, resolve(), cat)
 	for {
 		// A little jitter, so a fixed interval is not a machine signature.
 		jitter := time.Duration(time.Now().Unix()%int64(w.every/4)) * time.Second
@@ -364,7 +381,7 @@ func (w *watcher) run(ctx context.Context, t *target, cat *catalog) {
 			return
 		case <-time.After(w.every + jitter):
 		}
-		w.check(ctx, t, cat)
+		w.check(ctx, resolve(), cat)
 	}
 }
 
