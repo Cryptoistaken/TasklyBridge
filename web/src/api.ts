@@ -65,6 +65,12 @@ export interface SessionCreate {
   note?: string;
 }
 
+/** DELETE /api/sessions/{id}: the row is gone and the service needs a new session. */
+export interface SessionDelete {
+  ok: true;
+  note: string;
+}
+
 export type Leg = "user->bot" | "bot->user" | "bot->taskly" | "taskly->bot" | "internal";
 
 export interface Message {
@@ -197,22 +203,12 @@ export class ApiError extends Error {
 
 let onUnauthorized: (() => void) | null = null;
 
-/** Called whenever a /api request reports a dead admin session, so one place owns the login swap. */
+/** Called whenever any /api request answers 401, so one place owns the login swap. */
 export function setUnauthorized(fn: () => void): void {
   onUnauthorized = fn;
 }
 
-export interface ApiOptions {
-  /**
-   * `false` for an endpoint where 401 is an application answer — the login
-   * code or the 2FA password was rejected — instead of a dead admin cookie.
-   * The body's `error` is then thrown to the caller rather than swapping the
-   * whole app to the login card. See POST /api/sessions in docs/api.md.
-   */
-  auth401?: boolean;
-}
-
-export async function api<T>(method: string, path: string, body?: unknown, opts?: ApiOptions): Promise<T> {
+export async function api<T>(method: string, path: string, body?: unknown): Promise<T> {
   let res: Response;
   try {
     res = await fetch(path, {
@@ -224,6 +220,14 @@ export async function api<T>(method: string, path: string, body?: unknown, opts?
     throw new ApiError("Cannot reach the server. Is the Go backend running?", 0);
   }
 
+  // 401 means exactly one thing in this API: not authenticated. A rejected
+  // login code or 2FA password is 403 (docs/api.md), so this never fires for
+  // those and there is no opt-out to remember.
+  if (res.status === 401) {
+    onUnauthorized?.();
+    throw new ApiError("unauthorized", 401);
+  }
+
   const text = await res.text();
   let data: unknown = null;
   if (text) {
@@ -233,17 +237,9 @@ export async function api<T>(method: string, path: string, body?: unknown, opts?
       data = null;
     }
   }
-  const e = data && typeof data === "object" ? (data as { error?: string; field?: string }) : null;
-
-  // A dead admin cookie always announces itself as "unauthorized", so an
-  // endpoint that answers 401 for its own reasons still lands on the login
-  // card when the cookie really is gone.
-  if (res.status === 401 && (opts?.auth401 !== false || e?.error === "unauthorized")) {
-    onUnauthorized?.();
-    throw new ApiError("unauthorized", 401);
-  }
 
   if (!res.ok) {
+    const e = data && typeof data === "object" ? (data as { error?: string; field?: string }) : null;
     throw new ApiError(e?.error ?? `${method} ${path} failed with ${res.status}`, res.status, e?.field);
   }
   return data as T;

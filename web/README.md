@@ -97,3 +97,8 @@ web/
   never held in module state, the URL or storage. Only the attempt id is held
   (in memory) to tie the steps together. A stored session the service is not
   using is flagged destructive on the list, because it is a trap.
+- **Deleting a session takes two clicks** — the first arms the row and spells
+  out that the account must be signed in again and the service will need a new
+  session (loudest for the `in use` row); the second confirms. A fast
+  double-click does not count, because one accidental deletion logs the account
+  out and cannot be undone.

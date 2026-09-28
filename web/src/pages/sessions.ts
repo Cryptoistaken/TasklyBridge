@@ -7,7 +7,7 @@
 // attempt id is held, in memory, because it has to survive the re-render
 // between steps.
 
-import { ApiError, api, get, type List, type Session, type SessionCreate } from "../api";
+import { ApiError, api, get, takeOverview, type List, type Session, type SessionCreate, type SessionDelete } from "../api";
 import {
   chip,
   dot,
@@ -26,7 +26,10 @@ import {
   type Page,
 } from "../ui";
 
-const COLUMNS = 5;
+const COLUMNS = 6;
+// Deleting logs the account out, so the second click has to be a deliberate
+// one: a fast double-click lands inside this window and does nothing.
+const ARM_DELAY = 750;
 
 type Step = "phone" | "code" | "password" | "done";
 
@@ -42,11 +45,20 @@ const STEP: Record<Step, { title: string; field: string; action: string }> = {
 let statsSlot: HTMLElement | null = null;
 let formSlot: HTMLElement | null = null;
 let listSlot: HTMLElement | null = null;
+let flashSlot: HTMLElement | null = null;
 let errSlot: HTMLElement | null = null;
 let input: HTMLInputElement | null = null;
 let btn: HTMLButtonElement | null = null;
 
 let items: Session[] = [];
+
+// Delete: the first click arms a row, the second confirms it. Held here, in
+// memory only, like everything else on this page.
+let armed: string | null = null;
+let armedAt = 0;
+let deleting = false;
+let flash = "";
+let flashBad = false;
 
 // The create flow. The attempt id lives here and nowhere else — not in the
 // DOM, not in the URL, not in localStorage — so a re-render cannot lose it
@@ -70,8 +82,18 @@ function stateChip(s: Session): HTMLElement {
   return h("span", { class: "chip " + (tone === "ok" ? "" : tone) }, dot(tone), s.state);
 }
 
+function deleteWarning(s: Session): string {
+  const cost =
+    "The account will have to be signed in again, and the service will need a new session created.";
+  const head = s.in_use
+    ? "This is the session the service is using right now — deleting it leaves the service with none. "
+    : "";
+  return `${head}Deleting signs the account out and cannot be undone. ${cost} Click Confirm delete to proceed.`;
+}
+
 function row(s: Session): HTMLTableRowElement[] {
   const idle = !s.in_use;
+  const thisArmed = armed === s.id;
   const cells = h(
     "tr",
     { "data-id": s.id },
@@ -80,7 +102,20 @@ function row(s: Session): HTMLTableRowElement[] {
     td(fmtBytes(s.bytes), "num mono"),
     td(when(s.updated_at), "mono nowrap muted"),
     td(idle ? chip("not in use", "bad") : h("span", { class: "chip" }, dot("ok"), "in use")),
+    td(
+      h("button", {
+        class: "btn danger sm",
+        type: "button",
+        text: deleting && thisArmed ? "Deleting…" : thisArmed ? "Confirm delete" : "Delete",
+        disabled: deleting,
+        onclick: () => void remove(s),
+      }),
+      "nowrap",
+    ),
   );
+  // Armed wins over the idle note: one row, one message, and the armed one is
+  // the message that must not be missed.
+  if (thisArmed) return [cells, subRow(COLUMNS, h("span", { class: "warn", text: deleteWarning(s) }))];
   // A stored session the service is not using is a trap, so it says so under
   // the row instead of relying on the chip alone.
   return idle
@@ -99,6 +134,7 @@ function renderList(): void {
           { label: "Size", num: true },
           { label: "Updated" },
           { label: "In use" },
+          { label: "Action" },
         ],
         items.length
           ? items.flatMap(row)
@@ -124,6 +160,62 @@ async function refresh(): Promise<void> {
   items = list.items;
   renderStats();
   renderList();
+}
+
+// --- delete -----------------------------------------------------------------
+
+function paintFlash(): void {
+  if (!flashSlot) return;
+  flashSlot.replaceChildren();
+  if (flash) {
+    flashSlot.appendChild(h("p", { class: flashBad ? "notice bad" : "notice", style: "margin-bottom:12px", text: flash }));
+  }
+}
+
+async function remove(s: Session): Promise<void> {
+  if (deleting) return;
+  if (armed !== s.id) {
+    armed = s.id; // first click arms
+    armedAt = Date.now();
+    renderList();
+    return;
+  }
+  if (Date.now() - armedAt < ARM_DELAY) return; // a double-click is one gesture
+
+  deleting = true;
+  renderList();
+  const wasInUse = s.in_use;
+
+  let note = "";
+  try {
+    const r = await api<SessionDelete>("DELETE", "/api/sessions/" + encodeURIComponent(s.id));
+    note = r.note;
+  } catch (e) {
+    deleting = false;
+    armed = null;
+    flash = errorMessage(e); // 404 comes back as the server's own message
+    flashBad = true;
+    renderList();
+    paintFlash();
+    return;
+  }
+
+  deleting = false;
+  armed = null;
+  flash = `Deleted ${s.phone || s.id} — ${note}`;
+  flashBad = false;
+  if (wasInUse) {
+    // The boot-time Overview snapshot predates this delete. Dropping it makes
+    // the next visit refetch instead of implying the service is still up.
+    takeOverview();
+  }
+  try {
+    await refresh();
+  } catch (e) {
+    flashBad = true;
+    flash += ` · list refresh failed: ${errorMessage(e)}`;
+  }
+  paintFlash();
 }
 
 // --- create form ------------------------------------------------------------
@@ -294,8 +386,8 @@ async function submit(): Promise<void> {
   paintErr();
 
   try {
-    // No auth401 override: this endpoint never returns 401 for a rejected
-    // credential, so a 401 here is unambiguously a dead admin session.
+    // A 401 here can only mean the admin session is gone: a rejected code or
+    // password is 403 (docs/api.md), so the default 401 handling is correct.
     const r = await api<SessionCreate>("POST", "/api/sessions", body);
 
     if (r.ok) {
@@ -333,11 +425,12 @@ export const sessions: Page = {
     statsSlot = h("div", {});
     formSlot = h("div", {});
     listSlot = h("div", {});
+    flashSlot = h("div", {});
     el.replaceChildren(
       pageHead("Sessions", "stored Telegram sessions · created here, step by step, no file upload"),
       statsSlot,
       section("Create a session", formSlot),
-      section("Stored sessions", listSlot),
+      section("Stored sessions", flashSlot, listSlot),
     );
     renderForm();
     await refresh();
@@ -347,10 +440,16 @@ export const sessions: Page = {
     statsSlot = null;
     formSlot = null;
     listSlot = null;
+    flashSlot = null;
     errSlot = null;
     input = null;
     btn = null;
     items = [];
+    armed = null;
+    armedAt = 0;
+    deleting = false;
+    flash = "";
+    flashBad = false;
     step = "phone";
     attempt = null;
     phone = "";

@@ -227,6 +227,18 @@ diagnosable and it is not a secret.
 Errors: `400` bad phone or missing field, `403` code or password rejected,
 `404` the attempt expired, `429` too many attempts (5 per hour).
 
+#### `DELETE /api/sessions/{id}`
+
+Removes a stored session. This signs the account out and cannot be undone: the
+service is left with no session and a new one must be created.
+
+```json
+{ "ok": true, "note": "the service will need a new session" }
+```
+
+`404` if there is no such session. The client should confirm before calling,
+and say plainly when the session being removed is the one currently in use.
+
 **`401` means exactly one thing: not authenticated.** A rejected login code or
 2FA password is `403`, never `401`, so a client can treat every `401` as a dead
 admin session without having to inspect the body. An earlier draft of this
