@@ -88,9 +88,13 @@ func (s *adminServer) routes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/auth/telegram/config", s.handleLoginConfig)
 	mux.HandleFunc("/api/auth/telegram/login", s.handleLogin)
 
-	// Private: everything else under /api, plus the dashboard itself.
+	// Private: everything under /api. The dashboard shell is NOT gated,
+	// because it is the page that performs the login. Gating it would mean
+	// the sign-in screen could not be reached to obtain a session, which is a
+	// lockout rather than a security measure. It contains no data: the API
+	// behind it is what actually holds anything.
 	mux.Handle("/api/", s.requireAuth(http.HandlerFunc(s.handleAPI)))
-	mux.Handle("/", s.requireAuth(s.dashboardHandler()))
+	mux.Handle("/", s.dashboardHandler())
 }
 
 // dashboardHandler serves the built frontend, falling back to index.html so
