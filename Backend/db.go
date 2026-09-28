@@ -90,20 +90,27 @@ CREATE TABLE IF NOT EXISTS withdrawals (
   at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS withdrawals_at_idx ON withdrawals (at DESC);
-
-CREATE TABLE IF NOT EXISTS price_baseline (
-  job        TEXT PRIMARY KEY,
-  price      NUMERIC(12,4) NOT NULL,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS job_availability (
-  job        TEXT PRIMARY KEY,
-  available  BOOLEAN NOT NULL DEFAULT false,
-  cost       NUMERIC(12,4) NOT NULL DEFAULT 0,
-  at         TIMESTAMPTZ NOT NULL DEFAULT now()
-);
 `
+
+// Two tables that used to be here have been removed: price_baseline and
+// job_availability.
+//
+// Neither was ever written. The price watcher persists to prices.json and
+// availability.json on the data volume, so both tables sat empty while their
+// names said otherwise. job_availability was worse than dead: the dashboard
+// read it, always got nothing, and reported every job as UNAVAILABLE from a
+// table that had never held a row.
+//
+// The watcher writes to the volume rather than the database on purpose. The
+// price poll is every fifteen minutes and the availability state is one small
+// file; putting them in Postgres would mean waking a store that scales to zero,
+// several times an hour, to record two numbers. The file also survives a
+// restart without a query, which is what "did we already announce this" needs.
+//
+// Existing databases keep the empty tables - the schema is CREATE IF NOT
+// EXISTS, so removing the statement changes nothing for a deployment that
+// already has them. They are simply never written and never read again.
+const _ = 0
 
 // hotSchema is the transcript. It grows on every interaction, so it is the
 // thing worth keeping out of the store that suspends.
