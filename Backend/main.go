@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -183,6 +184,16 @@ func envBool(key string, def bool) bool {
 // outside the dotenv loader.
 func getenv(key string) string { return strings.TrimSpace(os.Getenv(key)) }
 
+// sessionSecret is the key the admin session cookie is signed with. It must
+// not be blank in production, because a blank key would make every cookie
+// forgeable.
+func sessionSecret() string {
+	if s := getenv("ADMIN_SESSION_SECRET"); s != "" {
+		return s
+	}
+	return "insecure-development-secret-do-not-use-in-production"
+}
+
 func envOr(key, def string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
@@ -223,6 +234,7 @@ func main() {
 	list := flag.Bool("list", false, "read the provider job list and exit")
 	migrate := flag.Bool("migrate", false, "apply the database schema and exit")
 	status := flag.Bool("status", false, "print configuration and database state, then exit")
+	asCLI := flag.Bool("cli", false, "run the operator CLI, passing the rest of the arguments to it")
 	flag.Parse()
 
 	switch {
@@ -247,6 +259,10 @@ func main() {
 		if err := runList(); err != nil {
 			fail(err)
 		}
+	case *asCLI:
+		if err := runCLI(flag.Args()); err != nil {
+			fail(err)
+		}
 	default:
 		if err := run(); err != nil {
 			fail(err)
@@ -265,14 +281,20 @@ func fail(err error) {
 //
 // The target is built before the client so the update handler can stamp
 // arrivals; its api and peer are filled in once the client is running.
-func withTarget(ctx context.Context, a *audit, fn func(*target) error) error {
+func withTarget(ctx context.Context, a *audit, botRef *botClient, cat *catalog, st *store, fn func(*target) error) error {
 	arrivals := make(chan seqMsg, 64)
 	var targetID int64
 
 	tgt := &target{arrivals: arrivals, audit: a, timeout: waitTimeout}
 
+	// The session comes from the critical store when there is one, and from
+	// disk otherwise. Reading a file would work right up until the first
+	// deploy, at which point the container has no session and the account
+	// would have to be signed in again by hand.
+	storage := sessionStorage(ctx, a)
+
 	client := telegram.NewClient(apiID, apiHash, telegram.Options{
-		SessionStorage: &session.FileStorage{Path: sessionPath},
+		SessionStorage: storage,
 		Device:         telegram.DeviceTDesktopWindows(),
 		UpdateHandler: telegram.UpdateHandlerFunc(func(_ context.Context, u tg.UpdatesClass) error {
 			m := extractMessage(u)
@@ -300,7 +322,25 @@ func withTarget(ctx context.Context, a *audit, fn func(*target) error) error {
 			return fmt.Errorf("auth: %w", err)
 		}
 		if !status.Authorized {
-			return fmt.Errorf("session is not signed in - run: go run ./Test -login")
+			// A missing session is a state, not a fatal error.
+			//
+			// Returning an error here crash-looped the whole service, which took
+			// the dashboard down at exactly the moment an operator needed it to
+			// add a session. So: say so loudly, keep serving, and wait for one
+			// to arrive at POST /api/session.
+			a.log(legInternal, "no-session", 0,
+				"no Telegram session stored. The bot is idle but the dashboard is up. "+
+					"Add a session at POST /api/session, or run: cli session push",
+				map[string]string{"service": "still serving", "bot": "idle"})
+			// Hold the connection open with no account. The HTTP server runs
+			// alongside this, so the dashboard stays reachable.
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-reconnectSignal:
+				a.log(legInternal, "retrying", 0, "a session arrived, reconnecting", nil)
+				return errReconnect
+			}
 		}
 		peer, id, err := resolve(ctx, client.API(), targetBot)
 		if err != nil {
@@ -317,8 +357,69 @@ func withTarget(ctx context.Context, a *audit, fn func(*target) error) error {
 			map[string]string{"bot": targetBot})
 
 		tgt.ctx, tgt.api, tgt.peer = ctx, client.API(), peer
+
+		// The dashboard and the Bot API long poll both live inside this, so
+		// there is one process: one MTProto connection, one session, one lock.
+		// The -list mode passes nils, which simply means no dashboard.
+		if botRef == nil {
+			return fn(tgt)
+		}
+		admin := &adminServer{
+			bot: botRef, audit: a, store: st, tgt: tgt, cat: cat,
+			secret:  []byte(sessionSecret()),
+			clients: map[chan []byte]struct{}{},
+		}
+		if admin.db, err = openCriticalStore(); err != nil {
+			a.log(legInternal, "admin-db", 0, "no critical store: "+err.Error(), nil)
+		} else {
+			defer admin.db.Close()
+		}
+		go func() {
+			if err := startAdmin(ctx, admin); err != nil {
+				a.log(legInternal, "admin-stopped", 0, err.Error(), nil)
+			}
+		}()
+
 		return fn(tgt)
 	})
+}
+
+// sessionStorage picks where the Telegram session lives.
+//
+// The critical store is the answer whenever it is configured, because a
+// container filesystem is wiped on every deploy and this service has no volume.
+// The file path remains the fallback so a purely local run needs no database.
+//
+// The session blob is a live credential, so it is never logged. Only the fact
+// of its presence and size is ever reported.
+func sessionStorage(ctx context.Context, a *audit) telegram.SessionStorage {
+	db, err := openCriticalStore()
+	if err != nil {
+		a.log(legInternal, "session-store", 0,
+			"no critical store, falling back to the session file: "+err.Error(), nil)
+		return &session.FileStorage{Path: sessionPath}
+	}
+	// A cold Neon must not crash-loop the service, so give it a few seconds.
+	if err := waitForDB(ctx, db, 5); err != nil {
+		a.log(legInternal, "session-store", 0, err.Error(), map[string]string{
+			"fallback": "session file",
+		})
+		db.Close()
+		return &session.FileStorage{Path: sessionPath}
+	}
+	store := &neonSessionStore{db: db, accountID: sessionAccountID()}
+	if has, size, err := HasSession(ctx, db, sessionAccountID()); err == nil {
+		if has {
+			a.log(legInternal, "session-store", 0,
+				"session loaded from the critical store", map[string]string{
+					"account": sessionAccountID(), "bytes": strconv.Itoa(size),
+				})
+		} else {
+			a.log(legInternal, "session-store", 0,
+				"no session stored yet; the account must be signed in once", nil)
+		}
+	}
+	return store
 }
 
 func runList() error {
@@ -329,7 +430,7 @@ func runList() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	return withTarget(ctx, a, func(t *target) error {
+	return withTarget(ctx, a, nil, nil, nil, func(t *target) error {
 		tasks, err := t.fetchTasks("cookie")
 		if err != nil {
 			return err
@@ -392,44 +493,65 @@ func run() error {
 	// poll loop and every provider action. A second client on the same session
 	// would fight over the auth key, so withTarget is entered exactly once and
 	// the poller lives inside it.
-	return withTarget(ctx, a, func(t *target) error {
-		note := &botNotifier{bot: bot, admins: adminIDs, a: a}
-		w := newWatcher(outDir, a, note, watchEvery, watchForJob, catalogSubject(cat))
-		fmt.Printf("watching   : %q every %s (min 5m)\n\n", watchForJob, watchEvery)
-		go w.run(ctx, t, cat)
+	//
+	// A reconnect is not fatal. When no session is stored the process stays up
+	// serving the dashboard, and a session uploaded over HTTP asks for a
+	// reconnect rather than needing a redeploy.
+	for ctx.Err() == nil {
+		err := withTarget(ctx, a, bot, cat, st, func(t *target) error {
+			note := &botNotifier{bot: bot, admins: adminIDs, a: a}
+			w := newWatcher(outDir, a, note, watchEvery, watchForJob, catalogSubject(cat))
+			fmt.Printf("watching   : %q every %s (min 5m)\n\n", watchForJob, watchEvery)
+			go w.run(ctx, t, cat)
 
-		var offset int64
-		for ctx.Err() == nil {
-			updates, err := bot.getUpdates(offset, 25)
-			if err != nil {
-				// Another instance holds the getUpdates lock. Retrying fast
-				// would just fill the log, so say it once and back right off.
-				if isDuplicateInstance(err) {
-					a.log(legInternal, "duplicate-instance", 0,
-						"another instance is polling this bot; backing off 60s", nil)
+			var offset int64
+			for ctx.Err() == nil {
+				updates, err := bot.getUpdates(offset, 25)
+				if err != nil {
+					// Another instance holds the getUpdates lock. Retrying fast
+					// would just fill the log, so say it once and back right off.
+					if isDuplicateInstance(err) {
+						a.log(legInternal, "duplicate-instance", 0,
+							"another instance is polling this bot; backing off 60s", nil)
+						select {
+						case <-ctx.Done():
+							return nil
+						case <-time.After(60 * time.Second):
+						}
+						continue
+					}
+					a.log(legInternal, "poll-error", 0, err.Error(), nil)
 					select {
 					case <-ctx.Done():
 						return nil
-					case <-time.After(60 * time.Second):
+					case <-time.After(3 * time.Second):
 					}
 					continue
 				}
-				a.log(legInternal, "poll-error", 0, err.Error(), nil)
-				select {
-				case <-ctx.Done():
-					return nil
-				case <-time.After(3 * time.Second):
+				for _, u := range updates {
+					offset = u.UpdateID + 1
+					h := &handler{bot: bot, audit: a, store: st, tgt: t, boundUser: boundUserID, cat: cat, alerts: note}
+					h.handle(u)
 				}
-				continue
 			}
-			for _, u := range updates {
-				offset = u.UpdateID + 1
-				h := &handler{bot: bot, audit: a, store: st, tgt: t, boundUser: boundUserID, cat: cat, alerts: note}
-				h.handle(u)
-			}
+			return nil
+		})
+
+		if err == nil || ctx.Err() != nil {
+			return err
 		}
-		return nil
-	})
+		if !errors.Is(err, errReconnect) {
+			a.log(legInternal, "provider-down", 0, err.Error(), map[string]string{
+				"action": "retrying in 10s",
+			})
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(10 * time.Second):
+		}
+	}
+	return nil
 }
 
 // -------------------------------------------------------------- self test ---
