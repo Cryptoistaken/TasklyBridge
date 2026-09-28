@@ -26,11 +26,40 @@ const WIDGET_SRC = "https://oauth.telegram.org/js/telegram-login.js";
 // exist on window rather than being a closure.
 declare global {
   interface Window {
-    onTelegramAuth?: (data: { id_token?: string; error?: string }) => void;
+    onTelegramAuth?: (data: { id_token?: string; error?: string } | string) => void;
   }
 }
 
 let scriptLoading: Promise<boolean> | null = null;
+
+/**
+ * Pull the id_token out of the widget's URL fragment, or "" when the fragment
+ * holds no result.
+ *
+ * base64url is restored to base64 and padded, because atob needs the padding.
+ * A decode failure returns "" rather than throwing, so a malformed fragment
+ * degrades to "not signed in" instead of a blank page.
+ */
+function tokenFromHash(hash: string): string {
+  const m = hash.match(/tgAuthResult=([^&]+)/);
+  if (!m) return "";
+  try {
+    const b64 = m[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const payload: unknown = JSON.parse(atob(padded));
+    if (typeof payload === "string") return payload;
+    if (payload && typeof payload === "object") {
+      const rec = payload as Record<string, unknown>;
+      for (const key of ["result", "id_token", "token"]) {
+        const v = rec[key];
+        if (typeof v === "string" && v) return v;
+      }
+    }
+    return "";
+  } catch {
+    return "";
+  }
+}
 
 function loadWidget(clientId: string): Promise<boolean> {
   // The script must exist before the widget can bind, and it must not be added
@@ -121,20 +150,47 @@ export function mountLogin(root: HTMLElement, onOk: () => void): void {
     fail(body.error || body.name || "Sign-in failed.");
   }
 
+  // Second path only. The flow that actually happens is the fragment below; see
+  // the note at the top of this file. Some hosts deliver the result through
+  // this callback instead, so it stays wired.
   window.onTelegramAuth = (data) => {
+    if (typeof data === "string") {
+      // Some builds pass the result as a bare string.
+      if (data.startsWith("{")) {
+        try {
+          void exchange(JSON.parse(data).id_token as string);
+        } catch {
+          fail("Telegram returned something unreadable.");
+        }
+        return;
+      }
+      if (data) void exchange(data);
+      return;
+    }
     if (data?.error) {
-      err.hidden = false;
-      err.textContent = String(data.error);
-      status.textContent = "";
+      fail(String(data.error));
       return;
     }
-    const idToken = data?.id_token;
-    if (!idToken) {
-      fail("Telegram returned no token.");
+    if (data?.id_token) {
+      void exchange(data.id_token);
       return;
     }
-    void exchange(idToken);
+    fail("Telegram returned no token.");
   };
+
+  // The path that actually fires: the widget navigates away to Telegram and
+  // comes back with the result in the fragment, so the token is read here on
+  // load. Without this, approving in Telegram returns to a page that does
+  // nothing at all.
+  const fromHash = tokenFromHash(window.location.hash);
+  if (fromHash) {
+    // Clear the fragment first, so a reload does not replay the exchange and
+    // the token does not linger in the address bar or in history.
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+    button.disabled = true;
+    void exchange(fromHash);
+    return;
+  }
 
   // The client id is public: it names the application, not a user.
   (async () => {
