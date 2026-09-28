@@ -518,33 +518,33 @@ input[type="checkbox"] {
   background: var(--background);
 }
 
-.login-card {
-  width: 320px;
+/* The page holds nothing but the sign-in button, so it is sized to the widget
+   rather than to a card. Telegram renders its own button inside it. */
+.login-actions {
+  width: 300px;
   display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 28px 24px;
+  justify-content: center;
 }
 
-.login-card .wordmark,
-.login-card .brand {
-  padding: 0;
-  font-size: 17px;
+/* Status and errors sit under the button and are hidden until there is
+   something to say, so the resting page really is just the button. */
+.login-aside {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  max-width: 380px;
+  text-align: center;
+  min-height: 18px;
+}
+
+.login-aside p {
   margin: 0;
 }
 
-.login-card .btn {
-  margin-top: 4px;
-  width: 100%;
-}
-
-/* The sign-in button is the page's single primary action, so it is given the
-   full card width and never sits beside anything else. */
-.login-actions {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 6px;
+.login-aside p[hidden] {
+  display: none;
 }
 
 /* The Telegram widget replaces this button's contents and styles it itself, so

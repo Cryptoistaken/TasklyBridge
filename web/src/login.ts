@@ -69,17 +69,20 @@ export function mountLogin(root: HTMLElement, onOk: () => void): void {
   );
   button.disabled = true;
 
-  const card = h("div", { class: "card login-card" },
-    h("h1", { class: "brand" }, "TasklyBridge"),
-    h("p", { class: "muted small" }, "Admin dashboard"),
+  // Just the button. No wordmark, no subtitle, no card chrome: the page has one
+  // job and the widget is the whole of it.
+  //
+  // The status and error lines stay in the DOM because a failure has to be
+  // visible, but they are hidden until there is something to say.
+  //
+  // The centering lives on .login in the stylesheet, so the button has to sit
+  // inside that wrapper.
+  root.replaceChildren(h(
+    "div",
+    { class: "login" },
     h("div", { class: "login-actions" }, button),
-    status,
-    err,
-  );
-  // The centering lives on .login in the stylesheet, so the card has to sit
-  // inside that wrapper. Replacing the root with the card alone left the card
-  // pinned to the top-left of the page.
-  root.replaceChildren(h("div", { class: "login" }, card));
+    h("div", { class: "login-aside" }, status, err),
+  ));
 
   function fail(message: string): void {
     err.textContent = message;
