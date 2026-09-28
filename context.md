@@ -74,7 +74,7 @@ scarce, risky resource.
 | Location | `C:\Users\Ratul\Studio\Tools\TasklyBridge` |
 | Backend | **Go**, one binary, both sides |
 | MTProto | `github.com/gotd/td` **v0.162.0** |
-| Our bot | **`@OpenTasksBot`** (id `8730058124`), long polling, no library |
+| Our bot | **`@OpenTasksBot`** (id `8730058124`), webhook, no library |
 | Dashboard | TypeScript built by Bun to static files, served by Go (not built) |
 | Database | **Neon Postgres** (new project) — not wired; JSON files stand in |
 | Hosting | One Railway service, one process |
@@ -502,6 +502,19 @@ Each was found by running the thing, not by reading it.
     survived, kept the `getUpdates` lock, and quietly degraded production for
     twenty minutes while I debugged the wrong thing. Startup now refuses to
     run when another instance already holds that lock.
+21. **The login callback was wired and the token was never read.** The official
+    widget does not hand the token to a JavaScript callback in the usual flow:
+    it navigates away to Telegram and returns with the result in the URL
+    fragment as `#tgAuthResult=<base64url>`. `window.onTelegramAuth` was
+    declared, named in `data-onauth` and assigned — and never fired. Login
+    looked completely dead: approve in Telegram, come back, nothing happens, no
+    error, no network request. `tsc` and `bun run build` were both clean,
+    because the code was well-formed and simply never called. Fixed by reading
+    the fragment on load, base64url-decoding it and exchanging it, with the
+    callback kept as a second path. The shape came from SheetSubmit's
+    `LoginScreen`, and **reading the working reference is what surfaced it** —
+    I had guessed the API from memory twice and guessed wrong twice. This is
+    rule 9 again: a wired handler is not a reached one.
 
 ### A process failure worth recording
 

@@ -39,6 +39,7 @@ HMAC-signed with `ADMIN_SESSION_SECRET`.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/healthz` | 200 when at least one account is connected |
+| `POST` | `/webhook` | Telegram update delivery — **see below** |
 | `POST` | `/api/logout` | clears the cookie |
 | `GET` | `/api/sessions` | list stored Telegram sessions |
 | `POST` | `/api/sessions` | start or continue creating a session |
@@ -59,6 +60,41 @@ HMAC-signed with `ADMIN_SESSION_SECRET`.
 | `GET` | `/api/settings` | non-secret configuration |
 | `PUT` | `/api/settings` | the editable subset |
 | `GET` | `/api/events` | **SSE** live feed |
+
+## `POST /webhook`
+
+Telegram's delivery endpoint, and the only route on this service that is public
+without a session — Telegram is the caller and cannot hold one.
+
+The bot **registers this itself on every boot**, from `RAILWAY_PUBLIC_DOMAIN`
+(Railway injects it) with `WEBHOOK_BASE_URL` as an optional override. It is not
+set once at setup, because Railway hands out a different domain whenever the
+service is recreated, and a webhook pointing at a dead URL is a silent failure:
+the process looks healthy and simply never hears anything again. After
+`setWebhook`, `getWebhookInfo` is read back and a `last_error_message` there
+fails startup rather than being logged and ignored.
+
+| Situation | Result |
+| --- | --- |
+| `WEBHOOK_SECRET` set, header missing or wrong | `403`, body not parsed |
+| `GET` instead of `POST` | `405` |
+| Secret ok, update well-formed | `200` **immediately**, work continues after |
+
+The `200` is sent before the update is handled. A provider navigation takes
+seconds, and answering late would make Telegram redeliver the same update
+repeatedly. Rule 4 still applies: the handler must not block.
+
+**Webhook and long polling are mutually exclusive.** Telegram refuses
+`getUpdates` while a webhook is set, so when a webhook registers the poller does
+not start. The startup banner says which one is live (`updates : webhook` or
+`updates : long polling`) because being in the wrong one produces no error at
+all — only silence. For the same reason the duplicate-instance probe
+(`getUpdates`-based) runs **only** on the polling path, and **after**
+registration: probing `getUpdates` in webhook mode fails every single boot.
+
+Without `WEBHOOK_SECRET` one is generated per process. That still works, because
+registration re-runs on boot, but the log says so — a silently rotating secret
+is a miserable thing to debug.
 
 ## Payloads
 
