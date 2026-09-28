@@ -36,8 +36,8 @@ func selfTestWallet() error {
 	for name, bad := range map[string]string{
 		"empty":           "",
 		"whitespace only": "   ",
-		"too short":       "0x2222222222222222222222222222222222222222",
-		"too long":        "0x1111111111111111111111111111111111111111ab",
+		"too short":       "0x222222222222222222222222222222222222222",
+		"too long":        "0x2222222222222222222222222222222222222222222",
 		"no 0x prefix":    "2222222222222222222222222222222222222222",
 		"non-hex letter":  "0x2222222222222222222222222222222222222222z",
 		"tron address":    "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE",

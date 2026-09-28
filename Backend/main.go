@@ -179,6 +179,10 @@ func envBool(key string, def bool) bool {
 	return def
 }
 
+// getenv reads an environment variable, for code that runs before or
+// outside the dotenv loader.
+func getenv(key string) string { return strings.TrimSpace(os.Getenv(key)) }
+
 func envOr(key, def string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
@@ -217,6 +221,8 @@ func loadDotEnv(path string) error {
 func main() {
 	selftest := flag.Bool("selftest", false, "run offline checks and exit")
 	list := flag.Bool("list", false, "read the provider job list and exit")
+	migrate := flag.Bool("migrate", false, "apply the database schema and exit")
+	status := flag.Bool("status", false, "print configuration and database state, then exit")
 	flag.Parse()
 
 	switch {
@@ -226,17 +232,31 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("SELFTEST OK")
+	case *migrate:
+		if err := loadConfig(); err != nil {
+			fail(err)
+		}
+		if err := runMigrate(); err != nil {
+			fail(err)
+		}
+	case *status:
+		if err := runStatus(); err != nil {
+			fail(err)
+		}
 	case *list:
 		if err := runList(); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
+			fail(err)
 		}
 	default:
 		if err := run(); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
+			fail(err)
 		}
 	}
+}
+
+func fail(err error) {
+	fmt.Fprintln(os.Stderr, "error:", err)
+	os.Exit(1)
 }
 
 // withTarget starts the MTProto client, hands a live target to fn, and shuts
