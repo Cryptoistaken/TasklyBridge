@@ -112,6 +112,34 @@ func (b *botClient) getUpdates(offset int64, timeoutSeconds int) ([]inboundUpdat
 	return out, err
 }
 
+// checkBotReachable reports whether the token is usable and whether something
+// else is already polling it.
+//
+// Only one process may hold a bot's getUpdates lock. When the service is
+// deployed, a second copy on a laptop silently takes the lock away from
+// production, and the symptom is a 60-second backoff loop rather than an
+// error. Checking once at startup turns that into a clear message.
+func (b *botClient) checkBotReachable() error {
+	if _, err := b.me(); err != nil {
+		return fmt.Errorf("the bot token was rejected: %w", err)
+	}
+	// A single short poll. On success the lock is ours for the next 25s; on
+	// conflict, someone else has it.
+	var probe []inboundUpdate
+	err := b.call("getUpdates", map[string]any{
+		"offset":          -1,
+		"timeout":         0,
+		"allowed_updates": []string{"message"},
+	}, &probe)
+	if err != nil && isDuplicateInstance(err) {
+		return fmt.Errorf("another instance is already polling this bot.\n" +
+			"If the service is deployed, stop the local copy: two processes " +
+			"sharing one bot fight over the update stream and the deployed one goes silent.\n" +
+			"Stop the deployed service first with: railway down")
+	}
+	return nil
+}
+
 func (b *botClient) sendMessage(chatID int64, text string, kb *inlineKeyboard) error {
 	payload := map[string]any{"chat_id": chatID, "text": text}
 	if kb != nil {
@@ -259,6 +287,14 @@ func (h *handler) showTasks(userID int64) {
 	// The job can be out of stock on the provider's side. Say so rather than
 	// showing an empty menu.
 	if len(offers) == 0 {
+		// Tell the operator *why*, because a withdrawn job and a catalogue
+		// that no longer matches look identical from the outside, and only one
+		// of them is self-healing.
+		if h.alerts != nil {
+			why := h.cat.describeMiss(live)
+			h.audit.log(legInternal, "no-offers", userID, why, nil)
+			_ = h.alerts.notify("🚨 Nothing is being offered.\n\n" + why)
+		}
 		h.reply(userID, "No jobs are available right now.\n\nPlease check back shortly.")
 		return
 	}

@@ -482,6 +482,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("bot token rejected: %w", err)
 	}
+	// Fail loudly rather than silently stealing the update lock from a deployed
+	// copy. This bit us: a laptop run took the lock and production backed off
+	// for 60s at a time with nothing but a log line to explain it.
+	if err := bot.checkBotReachable(); err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -206,6 +206,34 @@ func hiddenFrom(live []Task, offers []offer) []Task {
 	return out
 }
 
+// describeMiss explains, to an operator, why nothing is being offered.
+//
+// This matters because the two causes look identical from outside: a job the
+// provider has withdrawn, and a job whose name no longer matches the
+// catalogue. The first is normal and self-healing. The second is a
+// configuration problem that will silently sell nothing until someone notices,
+// so it is worth saying which one happened.
+func (c *catalog) describeMiss(live []Task) string {
+	if len(live) == 0 {
+		return "the provider returned no jobs at all, so the menu could not be read"
+	}
+	names := make([]string, 0, len(live))
+	for _, t := range live {
+		names = append(names, fmt.Sprintf("%q ($%.4f)", t.Name, t.Price))
+	}
+	var wanted []string
+	for _, j := range c.jobs {
+		if j.Enabled {
+			wanted = append(wanted, strings.Join(j.RequireAll, " + "))
+		}
+	}
+	return fmt.Sprintf(
+		"the provider offers %s, but no catalogue entry matches %v. "+
+			"This is a configuration problem, not an outage: the bot will show no jobs until "+
+			"require_all in task.json is updated to a name the provider is actually using.",
+		strings.Join(names, ", "), wanted)
+}
+
 // find returns the offer a callback index refers to. The index is validated
 // against the resolved list, so a hidden job cannot be joined by guessing.
 func (c *catalog) find(offers []offer, idx int) (offer, bool) {

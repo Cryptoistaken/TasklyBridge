@@ -5,6 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
     <title>TasklyBridge</title>
+    <!-- The sign-in widget is served from oauth.telegram.org. Preconnecting
+         removes a round trip from the one action the page exists for. -->
+    <link rel="preconnect" href="https://oauth.telegram.org" crossorigin />
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>

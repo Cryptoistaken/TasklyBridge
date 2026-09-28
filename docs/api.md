@@ -8,19 +8,37 @@ RFC3339.
 
 ## Auth
 
-`POST /api/login` with `{"password":"..."}` → sets an HMAC-signed cookie.
-Every other `/api/*` route except `/api/login` and `/healthz` requires it.
-Unauthenticated → `401 {"error":"unauthorized"}`.
+Sign-in is the **Telegram Login Widget**, and it is the only method. There is
+no password, no `ADMIN_PASSWORD`, and no fallback: a shared password on a panel
+that can move money is the weakest link in the chain.
 
-The password is `ADMIN_PASSWORD` in the environment. The cookie is
-`HttpOnly; SameSite=Strict; Path=/`. The signing key is `ADMIN_SESSION_SECRET`.
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/auth/telegram/config` | `{"clientId": 8730058124}`, cacheable 1h |
+| `POST` | `/api/auth/telegram/login` | `{"id_token":"..."}` → session cookie |
+
+The page loads `https://oauth.telegram.org/js/telegram-login.js`, calls
+`Telegram.Login.auth({client_id, scope:["profile","phone"]}, cb)`, and POSTs the
+`id_token` from the callback.
+
+The server verifies the token as an RS256 JWT against
+`https://oauth.telegram.org/.well-known/jwks.json`, checks the audience is our
+bot id, then checks the uid is in `ADMIN_USER_IDS`. Only then is a cookie
+issued. Every other `/api/*` route requires that cookie; without it →
+`401 {"error":"unauthorized"}`.
+
+A **403** on the login endpoint means the token was valid but the uid is not an
+admin, so no session is created. `401` means only "not authenticated" anywhere
+in this API.
+
+The cookie is `HttpOnly; SameSite=Strict; Path=/; Secure` over HTTPS, 30 days,
+HMAC-signed with `ADMIN_SESSION_SECRET`.
 
 ## Endpoints
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/healthz` | 200 when at least one account is connected |
-| `POST` | `/api/login` | password in, cookie out |
 | `POST` | `/api/logout` | clears the cookie |
 | `GET` | `/api/sessions` | list stored Telegram sessions |
 | `POST` | `/api/sessions` | start or continue creating a session |
@@ -346,7 +364,7 @@ fails validation. `409` when `WITHDRAW_DRY_RUN` is on.
 ```
 
 `PUT` accepts only the editable subset. **Secrets are never returned**:
-`BOT_TOKEN`, `TG_API_HASH`, `ADMIN_PASSWORD` and the session key are not in
+`BOT_TOKEN`, `TG_API_HASH` and the session key are not in
 this payload and must not be added to it.
 
 ## `/api/events` — SSE

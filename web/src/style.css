@@ -526,13 +526,25 @@ input[type="checkbox"] {
   padding: 28px 24px;
 }
 
-.login-card .wordmark {
+.login-card .wordmark,
+.login-card .brand {
   padding: 0;
   font-size: 17px;
+  margin: 0;
 }
 
 .login-card .btn {
   margin-top: 4px;
+  width: 100%;
+}
+
+/* The sign-in button is the page's single primary action, so it is given the
+   full card width and never sits beside anything else. */
+.login-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 6px;
 }
 
 /* --- message feed ---------------------------------------------------------- */
