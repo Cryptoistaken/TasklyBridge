@@ -554,11 +554,13 @@ input[type="checkbox"] {
   display: none;
 }
 
-/* The Telegram widget replaces this button's contents and styles it itself, so
-   these rules only cover the moment before the script arrives and the state
-   after it fails. Keeping them on the tokens means the pre-load button is not
-   a white box on a black page. */
-.tg-auth-button {
+/* The sign-in button. The widget does NOT replace or restyle this: the script
+   is loaded bare and Telegram.Login.auth drives the flow, so the button stays
+   ours to render. It used to carry the class tg-auth-button, which is the
+   legacy widget's hook for finding a button to bind itself to - naming it that
+   is how the widget took over the click and the login callback stopped
+   firing. */
+.login-button {
   display: block;
   width: 100%;
   min-height: 44px;
@@ -571,12 +573,12 @@ input[type="checkbox"] {
   cursor: pointer;
 }
 
-.tg-auth-button:disabled {
+.login-button:disabled {
   opacity: 0.55;
   cursor: not-allowed;
 }
 
-.tg-auth-button:not(:disabled):hover {
+.login-button:not(:disabled):hover {
   background: var(--muted);
 }
 
