@@ -1,11 +1,9 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"strings"
-	"time"
 )
 
 // runStatus prints what the process is configured with and whether the pieces
@@ -73,32 +71,10 @@ func runStatus() error {
 	fmt.Println()
 
 	fmt.Println("Database")
-	dsn := strings.TrimSpace(getenv("DATABASE_URL"))
-	if dsn == "" {
-		fmt.Println("  DATABASE_URL    : NOT SET - state will stay in local files")
-		return nil
-	}
-	fmt.Printf("  url             : %s\n", redactDSN(dsn))
-	db, err := openDB(dsn)
-	if err != nil {
-		fmt.Printf("  reachable       : NO - %v\n", err)
-		return nil
-	}
-	defer db.Close()
-	fmt.Println("  reachable       : yes")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	tables, err := verifySchema(ctx, db)
-	if err != nil {
-		fmt.Printf("  schema          : PROBLEM - %v\n", err)
-		return nil
-	}
-	if len(tables) == 0 {
-		fmt.Println("  schema          : EMPTY - run: go run ./Backend -migrate")
-		return nil
-	}
-	fmt.Printf("  schema          : %d table(s) - %s\n", len(tables), strings.Join(tables, ", "))
+	// Split by write volume: the critical store holds what is hard to
+	// recreate, the log store takes the constant stream of transcripts.
+	reportStore("critical (Neon)", getenv("DATABASE_URL"))
+	reportStore("logs (high volume)", getenv("LOGS_DATABASE_URL"))
 	return nil
 }
 

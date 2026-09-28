@@ -4,23 +4,33 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
-	// Pure-Go Postgres driver, registered against database/sql.
+	// Pure-Go Postgres driver, registered against database/sql. It talks to
+	// both stores, so the split is configuration rather than code.
 	_ "github.com/lib/pq"
 )
 
-// The durable store: accounts, users, sessions, messages, alerts, withdrawals
-// and the price baseline. Neon holds it, so deleting the whole Railway project
-// must be recoverable from here.
+// Two stores, split by write volume rather than by table.
 //
-// The MTProto session blob lives in `sessions` rather than on a container disk
-// on purpose: the container filesystem is wiped on every deploy, and losing a
-// session means logging that account in again by hand.
+//	Neon   - critical, infrequent. Accounts, users, sessions (the MTProto auth
+//	         keys), withdrawals, alerts, price baselines. Deleting the whole
+//	         Railway project must be recoverable from here.
+//	Railway Postgres - high volume. The message and audit logs, written on every
+//	         single interaction.
+//
+// The reason is not tidiness. Neon scales to zero when idle, so a hot write
+// path would keep waking it and paying compute for the privilege, and the
+// round trip is over the internet. The message log is the bulk of writes and
+// is the cheapest thing to lose: it is a transcript, and the accounts it
+// describes are safe in Neon.
+//
+// If LOGS_DATABASE_URL is unset the log tables are created in the critical
+// store instead, so a single-database setup still works.
 
-const schemaSQL = `
+// criticalSchema is the durable store. Everything here is hard to recreate.
+const criticalSchema = `
 CREATE TABLE IF NOT EXISTS accounts (
   id              TEXT PRIMARY KEY,
   phone           TEXT NOT NULL,
@@ -49,24 +59,12 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 -- The MTProto auth keys. This IS the account: lose it and the account must be
--- signed in again, so it belongs in durable storage rather than a container.
+-- signed in again by hand, so it belongs in the durable store.
 CREATE TABLE IF NOT EXISTS sessions (
   account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
   blob       BYTEA NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE TABLE IF NOT EXISTS messages (
-  id         TEXT PRIMARY KEY,
-  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-  user_id    BIGINT,
-  leg        TEXT NOT NULL,
-  text       TEXT NOT NULL DEFAULT '',
-  buttons    JSONB NOT NULL DEFAULT '[]'::jsonb,
-  at         TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS messages_at_idx ON messages (at DESC);
-CREATE INDEX IF NOT EXISTS messages_account_idx ON messages (account_id, at DESC);
 
 CREATE TABLE IF NOT EXISTS alerts (
   id      TEXT PRIMARY KEY,
@@ -81,7 +79,7 @@ CREATE INDEX IF NOT EXISTS alerts_at_idx ON alerts (at DESC);
 
 CREATE TABLE IF NOT EXISTS withdrawals (
   id           TEXT PRIMARY KEY,
-  account_id   TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  account_id   TEXT NOT NULL,
   wallet       TEXT NOT NULL,
   amount       NUMERIC(12,4) NOT NULL,
   fee          NUMERIC(12,4) NOT NULL DEFAULT 0,
@@ -93,8 +91,6 @@ CREATE TABLE IF NOT EXISTS withdrawals (
 );
 CREATE INDEX IF NOT EXISTS withdrawals_at_idx ON withdrawals (at DESC);
 
--- Last known price per provider job, so a restart does not treat every current
--- price as a change.
 CREATE TABLE IF NOT EXISTS price_baseline (
   job        TEXT PRIMARY KEY,
   price      NUMERIC(12,4) NOT NULL,
@@ -107,6 +103,33 @@ CREATE TABLE IF NOT EXISTS job_availability (
   cost       NUMERIC(12,4) NOT NULL DEFAULT 0,
   at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+`
+
+// hotSchema is the transcript. It grows on every interaction, so it is the
+// thing worth keeping out of the store that suspends.
+const hotSchema = `
+CREATE TABLE IF NOT EXISTS messages (
+  id         TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  user_id    BIGINT,
+  leg        TEXT NOT NULL,
+  text       TEXT NOT NULL DEFAULT '',
+  buttons    JSONB NOT NULL DEFAULT '[]'::jsonb,
+  at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS messages_at_idx ON messages (at DESC);
+CREATE INDEX IF NOT EXISTS messages_account_idx ON messages (account_id, at DESC);
+
+CREATE TABLE IF NOT EXISTS audit (
+  id        BIGSERIAL PRIMARY KEY,
+  leg       TEXT NOT NULL,
+  kind      TEXT NOT NULL,
+  user_id   BIGINT,
+  text      TEXT NOT NULL DEFAULT '',
+  meta      JSONB NOT NULL DEFAULT '{}'::jsonb,
+  at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS audit_at_idx ON audit (at DESC);
 `
 
 // openDB connects with a short timeout, so a bad URL fails fast at startup
@@ -131,17 +154,67 @@ func openDB(dsn string) (*sql.DB, error) {
 	return db, nil
 }
 
-// migrate applies the schema. Every statement is CREATE ... IF NOT EXISTS, so
-// running it against an existing database is a no-op and safe to repeat.
-func migrate(ctx context.Context, db *sql.DB) error {
-	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
-		return fmt.Errorf("apply schema: %w", err)
+// storeNames are the labels used in status output.
+const (
+	storeCritical = "critical (Neon)"
+	storeLogs     = "logs (high volume)"
+)
+
+// runMigrate applies both schemas. Every statement is CREATE ... IF NOT
+// EXISTS, so repeating it is a no-op and safe to run on every deploy.
+func runMigrate() error {
+	criticalDSN := strings.TrimSpace(getenv("DATABASE_URL"))
+	if criticalDSN == "" {
+		return fmt.Errorf("DATABASE_URL is not set")
 	}
+
+	db, err := openDB(criticalDSN)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	if _, err := db.ExecContext(ctx, criticalSchema); err != nil {
+		return fmt.Errorf("apply critical schema: %w", err)
+	}
+	tables, err := verifySchema(ctx, db)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s: %d table(s) - %s\n", storeCritical, len(tables), strings.Join(tables, ", "))
+
+	// The log store is optional. Without it the log tables live alongside the
+	// critical ones, which is fine at low volume.
+	logsDSN := strings.TrimSpace(getenv("LOGS_DATABASE_URL"))
+	if logsDSN == "" {
+		fmt.Println("logs: LOGS_DATABASE_URL not set, writing logs to the critical store")
+		if _, err := db.ExecContext(ctx, hotSchema); err != nil {
+			return fmt.Errorf("apply log schema: %w", err)
+		}
+		return nil
+	}
+
+	logs, err := openDB(logsDSN)
+	if err != nil {
+		return fmt.Errorf("logs store: %w", err)
+	}
+	defer logs.Close()
+	if _, err := logs.ExecContext(ctx, hotSchema); err != nil {
+		return fmt.Errorf("apply log schema: %w", err)
+	}
+	lt, err := verifySchema(ctx, logs)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s: %d table(s) - %s\n", storeLogs, len(lt), strings.Join(lt, ", "))
 	return nil
 }
 
-// verifySchema lists the tables, so the CLI can prove what exists rather than
-// assuming the migration ran.
+// verifySchema lists the tables, so the status output proves what exists rather
+// than assuming a migration ran.
 func verifySchema(ctx context.Context, db *sql.DB) ([]string, error) {
 	rows, err := db.QueryContext(ctx,
 		`SELECT table_name FROM information_schema.tables
@@ -162,39 +235,7 @@ func verifySchema(ctx context.Context, db *sql.DB) ([]string, error) {
 	return out, rows.Err()
 }
 
-// runMigrate is the -migrate entry point.
-func runMigrate() error {
-	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
-	if dsn == "" {
-		return fmt.Errorf("DATABASE_URL is not set")
-	}
-	// Never let a password reach a log or a crash message.
-	redactDSN(dsn)
-
-	db, err := openDB(dsn)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	if err := migrate(ctx, db); err != nil {
-		return err
-	}
-	tables, err := verifySchema(ctx, db)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("migrated. %d table(s):\n", len(tables))
-	for _, t := range tables {
-		fmt.Printf("  %s\n", t)
-	}
-	return nil
-}
-
-// redactDSN strips the password so a connection string can be logged.
+// redactDSN strips the password so a connection string can be printed.
 func redactDSN(dsn string) string {
 	if i := strings.Index(dsn, "@"); i > 0 {
 		if j := strings.Index(dsn, "://"); j >= 0 && j+3 < i {
@@ -205,4 +246,34 @@ func redactDSN(dsn string) string {
 		}
 	}
 	return dsn
+}
+
+// reportStore opens a store and describes it, for the status output. It never
+// returns an error: a store being unreachable is information, not a failure of
+// the status command itself.
+func reportStore(label, dsn string) {
+	if dsn == "" {
+		fmt.Printf("  %-22s : NOT SET\n", label)
+		return
+	}
+	fmt.Printf("  %-22s : %s\n", label, redactDSN(dsn))
+	db, err := openDB(dsn)
+	if err != nil {
+		fmt.Printf("  %-22s   unreachable: %v\n", "", err)
+		return
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	tables, err := verifySchema(ctx, db)
+	if err != nil {
+		fmt.Printf("  %-22s   schema: %v\n", "", err)
+		return
+	}
+	if len(tables) == 0 {
+		fmt.Printf("  %-22s   EMPTY - run: go run ./Backend -migrate\n", "")
+		return
+	}
+	fmt.Printf("  %-22s   %d table(s): %s\n", "", len(tables), strings.Join(tables, ", "))
 }
