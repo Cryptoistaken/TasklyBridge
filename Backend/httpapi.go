@@ -638,23 +638,15 @@ func (s *adminServer) messages(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
+	// The transcript is the audit file, not the messages table. Nothing has
+	// ever inserted into that table, so this endpoint returned an empty list on
+	// every call and the page has been blank since it was built - while the
+	// four-leg log it should have been showing was being written to disk the
+	// whole time.
 	items := []map[string]any{}
-	if s.db != nil {
-		rows, err := s.db.Query(
-			`SELECT id, leg, text, to_char(at,'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-			 FROM messages ORDER BY at DESC LIMIT $1`, limit)
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var id, leg, text, at string
-				if rows.Scan(&id, &leg, &text, &at) == nil {
-					items = append(items, map[string]any{
-						"id": id, "account_id": sessionAccountID(), "user_id": 0,
-						"leg": leg, "direction": directionOf(leg), "text": text,
-						"buttons": []string{}, "at": at,
-					})
-				}
-			}
+	if s.audit != nil {
+		if got := s.audit.recent(limit); got != nil {
+			items = got
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": len(items)})

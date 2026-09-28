@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +44,10 @@ type event struct {
 type audit struct {
 	mu sync.Mutex
 	f  *os.File
+	// path is kept because f is opened write-only, so the Messages page has to
+	// open its own read handle. Without it the transcript could be written but
+	// never read back.
+	path string
 }
 
 // newAudit opens today's log. Audit failing must not take the bot down, so a
@@ -60,8 +66,83 @@ func newAudit(dir string) *audit {
 		return a
 	}
 	a.f = f
+	a.path = path
 	fmt.Printf("audit log: %s\n", path)
 	return a
+}
+
+// recent returns the last n interactions, newest first, in the shape the
+// Messages page already renders.
+//
+// The page used to read a `messages` table that nothing has ever inserted into,
+// so it has been empty since it was built. The transcript that does exist is
+// this file, written on every one of the four legs, so that is what it reads.
+//
+// The whole file is scanned. It is one file per process start, so the cost
+// grows with uptime rather than with traffic, and this is an admin page: it
+// would need an index only if a process were left running for months.
+func (a *audit) recent(n int) []map[string]any {
+	if a == nil || a.path == "" || n <= 0 {
+		return nil
+	}
+	f, err := os.Open(a.path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	// The date lives in the filename; each line only carries the time.
+	day := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(a.path), auditPrefix), ".jsonl")
+
+	// Read the tail only. A line that is still being appended to can be
+	// truncated, and a partial line must not take the page down with it.
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	all := make([]event, 0, n+1)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 || line[len(line)-1] != '}' {
+			continue // partial or blank
+		}
+		var ev event
+		if json.Unmarshal(line, &ev) != nil {
+			continue // a torn line must not break the page
+		}
+		all = append(all, ev)
+		if len(all) > n {
+			all = all[1:]
+		}
+	}
+
+	out := make([]map[string]any, 0, len(all))
+	for i := len(all) - 1; i >= 0; i-- {
+		ev := all[i]
+		// Keep the id unique within the file: two events can share a timestamp.
+		out = append(out, map[string]any{
+			"id":         ev.Time + "-" + strconv.Itoa(i),
+			"account_id": sessionAccountID(),
+			"user_id":    ev.UserID,
+			"leg":        ev.Leg,
+			"direction":  directionOf(ev.Leg),
+			"text":       ev.Text,
+			"buttons":    []string{},
+			"at":         auditTimestamp(day, ev.Time),
+		})
+	}
+	return out
+}
+
+// auditTimestamp joins the filename's date to the line's time in the same shape
+// the page's Date parser expects, which is what the messages table used to
+// return: 2026-09-28T13:17:41Z.
+func auditTimestamp(day, clock string) string {
+	if len(clock) >= 8 {
+		clock = clock[:8] // drop the milliseconds
+	}
+	if day == "" {
+		return clock
+	}
+	return day + "T" + clock + "Z"
 }
 
 // Close releases the log file.
@@ -118,6 +199,12 @@ func (a *audit) log(leg, kind string, userID int64, text string, meta map[string
 	fmt.Printf("  %-12s %-9s %-38s %s%s\n", ev.Time, leg+who, kind, ev.Text, extra)
 }
 
+// auditPrefix is the filename prefix; the date follows it. It is named because
+// the Messages page has to strip it back off to recover that date, since each
+// line only carries the time of day.
+const auditPrefix = "audit-"
+
+// oneline makes a multi-line value safe for one line of JSONL.
 func oneline(s string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\n", "\\n")
 }
