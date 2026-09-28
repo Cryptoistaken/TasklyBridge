@@ -381,6 +381,8 @@ func runAccount(ctx context.Context, a *audit, admin *adminServer, cat *catalog,
 		tgt.ctx, tgt.api, tgt.peer = ctx, client.API(), peer
 
 		// The -list mode passes a nil admin, which simply means no dashboard.
+		// Its callback lists the jobs and returns, and returning is correct
+		// there: the process is about to exit anyway.
 		if admin == nil {
 			return onConnect(tgt)
 		}
@@ -388,8 +390,31 @@ func runAccount(ctx context.Context, a *audit, admin *adminServer, cat *catalog,
 		// stored session is actually in use rather than merely present.
 		currentTarget = tgt
 		admin.tgt = tgt
-		return onConnect(tgt)
+		if err := onConnect(tgt); err != nil {
+			return err
+		}
+		// Hold this callback open for the life of the connection.
+		//
+		// client.Run treats the callback RETURNING as "shut the client down",
+		// so a callback that registered the account and returned nil tore the
+		// MTProto connection down the instant it connected. The fleet was
+		// emptied by the supervisor straight after, the account read as not
+		// connected while the logs said it was live, and the bot was left
+		// pointing at a dead client. The old code got this right by accident:
+		// its callback was the poll loop, which never returned.
+		return holdOpen(ctx)
 	})
+}
+
+// holdOpen is what a connected MTProto callback does instead of returning.
+//
+// It is named and separate because the rule it encodes is invisible: client.Run
+// reads a returned callback as a request to disconnect. Written as a bare
+// "<-ctx.Done()" inside a closure it reads like a no-op, and removing it costs a
+// working bot with nothing in the logs to say why.
+func holdOpen(ctx context.Context) error {
+	<-ctx.Done()
+	return nil
 }
 
 // updateSourceName is the banner line, so it is obvious at a glance whether
