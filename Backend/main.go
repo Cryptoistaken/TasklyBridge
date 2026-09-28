@@ -369,6 +369,10 @@ func withTarget(ctx context.Context, a *audit, botRef *botClient, cat *catalog, 
 			secret:  []byte(sessionSecret()),
 			clients: map[chan []byte]struct{}{},
 		}
+		// Remember the live connection so the sessions page can show which
+		// stored session is actually in use rather than merely present.
+		currentTarget = tgt
+		admin.sessions = newSessionManager(admin.db, a)
 		if admin.db, err = openCriticalStore(); err != nil {
 			a.log(legInternal, "admin-db", 0, "no critical store: "+err.Error(), nil)
 		} else {

@@ -5,6 +5,7 @@ import { errorMessage, errorBox, h, type Page } from "./ui";
 import { mountLogin } from "./login";
 import { overview } from "./pages/overview";
 import { accounts } from "./pages/accounts";
+import { sessions } from "./pages/sessions";
 import { users } from "./pages/users";
 import { tasks } from "./pages/tasks";
 import { messages } from "./pages/messages";
@@ -15,6 +16,7 @@ import { settings } from "./pages/settings";
 const PAGES: Record<string, Page> = {
   "/": overview,
   "/accounts": accounts,
+  "/sessions": sessions,
   "/users": users,
   "/tasks": tasks,
   "/messages": messages,
@@ -26,6 +28,7 @@ const PAGES: Record<string, Page> = {
 const NAV: [string, string][] = [
   ["/", "Overview"],
   ["/accounts", "Accounts"],
+  ["/sessions", "Sessions"],
   ["/users", "Users"],
   ["/tasks", "Tasks"],
   ["/messages", "Messages"],

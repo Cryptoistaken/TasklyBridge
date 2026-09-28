@@ -1,8 +1,8 @@
 # TasklyBridge dashboard (web/)
 
-Vanilla TypeScript, eight pages, one SSE connection. Built by Bun into static
+Vanilla TypeScript, nine pages, one SSE connection. Built by Bun into static
 files that the Go binary serves. No framework, no CSS framework, no HTTP
-library — the platform is enough for eight pages of tables.
+library — the platform is enough for nine pages of tables.
 
 Contract: `../docs/api.md` (endpoints) and `../docs/design.md` (tokens, layout,
 page rules).
@@ -68,6 +68,7 @@ web/
     pages/
       overview.ts     job availability, accounts, margin, loss banner
       accounts.ts     state column, flood-wait countdown
+      sessions.ts     stored sessions, three-step create form (no upload)
       users.ts        end users and their joined job
       tasks.ts        sell vs provider cost, margin, hidden list
       messages.ts     live four-leg feed, provider pairs grouped
@@ -90,3 +91,9 @@ web/
   moment the inputs change. `created` is labelled "provider accepted; arrival
   not confirmed" because the provider never confirms arrival.
 - **`selling_at_loss`** puts a red full-width banner at the top of Overview.
+- **Sessions are created in three steps** — phone, login code, 2FA password,
+  one `POST /api/sessions` per step, replacing the old file upload. The code
+  and the password are read from the input, sent once and cleared; they are
+  never held in module state, the URL or storage. Only the attempt id is held
+  (in memory) to tie the steps together. A stored session the service is not
+  using is flagged destructive on the list, because it is a trap.

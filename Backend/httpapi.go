@@ -39,7 +39,9 @@ type adminServer struct {
 	secret  []byte
 	db      *sql.DB
 	clients map[chan []byte]struct{}
-	mu      sync.Mutex
+	// sessions drives creating a Telegram session from the dashboard.
+	sessions *sessionManager
+	mu       sync.Mutex
 }
 
 // startAdmin serves the API, the event stream and the dashboard.
@@ -258,11 +260,13 @@ func (s *adminServer) handleAPI(w http.ResponseWriter, r *http.Request) {
 		s.withdrawalTerms(w, r)
 	case path == "/settings":
 		s.settings(w, r)
+	case path == "/sessions":
+		s.handleSessions(w, r)
+	case strings.HasPrefix(path, "/sessions/") && r.Method == http.MethodDelete:
+		s.sessions.deleteSession(w, r)
 	case path == "/session":
-		if r.Method == http.MethodPost {
-			s.handleUploadSession(w, r)
-			return
-		}
+		// Kept for the one thing the create flow cannot do: a plain status
+		// check. The raw upload is gone; sessions are created, not uploaded.
 		s.sessionStatus(w, r)
 	case path == "/events":
 		s.events(w, r)

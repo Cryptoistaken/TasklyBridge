@@ -64,6 +64,23 @@ func newAudit(dir string) *audit {
 	return a
 }
 
+// Close releases the log file.
+//
+// The process normally lives until the end, so this only matters on shutdown
+// and in tests, but without it a long-lived process that ever reopened its log
+// would leak a handle, and on Windows a leaked handle makes the file
+// undeletable.
+func (a *audit) Close() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.f == nil {
+		return nil
+	}
+	err := a.f.Close()
+	a.f = nil
+	return err
+}
+
 // log records one interaction. It is called for every message in both
 // directions, so the file is a complete transcript rather than a summary.
 func (a *audit) log(leg, kind string, userID int64, text string, meta map[string]string) {

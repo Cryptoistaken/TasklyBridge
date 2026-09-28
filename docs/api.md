@@ -22,6 +22,9 @@ The password is `ADMIN_PASSWORD` in the environment. The cookie is
 | `GET` | `/healthz` | 200 when at least one account is connected |
 | `POST` | `/api/login` | password in, cookie out |
 | `POST` | `/api/logout` | clears the cookie |
+| `GET` | `/api/sessions` | list stored Telegram sessions |
+| `POST` | `/api/sessions` | start or continue creating a session |
+| `DELETE` | `/api/sessions/{id}` | remove a stored session |
 | `GET` | `/api/overview` | everything for the Overview page, one call |
 | `GET` | `/api/accounts` | the account pool |
 | `GET` | `/api/accounts/{id}` | one account, with its recent traffic |
@@ -143,6 +146,74 @@ Every list endpoint returns `{"items":[...], "total":N}`.
 `margin_bdt` is `sell_bdt` minus the provider cost in Taka. **Negative means
 we lose money on every sale.** `hidden` lists provider jobs we do not sell, so
 the admin can see what is being withheld.
+
+### `/api/sessions`
+
+Creating a Telegram session from the dashboard, in steps. This replaces a file
+upload: a new account has no session file, so the whole sign-in happens here.
+
+```json
+{
+  "items": [
+    {
+      "id": "primary",
+      "phone": "+8801XXXXXXXXX",
+      "state": "connected",
+      "bytes": 4197,
+      "updated_at": "2026-09-28T14:05:44Z",
+      "in_use": true
+    }
+  ],
+  "total": 1
+}
+```
+
+`in_use` is true when the service is actually connected with that session, not
+merely when a row exists. `bytes` is the size of the credential blob; **the
+blob itself is never returned**.
+
+#### `POST /api/sessions`
+
+One endpoint, three steps, chosen by what the body carries.
+
+**Step 1 — send a code.** `{"phone": "+8801..."}`
+```json
+{ "attempt": "k3m9x2p7qw4d", "phone": "+8801...", "step": "code",
+  "note": "Telegram has sent a login code. Enter it here, or in the Telegram app." }
+```
+
+**Step 2 — the code.** `{"attempt": "k3m9x2p7qw4d", "code": "12345"}`
+
+Either the session is created:
+```json
+{ "ok": true, "bytes": 4197, "phone": "+8801...",
+  "note": "session created and stored. The service is reconnecting." }
+```
+
+Or the account has 2FA, and the same attempt continues:
+```json
+{ "attempt": "k3m9x2p7qw4d", "step": "password", "needs_password": true,
+  "note": "this account has 2FA. Enter its password." }
+```
+
+**Step 3 — the 2FA password.** `{"attempt": "k3m9x2p7qw4d", "password": "..."}`
+Returns the same `{"ok": true, "bytes": N, ...}` as a completed step 2.
+
+The `attempt` id is what ties the steps together, so two admins cannot
+interleave into one login. It expires after 15 minutes.
+
+**The code and the password are never returned, stored or logged.** Only the
+phone number is recorded, because it is what makes a failed sign-in
+diagnosable and it is not a secret.
+
+Errors: `400` bad phone or missing field, `403` code or password rejected,
+`404` the attempt expired, `429` too many attempts (5 per hour).
+
+**`401` means exactly one thing: not authenticated.** A rejected login code or
+2FA password is `403`, never `401`, so a client can treat every `401` as a dead
+admin session without having to inspect the body. An earlier draft of this
+document used `401` for both, which made a wrong code indistinguishable from an
+expired cookie and would have logged an admin out mid-task.
 
 ### `/api/messages`
 
