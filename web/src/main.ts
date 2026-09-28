@@ -200,8 +200,13 @@ function showLogin(): void {
   token++;
   root.replaceChildren();
   mountLogin(root, () => {
+    // A full reload, not startApp(). The cookie was just set by the response to
+    // the token exchange, and reloading re-runs boot(), which reads it and
+    // fetches the overview. Calling startApp() directly skipped that fetch, so
+    // the app came up against an empty cache and issued no request at all.
+    // This mirrors the working implementation in SheetSubmit's LoginScreen.
     history.replaceState(null, "", "#/");
-    startApp();
+    location.reload();
   });
 }
 

@@ -355,7 +355,7 @@ func (h *handler) onCallback(c *botCallback) {
 	h.bot.answerCallback(c.ID, "")
 
 	if userID != h.boundUser {
-		h.reply(userID, notWhitelistedShort)
+		h.reply(userID, notWhitelisted)
 		return
 	}
 

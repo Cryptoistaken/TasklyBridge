@@ -225,6 +225,10 @@ export async function api<T>(method: string, path: string, body?: unknown): Prom
       method,
       headers: body === undefined ? undefined : { "content-type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
+      // Explicit rather than relying on the same-origin default: every
+      // authenticated call depends on the session cookie, and being implicit
+      // about it is how it silently goes missing.
+      credentials: "include",
     });
   } catch {
     throw new ApiError("Cannot reach the server. Is the Go backend running?", 0);

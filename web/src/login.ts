@@ -98,6 +98,9 @@ export function mountLogin(root: HTMLElement, onOk: () => void): void {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ id_token: idToken }),
+        // The Set-Cookie on this response is the whole point of the call, so it
+        // is asked for explicitly rather than left to the default.
+        credentials: "include",
       });
     } catch {
       status.textContent = "";
