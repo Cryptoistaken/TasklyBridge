@@ -292,8 +292,31 @@ func TestDocumentedEndpointsAreRouted(t *testing.T) {
 }
 
 // TestOverviewShape is the test for the bug that broke the dashboard.
+//
+// It runs the same checks twice: once with the job offered, and once with it
+// withdrawn. The withdrawn pass is the one that matters, because that is the
+// state the service is actually in and the one where a zero cost is an absence
+// rather than a price. Checking only the offered state left the withdrawn
+// assertions dead code, and a dead assertion cannot fail.
 func TestOverviewShape(t *testing.T) {
 	s := newTestServer(t)
+
+	t.Run("offered", func(t *testing.T) {
+		checkOverviewShape(t, s)
+	})
+	t.Run("withdrawn", func(t *testing.T) {
+		writeAvailability(t, outDir, false, 0)
+		checkOverviewShape(t, s)
+	})
+	t.Run("no snapshot at all", func(t *testing.T) {
+		// A fresh deploy before the first poll: the file does not exist.
+		_ = os.Remove(filepath.Join(outDir, "availability.json"))
+		checkOverviewShape(t, s)
+	})
+}
+
+func checkOverviewShape(t *testing.T, s *adminServer) {
+	t.Helper()
 	res, body := s.call(t, http.MethodGet, "/api/overview", "")
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", res.StatusCode)
@@ -315,6 +338,28 @@ func TestOverviewShape(t *testing.T) {
 	}
 	if _, ok := task["name"].(string); !ok {
 		t.Errorf("GET /api/overview task: name is %T, want string", task["name"])
+	}
+
+	// A job the provider is not offering has no price at all. Its cost of zero
+	// is the absence of a quote, and reporting it as a known cost would show
+	// the provider giving the job away free and a margin of the whole sell
+	// price on something nobody can buy.
+	if avail, _ := task["available"].(bool); !avail {
+		if known, _ := task["cost_known"].(bool); known {
+			t.Errorf("GET /api/overview task: cost_known is true while available is false; "+
+				"a withdrawn job has no price (%v)", task)
+		}
+		if m, _ := task["margin_known"].(bool); m {
+			t.Errorf("GET /api/overview task: margin_known is true while available is false (%v)", task)
+		}
+		if loss, _ := task["selling_at_loss"].(bool); loss {
+			t.Error("GET /api/overview task: selling_at_loss is true for a job that is not offered")
+		}
+		// And the margin must not read as the full sell price.
+		if mg, _ := task["margin_bdt"].(float64); mg > 0 {
+			t.Errorf("GET /api/overview task: margin_bdt = %v for an unoffered job, "+
+				"which is a fabricated profit", mg)
+		}
 	}
 
 	accts, ok := body["accounts"].(map[string]any)

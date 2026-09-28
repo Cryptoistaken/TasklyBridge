@@ -608,7 +608,13 @@ func (s *adminServer) jobBlock() map[string]any {
 	out["name"] = job.Name
 	out["sell_bdt"] = job.SellBDT
 
-	if !st.Known {
+	if !st.Known || !st.Available {
+		// No offer means no price. A withdrawn job's cost of zero is the
+		// ABSENCE of a quote, not a quote of zero: treating it as known would
+		// report the provider as giving the job away free and show a perfect
+		// margin on something nobody can buy. This is the exact fabrication
+		// the *_known flags exist to prevent, and it is easy to write by
+		// accident because the snapshot file does carry a timestamp.
 		return out
 	}
 	out["provider_cost"] = st.Cost

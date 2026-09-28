@@ -62,7 +62,9 @@ function body(o: Overview): HTMLElement {
         value: bdt(t.margin_known ? t.margin_bdt : null),
         sub: t.cost_known
           ? `sell ${bdt(t.sell_bdt)} · cost ${usd(t.provider_cost)} ≈ ${bdt(costBdt(o))}`
-          : `sell ${bdt(t.sell_bdt)} · provider cost not polled yet`,
+          : t.available
+            ? `sell ${bdt(t.sell_bdt)} · provider cost not polled yet`
+            : `sell ${bdt(t.sell_bdt)} · withdrawn, so the provider quotes no price`,
         bad: t.margin_known && t.margin_bdt < 0,
       },
       {
