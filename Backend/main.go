@@ -477,8 +477,10 @@ func run() error {
 
 	// Refuse to run beside another copy. Two bridges sharing one MTProto session
 	// and one provider chat break each other in ways that look like provider
-	// faults, so this is checked before anything connects.
-	release, err := acquireLock(outDir)
+	// faults, so this is checked before anything connects. The lock lives in the
+	// OS temp directory, not the data directory: see lockDir for why a lock on
+	// a volume made every deploy impossible.
+	release, err := acquireLock(lockDir())
 	if err != nil {
 		return err
 	}
@@ -516,9 +518,13 @@ func run() error {
 		// and the log line says which of the two happened.
 		a.log(legInternal, "webhook-fallback", 0,
 			"continuing on long polling: "+hookErr.Error(), nil)
-	} else if hookSecret != "" {
-		// Only meaningful when polling. With a webhook, getUpdates is
-		// permanently unavailable and the probe would fail every boot.
+	}
+	if hookSecret == "" {
+		// Polling only. In webhook mode getUpdates is permanently refused
+		// with a 409 that is not a duplicate, so the probe there would both
+		// do nothing and hide the check that actually matters: two processes
+		// polling one bot is what rule 1 is about, and it can only happen
+		// here.
 		if err := bot.checkBotReachable(); err != nil {
 			return err
 		}

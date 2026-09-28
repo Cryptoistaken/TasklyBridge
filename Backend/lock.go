@@ -22,6 +22,30 @@ import (
 
 const lockName = "bridge.lock"
 
+// lockDir is where the lock file lives, and it is deliberately NOT the data
+// directory.
+//
+// It used to be, and that made deploying impossible. Railway starts the new
+// container while the old one is still running and only cuts traffic over once
+// the new one reports healthy, so the new container found the old one's lock
+// file, O_EXCL failed, and it exited instantly. The deployment then sat in
+// INITIALIZING forever with no log output while the previous version kept
+// serving traffic: a deploy that looks like it is working, is not, and is not
+// failing either.
+//
+// The lock exists to catch two bridges on one machine sharing one session, and
+// the OS temp directory is exactly that scope: a second `go run ./Backend` from
+// the same user collides with the first, and a fresh container never inherits
+// anything. Storing it on a volume inverts both.
+//
+// The trade-off is stated rather than hidden: this would not stop two Railway
+// replicas of the same service, because each has its own /tmp. There is one
+// replica, and the MTProto session lives in Neon, so scaling out would need a
+// real distributed lock then and not before.
+func lockDir() string {
+	return os.TempDir()
+}
+
 // acquireLock takes an exclusive lock for the life of the process. The returned
 // release function removes it, so a clean shutdown leaves nothing behind.
 func acquireLock(dir string) (release func(), err error) {
