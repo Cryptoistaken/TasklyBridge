@@ -16,6 +16,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -256,6 +257,70 @@ func TestMessagesEmptyLogIsNotAnError(t *testing.T) {
 // TestSnapshotFileIsNotTheAuditFile guards a mix-up that would be easy to make
 // in either direction: the availability snapshot and the transcript are separate
 // files and neither may read the other.
+// TestSessionsSurvivesANilDatabase is the regression test for a wiring bug that
+// only production had.
+//
+// withTarget built the session manager BEFORE opening the store, so the manager
+// was handed a nil *sql.DB and GET /api/sessions dereferenced it. The HTTP
+// server recovers a panic per connection, so the process stayed up and healthz
+// kept returning 200 while the page returned 502 forever - and it had never
+// worked, so nobody had a "before" to compare against.
+//
+// The contract tests could not see it: they build the server themselves and wire
+// the manager with a real handle. They verify the handler, not the order the
+// production wiring happens in. So this asks the question the wiring failed to.
+func TestSessionsSurvivesANilDatabase(t *testing.T) {
+	s := newTestServer(t)
+	// Exactly what production had: a manager, but with no handle behind it.
+	s.sessions = newSessionManager(nil, s.audit)
+
+	mux := http.NewServeMux()
+	s.routes(mux)
+	r := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: s.sign(testAdminUID)})
+	w := httptest.NewRecorder()
+
+	// The point is that this returns at all. A nil dereference here panics, and
+	// httptest's recorder has no server to recover it, so the test dies.
+	mux.ServeHTTP(w, r)
+
+	if w.Result().StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status %d, want 503 - a missing database is a clear error, not a panic",
+			w.Result().StatusCode)
+	}
+}
+
+// TestSessionsManagerIsBuiltAfterTheStore is a source-level check, and it is a
+// source-level check on purpose.
+//
+// The ordering bug lived in withTarget, which cannot be unit tested: entering it
+// starts a real MTProto client against a real Telegram account. Every test that
+// builds an adminServer itself wires the manager correctly, so a test written
+// that way passes no matter what withTarget does - which is exactly how the
+// first version of this test managed to become a check that could not fail.
+//
+// So this asserts the invariant where it is actually expressed: in the source.
+// It reads main.go and requires newSessionManager to appear after
+// openCriticalStore. It is a lint, not a proof, and it is labelled as one.
+func TestSessionsManagerIsBuiltAfterTheStore(t *testing.T) {
+	raw, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	src := string(raw)
+
+	open := strings.Index(src, "openCriticalStore()")
+	build := strings.Index(src, "newSessionManager(")
+	if open < 0 || build < 0 {
+		t.Skip("the wiring moved out of main.go; check it by hand")
+	}
+	if build < open {
+		t.Errorf("newSessionManager is called at offset %d, before openCriticalStore at %d.\n"+
+			"The manager is handed admin.db, so it must be built after the store is open, "+
+			"or GET /api/sessions panics on a nil handle.", build, open)
+	}
+}
+
 func TestSnapshotFileIsNotTheAuditFile(t *testing.T) {
 	s := newTestServer(t)
 	avail := filepath.Join(outDir, "availability.json")

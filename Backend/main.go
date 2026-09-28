@@ -379,12 +379,18 @@ func withTarget(ctx context.Context, a *audit, admin *adminServer, cat *catalog,
 		currentTarget = tgt
 		admin.tgt = tgt
 		admin.webhookSecret = hookSecret
-		admin.sessions = newSessionManager(admin.db, a)
+		// The store is opened BEFORE the session manager is built, because the
+		// manager is handed the handle. Built in the other order it received a
+		// nil *sql.DB, and GET /api/sessions dereferenced it and panicked on
+		// the first call - a 502 on a page that had never worked. The contract
+		// tests did not catch it because they wire the manager with a real
+		// handle: they verify the handler, not this ordering.
 		if admin.db, err = openCriticalStore(); err != nil {
 			a.log(legInternal, "admin-db", 0, "no critical store: "+err.Error(), nil)
 		} else {
 			defer admin.db.Close()
 		}
+		admin.sessions = newSessionManager(admin.db, a)
 		go func() {
 			if err := startAdmin(ctx, admin); err != nil {
 				a.log(legInternal, "admin-stopped", 0, err.Error(), nil)

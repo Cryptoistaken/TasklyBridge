@@ -118,6 +118,16 @@ func (s *adminServer) handleSessions(w http.ResponseWriter, r *http.Request) {
 // from the provider, so it is a fact with an expiry rather than a stored truth,
 // and `balance_known` says which it is.
 func (m *sessionManager) list(w http.ResponseWriter, r *http.Request) {
+	// A nil handle must be a 503, never a panic. The HTTP server recovers a
+	// panic per connection, so the process survives and the operator sees a
+	// 502 with nothing in the log but a stack trace - which is exactly how the
+	// wiring bug in withTarget presented itself: a page that had never worked
+	// and no error anyone could act on.
+	if m == nil || m.db == nil {
+		writeJSON(w, http.StatusServiceUnavailable,
+			map[string]any{"error": "no database, so sessions cannot be listed"})
+		return
+	}
 	rows, err := m.db.Query(
 		`SELECT s.account_id, a.phone, a.state, length(s.blob),
 		        to_char(s.updated_at,'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
