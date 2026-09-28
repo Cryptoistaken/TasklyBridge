@@ -273,17 +273,15 @@ func verifyTelegramLogin(idToken, clientID string) (telegramClaims, error) {
 		return out, fmt.Errorf("token issued in the future")
 	}
 
-	// The subject is the Telegram user id. The claim name has varied, so try
-	// the known ones, then fall back to sub.
-	uid, _ := claims["sub"].(string)
-	for _, key := range []string{"id", "user_id", "telegram_id"} {
-		if uid == "" {
-			if v, ok := claims[key].(string); ok {
-				uid = v
-			}
-		}
-	}
-	if !isTelegramUID(uid) {
+	// The Telegram user id. The id claims are tried FIRST and sub is the last
+	// resort, because in Telegram's OIDC the two are different numbers: for a
+	// real admin token, sub was 1595440342989821376 while id was 8447133985.
+	// Reading sub first passed isTelegramUID - it is digits - and then failed
+	// the admin check, so every login was refused with "not authorised" even
+	// though the user was an administrator. SheetSubmit reads id first, which
+	// is why it works there and did not work here.
+	uid := telegramUID(claims)
+	if uid == "" {
 		return out, fmt.Errorf("token has no usable subject")
 	}
 
@@ -335,6 +333,38 @@ func isTelegramUID(s string) bool {
 // only who the person is; this decides what they may do. A non-admin must never
 // be issued a session, and the check must happen after verification so the
 // endpoint does not leak who is on the allowlist.
+// telegramUID pulls the Telegram user id out of verified claims.
+//
+// The id claims win over sub, because they are the account's actual Telegram
+// id while sub is an unrelated OIDC subject. Both are digit strings of a
+// plausible length, so there is no way to tell them apart by shape: the only
+// correct answer is to prefer the claim that means what we want.
+func telegramUID(claims map[string]any) string {
+	for _, key := range []string{"id", "user_id", "telegram_id"} {
+		if v := claimString(claims, key); isTelegramUID(v) {
+			return v
+		}
+	}
+	if v := claimString(claims, "sub"); isTelegramUID(v) {
+		return v
+	}
+	return ""
+}
+
+// claimString reads a claim as a string, accepting a JSON number too. Telegram
+// has sent these values both ways, and a number that was not handled would read
+// as "claim absent" rather than as a wrong answer, which is much harder to
+// notice.
+func claimString(claims map[string]any, key string) string {
+	switch v := claims[key].(type) {
+	case string:
+		return v
+	case float64:
+		return strconv.FormatInt(int64(v), 10)
+	}
+	return ""
+}
+
 func isAdmin(uid string, admins []int64) bool {
 	for _, a := range admins {
 		if strconv.FormatInt(a, 10) == uid {
