@@ -515,6 +515,29 @@ Each was found by running the thing, not by reading it.
     `LoginScreen`, and **reading the working reference is what surfaced it** —
     I had guessed the API from memory twice and guessed wrong twice. This is
     rule 9 again: a wired handler is not a reached one.
+22. **The single-instance lock lived on a Railway volume, so no deploy could
+    ever start.** Railway runs the new container alongside the old one and only
+    moves traffic once the new one is healthy, so the new container found
+    `bridge.lock` on `/data`, `O_EXCL` failed, and the process exited on the
+    first line of `run()`. The deployment sat in INITIALIZING for ten minutes
+    with **no log output at all** while the previous version kept serving
+    `healthz`. The two tells were the lock file being visible in
+    `railway service files ls /data/out` and every log line carrying the *old*
+    deployment's timestamps. The lock now lives in the OS temp directory, which
+    is the right scope for it anyway: two bridges on one machine.
+23. **The two stores were wired backwards, and the label hid it.** Production
+    ran with `DATABASE_URL` pointing at Railway Postgres while `NEON_DATABASE_URL`
+    sat set and unread. `-status` printed `critical (Neon)` throughout, so the
+    one command meant to report the configuration was confidently wrong about
+    the store holding the session. Meanwhile Railway Postgres lost every table
+    when its own deployment failed, so the flip to Neon was not tidiness — it
+    restored the only surviving copy of the MTProto session.
+24. **The split has no writer on the log side.** `messages` and `audit` are
+    declared in the schema and nothing inserts into either; the audit is a JSONL
+    file on the volume. So the Messages page was always empty, and the
+    high-volume-write problem the split exists to solve is not happening. Both
+    stores now come from one constant instead of two literals, but the honest
+    answer for now is a single Neon database.
 
 ### A process failure worth recording
 

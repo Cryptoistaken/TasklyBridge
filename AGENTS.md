@@ -183,6 +183,46 @@ trip.
 | **Neon** (`DATABASE_URL`) | `accounts`, `users`, `sessions`, `alerts`, `withdrawals`, `price_baseline`, `job_availability` | Critical and infrequent. Deleting the whole Railway project must be recoverable from here |
 | **Railway Postgres** (`LOGS_DATABASE_URL`) | `messages`, `audit` | The bulk of the writes, and the cheapest thing to lose: a transcript of things the accounts table already describes |
 
+### The second store has no writer yet
+
+**`messages` and `audit` are declared in the schema and nothing ever writes
+them.** Verified, not assumed: the only `INSERT INTO` statements in `Backend/`
+target `sessions` and the withdrawal tables.
+
+- The **audit is a JSONL file**, not a table. `audit.log()` appends to
+  `/data/out/audit-YYYY-MM-DD.jsonl` through an `*os.File`. That is why
+  `type audit struct` has no database handle at all.
+- **`messages` is only ever read.** `httpapi.go` serves the Messages page from
+  `SELECT ... FROM messages`, and no code path inserts a row.
+
+Two consequences, both load-bearing:
+
+1. **The Messages page has always been empty.** An empty page there is not
+   evidence of data loss.
+2. **The reason for the split is currently moot.** There are no high-volume
+   database writes to keep away from Neon, because the high-volume traffic
+   never went to a database. Neon is barely written to at all.
+
+So `LOGS_DATABASE_URL` is referenced only by `-migrate`, `-cli` and `-status`.
+**Setting it would create two tables in Railway Postgres that nothing writes
+to**, and the Messages page would read an empty table in the disposable
+database — strictly worse than today. Do not set it as part of a cleanup.
+
+### This split has already saved the service
+
+Railway Postgres lost **every table** when its own deployment failed
+(2026-09-28, ~3h before it was noticed). Production kept serving for a while
+because the MTProto session was already in memory and `healthz` still returned
+200; the loss only surfaced on the next restart, as
+`relation "sessions" does not exist` on a ten-second retry loop.
+
+Neon held the only surviving copy of the session. Moving `DATABASE_URL` to Neon
+restored the bridge in one deploy.
+
+**A reachable database is not a populated one.** `healthz` answers 200 for a
+database with no tables in it. Check `-status`, which lists what actually
+exists.
+
 `sessions` holds the MTProto auth keys. **The blob is a live credential** — it is
 never logged, never printed, never returned by an API, and never committed. Only
 its size and presence are ever reported. `claude`-style mistakes here are
