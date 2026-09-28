@@ -1,0 +1,701 @@
+/* TasklyBridge admin dashboard.
+   Tokens are copied verbatim from docs/design.md. Nothing else is invented. */
+
+:root {
+  --background: #050505;
+  --card: #0a0a0a;
+  --secondary: #1a1a1a;
+  --muted: #1a1a1a;
+  --accent: #1a1a1a;
+  --border: #262626;
+  --input: #262626;
+  --foreground: #e5e5e5;
+  --muted-foreground: #6b7280;
+  --primary: #ffffff;
+  --primary-foreground: #000000;
+  --ring: #ffffff;
+  --destructive: #ef4444;
+  --radius: 0.625rem;
+  --font-sans: "Geist Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, "Roboto Mono", Menlo, monospace;
+}
+
+/* Our own reset. No framework, so nothing here fights the tokens above. */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  border: 0 solid var(--border);
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+  background: none;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+h1,
+h2,
+h3 {
+  font-weight: 600;
+}
+
+:focus-visible {
+  outline: 1px solid var(--ring);
+  outline-offset: 2px;
+}
+
+/* --- layout ---------------------------------------------------------------- */
+
+.shell {
+  display: grid;
+  grid-template-columns: 236px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.side {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px 12px;
+  background: var(--card);
+  border-right: 1px solid var(--border);
+}
+
+.wordmark {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  padding: 0 8px;
+}
+
+.wordmark span {
+  color: var(--muted-foreground);
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+}
+
+.nav a {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+
+.nav a::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: transparent;
+  flex: none;
+}
+
+.nav a:hover {
+  background: var(--muted);
+  color: var(--foreground);
+}
+
+.nav a.active {
+  background: var(--secondary);
+  color: var(--foreground);
+}
+
+.nav a.active::before {
+  background: var(--primary);
+}
+
+.conn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 10px 0;
+  border-top: 1px solid var(--border);
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.view {
+  min-width: 0;
+  padding: 28px 32px 72px;
+  max-width: 1240px;
+}
+
+.page-head {
+  margin-bottom: 20px;
+}
+
+.page-head h1 {
+  font-size: 20px;
+  letter-spacing: -0.01em;
+}
+
+.page-head p {
+  margin-top: 4px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+
+.section {
+  margin-top: 28px;
+}
+
+.h2 {
+  font-size: 13px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted-foreground);
+  margin-bottom: 10px;
+}
+
+/* --- cards and stats ------------------------------------------------------- */
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+
+.card + .card {
+  margin-top: 12px;
+}
+
+.card.error {
+  border-color: var(--destructive);
+}
+
+.card.error .label {
+  color: var(--destructive);
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px;
+}
+
+.stat .label,
+.label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted-foreground);
+}
+
+.stat .value {
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 26px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+.stat .sub {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+.stat.bad .value {
+  color: var(--destructive);
+}
+
+/* The one thing this page must never be missed. */
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+  padding: 16px 18px;
+  background: var(--card);
+  border: 1px solid var(--destructive);
+  border-radius: var(--radius);
+  color: var(--destructive);
+}
+
+.banner .banner-text {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.banner .banner-tag {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+/* --- tables ---------------------------------------------------------------- */
+
+.table-wrap {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow-x: auto;
+}
+
+th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+td {
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+tbody tr:hover td {
+  background: var(--muted);
+}
+
+th.num,
+td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+td.empty {
+  color: var(--muted-foreground);
+  text-align: center;
+  padding: 24px 14px;
+}
+
+td.sub-cell {
+  background: var(--background);
+  color: var(--muted-foreground);
+  font-size: 12px;
+  padding-top: 0;
+  padding-bottom: 12px;
+}
+
+tbody tr:hover td.sub-cell {
+  background: var(--background);
+}
+
+td.sub-cell + td {
+  border-top: 0;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.muted {
+  color: var(--muted-foreground);
+}
+
+.warn {
+  color: var(--destructive);
+}
+
+.small {
+  font-size: 12px;
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+/* --- chips and dots -------------------------------------------------------- */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--muted);
+  color: var(--foreground);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+.chip.muted {
+  color: var(--muted-foreground);
+}
+
+.chip.bad {
+  color: var(--destructive);
+  border-color: var(--destructive);
+  background: transparent;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted-foreground);
+  flex: none;
+  display: inline-block;
+}
+
+.dot.ok {
+  background: var(--primary);
+}
+
+.dot.bad {
+  background: var(--destructive);
+}
+
+/* --- buttons and inputs ---------------------------------------------------- */
+
+.btn {
+  padding: 8px 14px;
+  background: var(--secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 13px;
+  color: var(--foreground);
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--muted-foreground);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+}
+
+.btn.primary {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--primary-foreground);
+  font-weight: 500;
+}
+
+.btn.primary:hover:not(:disabled) {
+  border-color: var(--primary);
+  opacity: 0.88;
+}
+
+.btn.danger {
+  color: var(--destructive);
+  border-color: var(--destructive);
+  background: transparent;
+}
+
+.btn.sm {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.input {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--background);
+  border: 1px solid var(--input);
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--ring);
+}
+
+select.input {
+  cursor: pointer;
+}
+
+input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary);
+}
+
+.field {
+  display: block;
+}
+
+.field > span {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted-foreground);
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 18px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.row.end {
+  justify-content: flex-end;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* --- login ----------------------------------------------------------------- */
+
+.login {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: var(--background);
+}
+
+.login-card {
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 28px 24px;
+}
+
+.login-card .wordmark {
+  padding: 0;
+  font-size: 17px;
+}
+
+.login-card .btn {
+  margin-top: 4px;
+}
+
+/* --- message feed ---------------------------------------------------------- */
+
+.feed {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.msg {
+  display: grid;
+  grid-template-columns: 168px minmax(0, 1fr);
+  gap: 4px 16px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.msg:last-child {
+  border-bottom: 0;
+}
+
+.msg .meta {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+}
+
+.msg .leg {
+  font-family: var(--font-mono);
+  color: var(--foreground);
+}
+
+.msg .txt {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.msg .btns {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.msg .btns .chip {
+  font-family: var(--font-mono);
+}
+
+/* Provider traffic: dollar figures live here and only here. */
+.msg.provider .leg {
+  color: var(--muted-foreground);
+}
+
+.msg.provider .txt {
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.msg.internal .txt {
+  color: var(--muted-foreground);
+  font-style: italic;
+}
+
+/* bot->taskly and taskly->bot are one conversation, so they sit in one block. */
+.pair {
+  border-left: 2px solid var(--muted-foreground);
+  background: var(--background);
+  border-bottom: 1px solid var(--border);
+}
+
+.pair .msg {
+  border-bottom: 0;
+}
+
+.pair .msg + .msg {
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+
+/* --- alerts ---------------------------------------------------------------- */
+
+.alert-critical {
+  color: var(--destructive);
+}
+
+.unread-dot {
+  background: var(--primary);
+}
+
+/* --- withdrawals ----------------------------------------------------------- */
+
+.kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 18px;
+  align-items: baseline;
+}
+
+.kv dt {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted-foreground);
+}
+
+.kv dd {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.kv dd.bad {
+  color: var(--destructive);
+}
+
+.wallet {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.notice {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--background);
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+
+.notice.bad {
+  border-color: var(--destructive);
+  color: var(--destructive);
+}
+
+.warning-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.warning-list li {
+  color: var(--destructive);
+  font-size: 13px;
+}
+
+.preview-box {
+  border-color: var(--muted-foreground);
+}
+
+.result-caption {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.confirmation {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--muted-foreground);
+}

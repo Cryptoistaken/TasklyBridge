@@ -1,0 +1,38 @@
+# --- Credentials and secrets. Never commit these. ---
+.env
+*.env
+!.env.example
+*.session
+*.key
+*.pem
+secrets/
+
+# --- Live Telegram sessions (MTProto auth keys). A committed session is a
+#     permanent account compromise, so these are ignored by name and by dir.
+Test/sessions/
+sessions/
+*.session
+
+# --- Runtime output: audit logs contain real user ids, phone numbers and the
+#     provider's prices. state.json holds who is in which job.
+Backend/out/
+Test/out/
+out/
+*.log
+*.jsonl
+
+# --- Plan files are scratch notes, not source.
+Test/plan.txt
+
+# --- Build output and dependencies ---
+node_modules/
+dist/
+*.exe
+*.test
+
+# --- Editor noise ---
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store

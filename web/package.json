@@ -1,0 +1,14 @@
+{
+  "name": "tasklybridge-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build ./src/index.html --outdir ./dist --minify",
+    "dev": "bun dev.ts",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.3"
+  }
+}

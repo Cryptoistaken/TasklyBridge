@@ -1,0 +1,224 @@
+# AGENTS.md — rules for working in this repo
+
+Read this before changing anything. Every rule here exists because breaking it
+has already happened, not because it sounds tidy.
+
+**Facts about the provider live in `context.md`. Do not rediscover them here.**
+
+---
+
+## The five rules that are never broken
+
+### 1. Never run two copies of the bridge
+
+Two processes sharing one MTProto session and one provider chat break each
+other: one consumes the other's replies, and the provider reads the stray
+message as a **cancel**. The visible symptom was an unhelpful *"could not read
+the job list"*, which sent the investigation in the wrong direction for a while.
+
+`Backend/lock.go` enforces this with an exclusive lock file. If startup reports
+another bridge running, **stop that process** — do not delete the lock and
+carry on. Telegram's own signal is `Conflict: terminated by other getUpdates
+request`; that is fatal, not transient, so the loser backs off 60s rather than
+retrying.
+
+### 2. Never send a bare fragment to the provider
+
+The provider matches on the **exact keyboard text**. Sending `Tasks` or `cookie`
+matches no button and lands in its cancel handler.
+
+```go
+// wrong - this is what caused every "Action cancelled."
+t.press("open Tasks", "Tasks")
+
+// right - resolve the fragment, send the WHOLE label, refuse if no match
+t.press("open Tasks", "Tasks")   // sends "📋 Tasks"
+```
+
+`press` resolves and refuses. **Never bypass that with `sendRaw`** for anything
+button-shaped; `sendRaw` is only for commands like `/start` and for text
+forwarded from a user.
+
+### 3. Never let a claim stand unverified
+
+This has already cost real time. A plan comment asserted *"the tool remembers
+the screen from the last run"* — it was false, and three runs no-op'd before
+the operator spotted it.
+
+**Measure, don't assert.** Run it, read the log, then write the comment. Every
+non-trivial change needs a self-test that fails without the fix.
+
+### 4. Never block Telegram's read loop
+
+The update handler must never block. A full channel **drops and counts** the
+message; it never stalls. Same for the audit log: a failure there degrades to
+console-only rather than taking the bridge down.
+
+### 5. Never leak the provider's price to an end user
+
+The provider price is **our cost and the basis of our margin**. It goes in the
+audit log and to admins. It must never appear in a user-facing message or a
+button label. `selfTestCatalog` asserts this.
+
+Concretely: buttons read **`Facebook 2fa 5tk`** — our name and the static Taka
+price. Message text is **`Available jobs`** and nothing else. No dollar signs,
+no separator, no provider name.
+
+### 6. Never substitute one provider job for another
+
+`2FA:Create FB (No mail)` and `Create FB (2FA)` are different products at
+different prices. Matching is by **`require_all`** — every listed term must
+appear in the provider's name:
+
+```json
+{ "require_all": ["2FA:Create FB", "No mail"], "sell_bdt": 5 }
+```
+
+A single substring of `Create FB` matches both, and the wrong job gets sold
+under the right name. When the real job is withdrawn, the catalogue must
+resolve to **nothing** so users see "no jobs available". Returning the other
+variant is the bug this rule exists to prevent.
+
+**Price is deliberately not part of the match**, so the provider can move it
+freely without breaking availability.
+
+### 7. Never let a static price hide a loss
+
+`sell_bdt` is static and cannot follow the market. `bdt_rate` exists solely so
+`sellingAtLoss` can tell an admin when the provider's cost exceeds what we
+charge. It is **never** shown to a user, and the displayed price never depends
+on it. With `bdt_rate: 0` the check stays silent rather than inventing a
+conversion.
+
+Note the current arithmetic: at the job's earlier price of **$0.050**, cost is
+about **5.20tk** against a **5tk** sell price. There is currently **no margin**.
+
+### 8. Never send alerts to an end user
+
+Price and availability alerts go to **`ADMIN_USER_IDS` only**. They state the
+provider's cost, which is this bridge's margin. `botNotifier` refuses to send
+when no admin is configured, so an alert fails loudly instead of leaking.
+
+---
+
+## Provider facts that will bite you
+
+All of these cost debugging time. They are established, not guesses.
+
+| Fact | Consequence |
+|---|---|
+| `getHistory` returns **0 messages**, always | Never read history to find a menu. Take the keyboard from the **live reply** to a press. |
+| `/start` is the only way in | It re-sends the welcome and **resets state**, so a user mid-job would be dumped out. |
+| The provider has a **modal state** | After `Start`, menu labels are read as cancel. `ensureMainMenu` proves it is on the main menu (looks for `Balance`) and clears with `❌ Cancel` if not. |
+| The menu is a **reply keyboard** | Tapping = sending the label as text. No `callback_data` to route for menus. |
+| **Prices move and jobs vanish** | `2FA:Create FB (No mail)` disappeared; the Cookies group went $0.0500 → $0.0480. Never hardcode the list. |
+| **Absent ≠ free** | A job not listed must resolve to nothing, never to a price of zero. |
+| **`Create FB (2FA)` is a DIFFERENT product** | From `2FA:Create FB (No mail)`. Never substitute one for the other. Match with `require_all`, never a single substring. |
+| **The job we sell is currently not listed** | The catalogue correctly resolves to nothing. Users see "no jobs available", admins get an alert. That is correct, not a bug. |
+| `Review time: 64 min` | Replies can arrive an hour later, possibly after a restart. |
+| It asks for a **2FA secret key** | The biggest open risk. See `context.md` §4. |
+
+---
+
+## Concurrency
+
+One MTProto client for the process. Telegram delivers updates **only to the
+running client**, so a second client on the same session is blind and fights
+over the auth key.
+
+Two locks on `target`, for two different reasons — do not merge them:
+
+- **`opMu`** held for a *whole operation* (`fetchTasks`, `joinTask`, `forward`).
+  The price watcher and a user tapping a job both navigate the same chat, and
+  overlapping navigations interleave into nonsense.
+- **`seqMu`** guards the arrival counter only. It **must not** be `opMu`: the
+  update handler bumps it while an operation holds `opMu` and is waiting for
+  that same arrival. Sharing the lock deadlocks.
+
+Every action stamps the sequence **before** sending, so only messages arriving
+after that stamp count as the reply. A message that lands while idle must never
+be read as the answer to the next action.
+
+---
+
+## `gotd` v0.162.0
+
+The schema is **newer than the classic one**. Before assuming an API shape,
+check it:
+
+```
+go doc github.com/gotd/td/tg MessagesSendMessageRequest
+```
+
+The ones that will catch you out:
+
+- Service methods are **flat**: `api.MessagesSendMessage(...)`, not `api.Messages().SendMessage(...)`.
+- `NewClient(appID, appHash, Options)` — **no dispatcher argument**.
+- Buttons are **not** an interface hierarchy: `KeyboardButton{Text, Type ButtonTypeClass}`.
+- `InlineButtonTypeURL{URL string}` — capital `URL`, not `Url`.
+- `UpdateNewMessage` is an `UpdateClass`, nested inside an `UpdatesClass`.
+- `UpdateShortMessage.Message` is a **plain string**, not `*tg.Message`.
+- `MessageEntityClass` gives `TypeName()`, `GetOffset()`, `GetLength()` — no switch needed.
+
+---
+
+## Working safely with the account
+
+**The account is the product.** One registered phone number per end user, and
+Telegram bans are permanent.
+
+- **No bulk registration tooling.** Accounts are created by hand, slowly.
+- **Throttle.** Every provider poll is 3 automated messages. `WATCH_INTERVAL`
+  defaults to 15 minutes with a **5 minute floor**. Don't lower it to "just
+  test something".
+- **Never** automate `Withdraw`, or anything paying money. The probe's guard
+  refuses destructive labels; `!click` overrides.
+- The test account is in many channels. Keep the **allowlist** filter on the
+  provider peer — a denylist let ~100 messages a run bury the transcript.
+
+---
+
+## Commands
+
+```powershell
+go build ./...                                  # both binaries
+go vet ./... && gofmt -l .                      # must be clean
+go run ./Backend -selftest                      # offline, no network, no login
+go run ./Backend -list                          # read the provider's live job list
+go run ./Backend                                # run the bridge
+go run ./Test -selftest                         # probe checks
+go run ./Test -login                            # sign in once, save session
+go run ./Test -plan Test/plan.txt               # run a probe plan
+```
+
+`-selftest` needs no network and no login. **Run it before claiming anything
+works.**
+
+---
+
+## Layout
+
+```
+Backend/
+  main.go        config, MTProto lifecycle, run loop, self-tests
+  taskly.go      everything that talks to the provider
+  ourbot.go      our Bot API bot: /start, job buttons, /exitjob
+  catalog.go     task.json: what we sell, our names, our prices
+  watch.go       price and availability alerts
+  store.go       who is in which job, survives restart
+  audit.go       the four-leg interaction log
+  lock.go        single-instance guard
+  task.json      the sellable catalogue — edit this, not code
+  .env           credentials (gitignored)
+  out/           audit logs, state, price baseline, lock
+Test/            throwaway probe (NOT part of the product)
+context.md       provider facts, decisions, open questions
+```
+
+---
+
+## Where things still need work
+
+State lives in JSON files, not Neon. Fine for one user, wrong for thirty. See
+`context.md` §9 for the open list — in particular the 2FA secret handling, which
+is a security decision, not a coding one.
