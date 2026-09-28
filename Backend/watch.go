@@ -193,12 +193,21 @@ func describe(c change) string {
 }
 
 // check performs one poll and alerts on any difference.
-func (w *watcher) check(ctx context.Context, t *target) {
+func (w *watcher) check(ctx context.Context, t *target, cat *catalog) {
 	tasks, err := t.fetchTasks("cookie")
 	if err != nil {
 		w.audit.log(legInternal, "watch-error", 0, "poll failed: "+err.Error(), nil)
 		return
 	}
+
+	// The availability verdict comes from the fetch above rather than a second
+	// one. A poll is three automated messages to the provider and the account
+	// is the product, so it is not worth paying for twice. It also has to run
+	// before the early returns below, or the very first poll after a deploy
+	// would record a price baseline and no availability at all - which is
+	// exactly what happened, and it left the dashboard with no cost to show
+	// until the next poll fifteen minutes later.
+	w.updateAvailability(cat, tasks)
 
 	now := map[string]float64{}
 	var summary []string
@@ -251,33 +260,52 @@ func (w *watcher) check(ctx context.Context, t *target) {
 // interesting; the job vanishing is an outage for this service, and it is
 // exactly the event that is easy to miss because everything else still looks
 // healthy. The provider drops jobs silently.
-func (w *watcher) checkSupported(cat *catalog, t *target) {
-	live, err := t.fetchTasks("cookie")
-	if err != nil {
-		w.audit.log(legInternal, "watch-error", 0, "availability poll failed: "+err.Error(), nil)
+// updateAvailability records whether the job we sell is currently offered, and
+// alerts an admin when that changes.
+//
+// It takes the list the price poll already fetched. It used to fetch its own,
+// and it used to be called from nowhere at all: the function existed, was
+// commented as though it ran every interval, and had no caller. So the
+// "job unavailable" alert had never fired, and the snapshot the dashboard reads
+// had never been written, which is why every job read as UNAVAILABLE from a
+// table nothing populated.
+//
+// Alerts fire on a transition only. Notifying on every poll would send an
+// admin a message every fifteen minutes for as long as a job stays withdrawn.
+func (w *watcher) updateAvailability(cat *catalog, live []Task) {
+	if cat == nil {
 		return
 	}
 	offers := cat.resolve(live)
+	was, _, hadSnapshot := w.availability()
+
+	if len(offers) == 0 {
+		w.setAvailability(false, 0)
+		// The first poll after a deploy has no previous state, so there is no
+		// transition to report. Saying "unavailable" on a cold start is just
+		// noise; the snapshot is still written either way.
+		if hadSnapshot && was {
+			msg := "🚨 " + w.subject + " is NOT available right now. " +
+				"The provider is not offering it, so the bot will show no jobs. " +
+				"Provider listed: " + truncate(jobNames(live), 200)
+			w.audit.log(legInternal, "watch-unavailable", 0, msg, nil)
+			if err := w.note.notify(msg); err != nil {
+				w.audit.log(legInternal, "watch-error", 0, "alert failed: "+err.Error(), nil)
+			}
+		} else {
+			w.audit.log(legInternal, "watch-unavailable-quiet", 0,
+				w.subject+" is not offered by the provider (first observation, no alert sent)",
+				nil)
+		}
+		return
+	}
 
 	var sb strings.Builder
 	for _, o := range offers {
 		fmt.Fprintf(&sb, "%s at %s (provider cost $%.4f)", o.Display, priceLabel(o.SellBDT), o.Provider.Price)
 	}
-	if len(offers) == 0 {
-		w.setAvailability(false, 0)
-		msg := "🚨 " + w.subject + " is NOT available right now. " +
-			"The provider is not offering it, so the bot will show no jobs. " +
-			"Provider listed: " + truncate(jobNames(live), 200)
-		w.audit.log(legInternal, "watch-unavailable", 0, msg, nil)
-		if err := w.note.notify(msg); err != nil {
-			w.audit.log(legInternal, "watch-error", 0, "alert failed: "+err.Error(), nil)
-		}
-		return
-	}
-
-	was, _ := w.availability()
 	w.setAvailability(true, offers[0].Provider.Price)
-	if !was {
+	if hadSnapshot && !was {
 		msg := "✅ " + w.subject + " is available again: " + sb.String()
 		w.audit.log(legInternal, "watch-available", 0, msg, nil)
 		if err := w.note.notify(msg); err != nil {
@@ -288,19 +316,24 @@ func (w *watcher) checkSupported(cat *catalog, t *target) {
 
 // availability is the last known state of the job we sell, persisted so a
 // restart does not re-announce a state that is already known.
-func (w *watcher) availability() (bool, float64) {
+//
+// The third return says whether a snapshot existed at all. Without it "the job
+// has never been seen" and "the job was available and just went away" look
+// identical, and an alert meant for the second fires on the first - on every
+// deploy.
+func (w *watcher) availability() (available bool, cost float64, known bool) {
 	raw, err := os.ReadFile(w.availPath)
 	if err != nil {
-		return false, 0
+		return false, 0, false
 	}
 	var st struct {
 		Available bool    `json:"available"`
 		Cost      float64 `json:"cost"`
 	}
 	if err := json.Unmarshal(raw, &st); err != nil {
-		return false, 0
+		return false, 0, false
 	}
-	return st.Available, st.Cost
+	return st.Available, st.Cost, true
 }
 
 func (w *watcher) setAvailability(available bool, cost float64) {
@@ -322,7 +355,7 @@ func (w *watcher) setAvailability(available bool, cost float64) {
 // poll is three automated messages to the provider, and an account that
 // automates too eagerly is exactly how an account gets banned.
 func (w *watcher) run(ctx context.Context, t *target, cat *catalog) {
-	w.check(ctx, t)
+	w.check(ctx, t, cat)
 	for {
 		// A little jitter, so a fixed interval is not a machine signature.
 		jitter := time.Duration(time.Now().Unix()%int64(w.every/4)) * time.Second
@@ -331,7 +364,7 @@ func (w *watcher) run(ctx context.Context, t *target, cat *catalog) {
 			return
 		case <-time.After(w.every + jitter):
 		}
-		w.check(ctx, t)
+		w.check(ctx, t, cat)
 	}
 }
 
