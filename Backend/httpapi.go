@@ -43,6 +43,10 @@ type adminServer struct {
 	// withdrawals would interleave two conversations with the provider and
 	// could pay the wrong amount, so only one may run at a time.
 	withdrawing bool
+	// webhookSecret guards POST /webhook, and dispatch hands an incoming
+	// update to the same handler the long poller uses.
+	webhookSecret string
+	dispatch      func(inboundUpdate)
 	// sessions drives creating a Telegram session from the dashboard.
 	sessions *sessionManager
 	mu       sync.Mutex
@@ -89,10 +93,15 @@ func startAdmin(ctx context.Context, s *adminServer) error {
 }
 
 func (s *adminServer) routes(mux *http.ServeMux) {
-	// Public: the healthcheck and the login handshake itself.
+	// Public: the healthcheck, the login handshake, and the webhook.
+	//
+	// The webhook is public because Telegram is the caller and cannot hold a
+	// session. It is guarded by a shared secret header instead, which is
+	// checked before the body is even parsed.
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/api/auth/telegram/config", s.handleLoginConfig)
 	mux.HandleFunc("/api/auth/telegram/login", s.handleLogin)
+	mux.HandleFunc("/webhook", s.handleWebhook)
 
 	// Private: everything under /api. The dashboard shell is NOT gated,
 	// because it is the page that performs the login. Gating it would mean
@@ -101,6 +110,44 @@ func (s *adminServer) routes(mux *http.ServeMux) {
 	// behind it is what actually holds anything.
 	mux.Handle("/api/", s.requireAuth(http.HandlerFunc(s.handleAPI)))
 	mux.Handle("/", s.dashboardHandler())
+}
+
+// handleWebhook receives updates from Telegram and hands them to the same
+// handler the long poller uses, so there is one code path for a message
+// regardless of how it arrived.
+func (s *adminServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+	if !verifyWebhookSecret(r, s.webhookSecret) {
+		// Answer 403 without parsing, so a stranger cannot make us do work.
+		s.audit.log(legInternal, "webhook-denied", 0,
+			"rejected a delivery with a bad secret token",
+			map[string]string{"from": remoteIP(r)})
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "forbidden"})
+		return
+	}
+
+	// Bounded: Telegram sends small updates, and an unbounded body here would
+	// be a free way to make the service allocate.
+	var u inboundUpdate
+	if err := decodeJSON(r, &u); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid update"})
+		return
+	}
+
+	// Telegram retries anything that is not 2xx, so answer 200 immediately and
+	// do the work after. Otherwise a slow provider navigation would make
+	// Telegram redeliver the same update repeatedly.
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+
+	if s.dispatch == nil {
+		s.audit.log(legInternal, "webhook-early", 0,
+			"arrived before the provider was connected; dropped", nil)
+		return
+	}
+	go s.dispatch(u)
 }
 
 // dashboardHandler serves the built frontend, falling back to index.html so

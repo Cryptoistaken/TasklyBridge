@@ -281,7 +281,17 @@ func fail(err error) {
 //
 // The target is built before the client so the update handler can stamp
 // arrivals; its api and peer are filled in once the client is running.
-func withTarget(ctx context.Context, a *audit, botRef *botClient, cat *catalog, st *store, fn func(*target) error) error {
+// withTarget starts the MTProto client, hands a live target to fn, and shuts
+// down cleanly. Everything MTProto-related goes through here, because Telegram
+// only delivers updates to the client that is actually running.
+//
+// The target is built before the client so the update handler can stamp
+// arrivals; its api and peer are filled in once the client is running.
+//
+// admin is nil in -list mode, which simply means no dashboard and no HTTP
+// server. hookSecret is empty when there is no webhook, in which case the
+// caller polls instead.
+func withTarget(ctx context.Context, a *audit, admin *adminServer, cat *catalog, st *store, hookSecret string, fn func(*target) error) error {
 	arrivals := make(chan seqMsg, 64)
 	var targetID int64
 
@@ -358,20 +368,17 @@ func withTarget(ctx context.Context, a *audit, botRef *botClient, cat *catalog, 
 
 		tgt.ctx, tgt.api, tgt.peer = ctx, client.API(), peer
 
-		// The dashboard and the Bot API long poll both live inside this, so
-		// there is one process: one MTProto connection, one session, one lock.
-		// The -list mode passes nils, which simply means no dashboard.
-		if botRef == nil {
+		// The dashboard and the Bot API webhook both live inside this, so there
+		// is one process: one MTProto connection, one session, one lock.
+		// The -list mode passes a nil admin, which simply means no dashboard.
+		if admin == nil {
 			return fn(tgt)
-		}
-		admin := &adminServer{
-			bot: botRef, audit: a, store: st, tgt: tgt, cat: cat,
-			secret:  []byte(sessionSecret()),
-			clients: map[chan []byte]struct{}{},
 		}
 		// Remember the live connection so the sessions page can show which
 		// stored session is actually in use rather than merely present.
 		currentTarget = tgt
+		admin.tgt = tgt
+		admin.webhookSecret = hookSecret
 		admin.sessions = newSessionManager(admin.db, a)
 		if admin.db, err = openCriticalStore(); err != nil {
 			a.log(legInternal, "admin-db", 0, "no critical store: "+err.Error(), nil)
@@ -386,6 +393,16 @@ func withTarget(ctx context.Context, a *audit, botRef *botClient, cat *catalog, 
 
 		return fn(tgt)
 	})
+}
+
+// updateSourceName is the banner line, so it is obvious at a glance whether
+// updates arrive by webhook or by long polling. The two are mutually exclusive
+// and being in the wrong one is a silent failure.
+func updateSourceName(webhook bool) string {
+	if webhook {
+		return "webhook (POST /webhook)"
+	}
+	return "long polling"
 }
 
 // sessionStorage picks where the Telegram session lives.
@@ -434,7 +451,7 @@ func runList() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	return withTarget(ctx, a, nil, nil, nil, func(t *target) error {
+	return withTarget(ctx, a, nil, nil, nil, "", func(t *target) error {
 		tasks, err := t.fetchTasks("cookie")
 		if err != nil {
 			return err
@@ -482,44 +499,83 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("bot token rejected: %w", err)
 	}
-	// Fail loudly rather than silently stealing the update lock from a deployed
-	// copy. This bit us: a laptop run took the lock and production backed off
-	// for 60s at a time with nothing but a log line to explain it.
-	if err := bot.checkBotReachable(); err != nil {
-		return err
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Register the webhook before the duplicate-instance check, because that
+	// check probes getUpdates and Telegram refuses getUpdates outright once a
+	// webhook is set. Order is load-bearing here.
+	//
+	// Registering on every boot is deliberate: Railway injects
+	// RAILWAY_PUBLIC_DOMAIN and the domain changes when the service is
+	// recreated, so a webhook set once at setup would quietly stop delivering.
+	// The bot would look healthy and simply never hear anything again.
+	hookSecret, hookErr := registerWebhook(bot, a)
+	if hookErr != nil {
+		// Not fatal: long polling is better than a service that will not start,
+		// and the log line says which of the two happened.
+		a.log(legInternal, "webhook-fallback", 0,
+			"continuing on long polling: "+hookErr.Error(), nil)
+	} else if hookSecret != "" {
+		// Only meaningful when polling. With a webhook, getUpdates is
+		// permanently unavailable and the probe would fail every boot.
+		if err := bot.checkBotReachable(); err != nil {
+			return err
+		}
+	}
+
+	admin := &adminServer{
+		bot: bot, audit: a, store: st, cat: cat,
+		secret:  []byte(sessionSecret()),
+		clients: map[chan []byte]struct{}{},
+	}
 
 	fmt.Printf("our bot    : @%s\n", me)
 	fmt.Printf("provider   : @%s\n", targetBot)
 	fmt.Printf("bound user : %d\n", boundUserID)
-	fmt.Printf("state file : %s\n\n", filepath.Join(outDir, "state.json"))
-	fmt.Println("running. /start in Telegram to see the job list.")
-	fmt.Println()
+	fmt.Printf("state file : %s\n", filepath.Join(outDir, "state.json"))
+	fmt.Printf("updates    : %s\n", updateSourceName(hookSecret != ""))
 
-	// One MTProto client for the life of the process, shared by the long
-	// poll loop and every provider action. A second client on the same session
+	// One MTProto client for the life of the process, shared by the update
+	// source and every provider action. A second client on the same session
 	// would fight over the auth key, so withTarget is entered exactly once and
-	// the poller lives inside it.
+	// the update loop lives inside it.
 	//
 	// A reconnect is not fatal. When no session is stored the process stays up
 	// serving the dashboard, and a session uploaded over HTTP asks for a
 	// reconnect rather than needing a redeploy.
 	for ctx.Err() == nil {
-		err := withTarget(ctx, a, bot, cat, st, func(t *target) error {
+		err := withTarget(ctx, a, admin, cat, st, hookSecret, func(t *target) error {
 			note := &botNotifier{bot: bot, admins: adminIDs, a: a}
 			w := newWatcher(outDir, a, note, watchEvery, watchForJob, catalogSubject(cat))
-			fmt.Printf("watching   : %q every %s (min 5m)\n\n", watchForJob, watchEvery)
+			fmt.Printf("watching   : %q every %s (min 5m)\n", watchForJob, watchEvery)
 			go w.run(ctx, t, cat)
+
+			// One handler for both update sources, built once the provider is
+			// connected. The webhook needs it to exist before the HTTP server
+			// begins accepting deliveries.
+			h := &handler{bot: bot, audit: a, store: st, tgt: t,
+				boundUser: boundUserID, cat: cat, alerts: note}
+			admin.dispatch = h.handle
+
+			if hookSecret != "" {
+				// Webhook mode. Telegram refuses getUpdates while a webhook
+				// is set, so the poller must not also run: it would error
+				// every 25 seconds and bury the log in noise.
+				fmt.Println("running. /start in Telegram to see the job list.")
+				// The webhook owns the updates now, so there is nothing to
+				// loop on. Wait for shutdown; the HTTP server is already up.
+				<-ctx.Done()
+				return nil
+			}
 
 			var offset int64
 			for ctx.Err() == nil {
 				updates, err := bot.getUpdates(offset, 25)
 				if err != nil {
-					// Another instance holds the getUpdates lock. Retrying fast
-					// would just fill the log, so say it once and back right off.
+					// Another instance holds the getUpdates lock. Retrying
+					// fast would just fill the log, so say it once and back
+					// right off.
 					if isDuplicateInstance(err) {
 						a.log(legInternal, "duplicate-instance", 0,
 							"another instance is polling this bot; backing off 60s", nil)
@@ -540,7 +596,6 @@ func run() error {
 				}
 				for _, u := range updates {
 					offset = u.UpdateID + 1
-					h := &handler{bot: bot, audit: a, store: st, tgt: t, boundUser: boundUserID, cat: cat, alerts: note}
 					h.handle(u)
 				}
 			}
