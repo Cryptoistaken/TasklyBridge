@@ -511,23 +511,31 @@ input[type="checkbox"] {
 
 /* --- login ----------------------------------------------------------------- */
 
+/* Flex, not grid.
+   A grid with min-height:100vh and two children stacks the rows from the top
+   and place-items only centres each item inside its own auto-height row, so
+   the group sat above the middle. Flex centres the group on both axes. */
 .login {
   min-height: 100vh;
-  display: grid;
-  place-items: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
   background: var(--background);
 }
 
-/* The page holds nothing but the sign-in button, so it is sized to the widget
-   rather than to a card. Telegram renders its own button inside it. */
+/* No fixed width. Telegram replaces the button and gives it its own intrinsic
+   size, so a container width would only introduce a second box to be centred
+   inside. Letting the button size itself and centring it is the only way the
+   result is actually centred. */
 .login-actions {
-  width: 300px;
   display: flex;
   justify-content: center;
 }
 
 /* Status and errors sit under the button and are hidden until there is
-   something to say, so the resting page really is just the button. */
+   something to say. No min-height: it would reserve blank space under the
+   button and push it off the true centre. */
 .login-aside {
   display: flex;
   flex-direction: column;
@@ -536,7 +544,6 @@ input[type="checkbox"] {
   margin-top: 14px;
   max-width: 380px;
   text-align: center;
-  min-height: 18px;
 }
 
 .login-aside p {
