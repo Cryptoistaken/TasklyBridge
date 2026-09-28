@@ -48,6 +48,11 @@ type adminServer struct {
 	// update to the same handler the long poller uses.
 	webhookSecret string
 	dispatch      func(inboundUpdate)
+	// note sends operator-facing announcements to ADMIN_USER_IDS and nowhere
+	// else. Hiding or showing a job is a decision with consequences for what
+	// users are offered, so the people who can make it are told when it happens.
+	// nil before the bot client exists, which is why every call checks.
+	note notifier
 	// sessions drives creating a Telegram session from the dashboard.
 	sessions *sessionManager
 	mu       sync.Mutex
@@ -273,6 +278,21 @@ func (s *adminServer) verify(value string) (string, bool) {
 	return parts[0], true
 }
 
+// ctxAdminUID carries the verified admin's Telegram id down to the handlers.
+// The cookie is signed, so this is the real account, not a claim from the
+// request body. It exists so an announcement can say who made the change
+// instead of leaving an operator guessing which of them did it.
+type ctxKey int
+
+const ctxAdminUID ctxKey = iota
+
+// adminUID returns the verified admin for this request, or "" when the route
+// was reached without going through requireAuth.
+func adminUID(r *http.Request) string {
+	v, _ := r.Context().Value(ctxAdminUID).(string)
+	return v
+}
+
 func (s *adminServer) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie(sessionCookie)
@@ -280,11 +300,12 @@ func (s *adminServer) requireAuth(next http.Handler) http.Handler {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 			return
 		}
-		if _, ok := s.verify(c.Value); !ok {
+		uid, ok := s.verify(c.Value)
+		if !ok {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxAdminUID, uid)))
 	})
 }
 
@@ -524,11 +545,45 @@ func (s *adminServer) setTaskEnabled(w http.ResponseWriter, r *http.Request, raw
 		})
 		return
 	}
-	s.audit.log(legInternal, "task-toggle", 0, "job enabled="+strconv.FormatBool(*req.Enabled),
-		map[string]string{"job": name})
+	// Announce it to admins. Showing or hiding a job changes what every user is
+	// offered, so the people who can make that call are told when it happens -
+	// and botNotifier sends to ADMIN_USER_IDS only, refusing outright when none
+	// are configured, so this can never reach an end user.
+	msg := taskToggleMessage(name, *req.Enabled, adminUID(r))
+	s.audit.log(legInternal, "task-toggle", 0, msg,
+		map[string]string{"job": name, "enabled": strconv.FormatBool(*req.Enabled)})
+	if s.note == nil {
+		// No bot client yet, so there is nobody to tell. The change is already
+		// persisted and the audit line records it, so this is a gap in the
+		// announcement rather than in the change.
+		s.audit.log(legInternal, "task-toggle", 0,
+			"no notifier configured, so the change was not announced", nil)
+	} else if err := s.note.notify(msg); err != nil {
+		// The toggle already happened. Failing the request now would tell the
+		// operator it did not, which is worse than an undelivered notice.
+		s.audit.log(legInternal, "task-toggle-failed", 0,
+			"change applied but the admin notice did not send: "+err.Error(), nil)
+	}
+
 	// Re-read rather than echoing: the file is the truth and the point of the
 	// call is to know what was actually persisted.
 	s.tasks(w, r)
+}
+
+// taskToggleMessage is what admins see. It states what changed and who changed
+// it, because a catalogue edit is a decision about what users are offered and
+// the next person to look needs to know it was deliberate.
+func taskToggleMessage(name string, enabled bool, by string) string {
+	who := "from the dashboard"
+	if by != "" {
+		who = "by admin " + by + " in the dashboard"
+	}
+	if enabled {
+		return "✅ " + name + " is now ON.\n\n" +
+			"Offered to users again. Changed " + who + "."
+	}
+	return "🚫 " + name + " is now OFF.\n\n" +
+		"The bot will stop offering it. Changed " + who + "."
 }
 
 func catBdtRate(c *catalog) float64 {

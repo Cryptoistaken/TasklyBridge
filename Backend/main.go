@@ -540,6 +540,11 @@ func run() error {
 		bot: bot, audit: a, store: st, cat: cat,
 		secret:  []byte(sessionSecret()),
 		clients: map[chan []byte]struct{}{},
+		// Admin-only announcements: a catalogue change made in the dashboard is
+		// told to the same people who can make it. botNotifier sends to
+		// ADMIN_USER_IDS and refuses when that list is empty, so it cannot
+		// reach an end user.
+		note: &botNotifier{bot: bot, admins: adminIDs, a: a},
 	}
 
 	fmt.Printf("our bot    : @%s\n", me)
