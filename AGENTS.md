@@ -352,12 +352,28 @@ Backend/
   store.go       who is in which job, survives restart
   audit.go       the four-leg interaction log
   lock.go        single-instance guard
-  task.json      the sellable catalogue — edit this, not code
+  task.json      the sellable catalogue - edit this, not code
   .env           credentials (gitignored)
-  out/           audit logs, state, price baseline, lock
+  out/           audit log, availability snapshot, price baseline
 Test/            throwaway probe (NOT part of the product)
+web/             the dashboard - React 19 + Vite + Tailwind v4 + shadcn/ui
+  src/auth/      the Telegram sign-in. Fragile, ported line for line. Do not "tidy" it.
+  src/components/ui/  shadcn primitives
+  src/components/     the app's own reusable pieces
+  src/pages/     one component per route
+  src/lib/       api client, formatters, cn()
+docs/            api.md is the contract, design.md is the visual system
 context.md       provider facts, decisions, open questions
 ```
+
+`bun run build` in `web/` writes `web/dist`, which the Go binary serves as static
+files. Bun is the package manager and script runner only - there is no Bun
+runtime in production.
+
+**Routing is real paths, not fragments** (`/accounts`, not `/#/accounts`), which
+only works because `dashboardHandler` already falls back to `index.html` for
+unknown paths. That fallback is load-bearing; without it every hard refresh on a
+deep link 404s.
 
 ---
 

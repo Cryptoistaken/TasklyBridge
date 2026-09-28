@@ -75,7 +75,7 @@ scarce, risky resource.
 | Backend | **Go**, one binary, both sides |
 | MTProto | `github.com/gotd/td` **v0.162.0** |
 | Our bot | **`@OpenTasksBot`** (id `8730058124`), webhook, no library |
-| Dashboard | TypeScript built by Bun to static files, served by Go (not built) |
+| Dashboard | **React 19 + Vite + Tailwind v4 + shadcn/ui**, built by Bun to static files, served by Go (not built) |
 | Database | **Neon Postgres** (new project) — not wired; JSON files stand in |
 | Hosting | One Railway service, one process |
 | Sessions | In Neon via `session.Storage`, not a Railway volume (not wired) |
@@ -538,6 +538,37 @@ Each was found by running the thing, not by reading it.
     high-volume-write problem the split exists to solve is not happening. Both
     stores now come from one constant instead of two literals, but the honest
     answer for now is a single Neon database.
+25. **A number that was never known, presented as a real one - four times over.**
+    This is the bug class that cost the most, and it wore a different disguise
+    each time:
+      - `GET /api/overview` omitted `provider_cost` and `margin_bdt` entirely,
+        and the page called `toFixed` on undefined: a white screen
+      - `/api/tasks` sent `provider_price: 0.0` and `margin_bdt` equal to the
+        sell price, so the Tasks page showed the provider giving the job away
+        free and `selling_at_loss` could never be true
+      - `jobAvailable()` read the `job_availability` table, which nothing has
+        ever written - the watcher writes `availability.json` - so every job
+        read as UNAVAILABLE from an empty table
+      - and after fixing that, my own reader treated a withdrawn job's timestamp
+        as proof its zero cost was known, which would have shown a fabricated
+        +5.00tk margin on a job nobody can buy
+    The fix that holds is `*_known` flags plus a dash for unknown, in the API and
+    in `usd()`/`bdt()`. A zero cost reads as a profit; absence has to look like
+    absence.
+26. **`checkSupported` existed, was documented as though it ran, and had no
+    caller.** So the "job unavailable" admin alert had never fired and the
+    snapshot the dashboard depends on had never been written. Dead code with a
+    convincing comment is worse than no code, because the comment is what stops
+    anyone looking. The alerting rule in `AGENTS.md` was true on paper only.
+27. **The dashboard moved from vanilla TypeScript to React 19 + shadcn/ui, and
+    from a hash router to real paths.** The URL read `/#/accounts`, which reads
+    as a mistake in the address rather than as a routing choice.
+    `BrowserRouter` needed nothing from the server, because `dashboardHandler`
+    already fell back to `index.html` for unknown paths - written for the hash
+    router and exactly what a real router needs. That fallback is load-bearing
+    and is now called out as such. The cost is real and stated: 41 KB of
+    hand-rolled DOM became 301 KB of React, 96 KB gzipped, for an admin panel
+    with a hard ceiling of 30 users.
 
 ### A process failure worth recording
 

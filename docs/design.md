@@ -151,18 +151,56 @@ switch, watch interval, watch job. Secrets are shown as **present / not set**
 and are never returned by the API, so nothing sensitive can be rendered. The
 dry-run switch carries a warning, because turning it off enables real payouts.
 
+## How it is built
+
+React 19 + TypeScript, bundled by Vite, styled with Tailwind v4, components from
+**shadcn/ui**. The shadcn variables are filled from the palette above rather than
+left at their defaults, so the app still looks like this document describes while
+every control is a real reusable component instead of hand-rolled markup.
+
+| Where | What |
+| --- | --- |
+| `web/src/components/ui/` | shadcn primitives - button, card, badge, alert, skeleton, separator |
+| `web/src/components/` | the app's own reusable pieces - `DataTable`, `StatTile`, `PageHeader`, `StatusChip`, `Shell` |
+| `web/src/pages/` | one component per route |
+| `web/src/lib/format.ts` | `usd()` / `bdt()` - the dash-for-unknown contract |
+| `web/src/globals.css` | the palette above, mapped onto shadcn's variables |
+
+Two rules survive the port and are worth stating because both were bugs once:
+
+**A figure that is not known renders as `—`, never as a number.** The API sends
+`*_known` flags. When one is false the underlying value is a zero, and a zero
+cost reads as "the provider gives it away free" and hides a loss. Everything
+money-shaped goes through `usd()` / `bdt()`, which take `null` and return the
+dash. Bypassing them with template literals reintroduces the bug.
+
+**Routing is real paths, not fragments.** `BrowserRouter` on `/accounts`,
+`/withdrawals` and so on, which is why URLs carry no `#`. The Go server already
+falls back to `index.html` for unknown paths, so a hard refresh on a deep link
+works; that fallback is what makes this possible, and it is load-bearing.
+
+`bun run build` writes `web/dist`, which the Go binary serves as static files.
+Bun is the package manager and script runner only - there is no Bun runtime in
+production, and no second process to supervise.
+
 ## Login
 
 **Only the Telegram sign-in button, centred on `--background`.** No wordmark, no
-subtitle, no card border or padding. Telegram's widget script renders and owns
-the button, so the pre-load state is styled from the same tokens and is replaced
-the moment the script arrives.
+subtitle, no card border or padding.
+
+The button is a Telegram-blue pill (`#119AF5`, white 16px/600, 22px radius, 44px
+tall) styled by us from the tokens above. The widget script is loaded **bare** and
+`Telegram.Login.auth` drives the flow, so nothing takes the click away from the
+app. The button class must never be `tg-auth-button`: that is the legacy
+widget's hook for finding a button to bind itself to, and using it is what broke
+sign-in twice. See `AGENTS.md` and the commit that moved it.
 
 A status line and an error line sit beneath it, **hidden until there is something
 to say**, so a failed sign-in is still visible without cluttering the resting
 page. The session cookie is the only credential of ours; there is no password.
 
 Layout note that cost a fix: the wrapper is **flex with `align-items` and
-`justify-content: center`**. A grid with `min-height: 100vh` and more than one
-child stacks the rows from the top and `place-items` only centres each item
-within its own auto-height row, so the group ends up above the middle.
+`justify-content: center`** - in the port, `flex min-h-screen flex-col items-center
+justify-center`. A grid with `min-height: 100vh` and more than one child stacks
+the rows from the top and `place-items` only centres each item within its own
+auto-height row, so the group ends up above the middle.
