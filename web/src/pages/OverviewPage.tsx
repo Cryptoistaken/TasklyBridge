@@ -117,7 +117,14 @@ export function OverviewPage({ initial }: { initial?: Overview | null }): React.
           bad={t.margin_known && t.margin_bdt < 0}
         />
         <StatTile label="Users" value={`${o.users.joined} joined`} sub={`${o.users.total} total · ${o.users.waiting} waiting`} />
-        <StatTile label="Balance" value={usd(o.balance_total)} sub="provider balance" />
+        {/* A balance nobody has read from the provider is not $0.0000. The API
+            sends balance_known; this tile was printing the zero underneath it,
+            so a disconnected bridge looked like a broke one. */}
+        <StatTile
+          label="Balance"
+          value={usd(o.balance_known ? o.balance_total : null)}
+          sub={o.balance_known ? "provider balance" : "not read from the provider yet"}
+        />
         <StatTile label="Alerts" value={String(o.alerts_unread)} sub="unread" />
         <StatTile
           label="Withdrawals"

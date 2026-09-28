@@ -34,6 +34,8 @@ export interface Overview {
   users: OverviewUsers;
   task: OverviewTask;
   balance_total: number;
+  /** False when no account's balance has been read from the provider yet. */
+  balance_known: boolean;
   alerts_unread: number;
   withdraw_dry_run: boolean;
   last_checked: string;
@@ -51,6 +53,8 @@ export interface Account {
   phone: string;
   state: AccountState;
   balance: number;
+  /** False when the provider has not stated this balance, so `balance` is 0. */
+  balance_known: boolean;
   assigned_user_id?: number | null;
   assigned_user_name?: string;
   messages_sent: number;

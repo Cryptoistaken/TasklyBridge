@@ -34,10 +34,33 @@ interface PreviewLine {
   account_id: string;
   phone: string;
   balance: number;
+  /**
+   * When the provider last stated this balance. A balance is a fact with an
+   * expiry, not a stored truth, so an account whose balance could not be read
+   * arrives as 0 with a zero read_at. Using the value alone would call a
+   * genuinely empty account "unread", and an unread one "$0.0000" - both wrong.
+   */
+  read_at?: string;
   amount: number;
   fee: number;
   net: number;
   problem?: string;
+}
+
+/**
+ * Whether a preview line's balance was actually read from the provider.
+ *
+ * The backend sends read_at for exactly this reason: a balance is a fact with
+ * an expiry, so zero is ambiguous between "the account is empty" and "we could
+ * not ask". Falling back to the value alone gets both wrong, and the one that
+ * matters - showing $0.0000 for an account holding money - is how a withdrawal
+ * gets planned against a number nobody confirmed.
+ */
+function balanceReadable(l: PreviewLine): boolean {
+  if (l.read_at) return true;
+  // An older payload with no read_at at all: fall back to the value, but never
+  // call a positive balance unread.
+  return l.balance > 0;
 }
 
 interface PreviewTotals {
@@ -623,7 +646,7 @@ function PreviewCard({ p, stale }: { p: PreviewData; stale: boolean }): React.JS
                 <div className="font-mono text-xs text-muted-foreground">{l.phone}</div>
               </Td>
               <Td num className="font-mono">
-                {l.balance > 0 ? usd(l.balance) : <span className="text-muted-foreground">unread</span>}
+                {balanceReadable(l) ? usd(l.balance) : <span className="text-muted-foreground">unread</span>}
               </Td>
               <Td num className="font-mono">
                 {usd(l.amount)}
@@ -645,7 +668,10 @@ function PreviewCard({ p, stale }: { p: PreviewData; stale: boolean }): React.JS
           <Kv
             pairs={[
               ["Accounts", String(p.totals.accounts)],
-              ["Total balance", usd(p.totals.total_balance)],
+              // A total that includes an unread balance is a partial sum, and a
+              // partial sum printed as a total is how an operator ends up
+              // withdrawing against money that was never counted.
+              ["Total balance", usd(p.totals.known_balance ? p.totals.total_balance : null)],
               ["Total amount", usd(p.totals.total_amount)],
               ["Total fee", usd(p.totals.total_fee)],
               ["Total net", usd(p.totals.total_net)],

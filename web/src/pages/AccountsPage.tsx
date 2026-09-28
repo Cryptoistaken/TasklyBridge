@@ -103,7 +103,12 @@ export function AccountsPage(): React.JSX.Element {
               </Td>
               <Td className="font-mono whitespace-nowrap">{a.phone || "—"}</Td>
               <Td num className="font-mono">
-                {usd(a.balance)}
+                {/* A balance nobody has read is not $0.0000. The API says so
+                    with balance_known, and this cell was printing the zero
+                    underneath it anyway - the one page in the dashboard that
+                    turned "unknown" into a real-looking number, which is the
+                    exact thing the flags exist to prevent. */}
+                {a.balance_known ? usd(a.balance) : <span className="muted">unread</span>}
               </Td>
               <Td>
                 {a.assigned_user_id ? (
