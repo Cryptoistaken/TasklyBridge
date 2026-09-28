@@ -3,8 +3,10 @@
 Everything learned so far, so a new session does not have to rediscover it.
 Facts only, with the evidence they came from.
 
-**Status:** the bridge runs end to end. One real Telegram account, bound to one
-test user, selling one job. Not deployed; not multi-user; not yet profitable.
+**Status:** deployed and running at **https://opentask.up.railway.app**, with a
+nine-page admin dashboard. One real Telegram account, bound to one test user,
+selling one job. The account's balance is **$0.0000**, and the job we sell is
+**not currently listed by the provider**, so the bot correctly offers nothing.
 
 **Update log**
 - v1 — probe learned the provider's menu and the 2FA key prompt.
@@ -12,6 +14,35 @@ test user, selling one job. Not deployed; not multi-user; not yet profitable.
 - v3 — single-instance bug, the catalogue (`task.json`), static BDT pricing,
   `require_all` job matching, admin-only alerts, and a live finding that the
   job we sell is **currently not listed by the provider**.
+- v4 — deployed to Railway, Neon for critical data and Railway Postgres for the
+  high-volume logs, the operator CLI, and Telegram Login Widget auth.
+- v5 — live balances, the full withdrawal flow with preview and SSE progress,
+  session creation from the dashboard, and **two UI centring bugs** that every
+  build check reported as green.
+
+## Where it runs
+
+| | |
+| --- | --- |
+| Dashboard | https://opentask.up.railway.app |
+| Railway project / service | `TasklyBridge` · `5d244153-…` / `361b378a-…` |
+| Critical store | Neon `tasklybridge` · `lingering-lake-46859788` |
+| Log store | Railway `Postgres` · `5e82eaf9-…` |
+| Our bot | `@OpenTasksBot` · id `8730058124` |
+| Bound user | `1772093705` |
+| Admins | `8447133985`, `1772093705` |
+
+The Railway CLI reads its token from `user.token` in `~/.railway/config.json`,
+**not** from `RAILWAY_TOKEN`; it rejected a valid token until that was written
+there.
+
+### Two stores, split by write volume
+
+Neon scales to zero when idle, so a write on every interaction keeps waking it
+and paying for the privilege. Neon holds the critical, infrequent data
+(accounts, users, session blobs, withdrawals, alerts, price baselines) so
+deleting the whole Railway project is recoverable. Railway Postgres holds the
+message and audit logs: the bulk of the writes, and the cheapest thing to lose.
 
 ---
 
@@ -452,6 +483,25 @@ Each was found by running the thing, not by reading it.
 16. **`task.json` silently loaded zero jobs** because it still had the old
     `match` key and JSON ignores unknown keys. Caught by a self-test that
     requires the shipped catalogue to match a live job.
+17. **The login page posted to `/api/login`, which does not exist.** The
+    frontend was built against an early password contract; the backend had
+    already switched to the Telegram widget. **Nobody could sign in at all.**
+    Found by reading the page, not by a test.
+18. **The dashboard shell was gated behind auth**, so the login page needed a
+    session to be reached. A lockout dressed up as a security measure.
+19. **Two UI centring bugs, both invisible to every check.** The stylesheet
+    had `.login { min-height: 100vh; place-items: center }` and no element
+    ever carried that class, so the rule was dead for the whole life of the
+    project. After adding the wrapper, grid still placed the group above the
+    middle, because `place-items` centres each item in its own auto-height row
+    rather than the group. `tsc`, `bun run build`, `go vet`, `gofmt` and 24
+    unit tests were green throughout. **Two screenshots found what the whole
+    chain missed** — now `AGENTS.md` rule 9.
+20. **My own kill command never matched the process.** The pattern
+    `^(go|bridge)\.exe$` does not match `Backend.exe`, so a stale instance
+    survived, kept the `getUpdates` lock, and quietly degraded production for
+    twenty minutes while I debugged the wrong thing. Startup now refuses to
+    run when another instance already holds that lock.
 
 ### A process failure worth recording
 

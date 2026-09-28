@@ -28,7 +28,7 @@ carries the only colour on the page:
 | Meaning | Token |
 | --- | --- |
 | connected, available, healthy | `--foreground` on `--muted` chip |
-| degraded, flood-wait, at risk | `--muted-foreground` chip, amber dot |
+| degraded, flood-wait, at risk | `--muted-foreground` chip (there is no amber in the palette) |
 | banned, dead, unavailable, loss | `--destructive` text or dot |
 | primary action | solid `--primary` white button |
 
@@ -75,18 +75,21 @@ Admin-facing, so: comfortable rows, right-aligned numeric columns, and
 
 ## Page map
 
-Eight pages. Nothing else.
+Nine pages. Nothing else.
 
 | Page | Route | Shows |
 | --- | --- | --- |
 | **Overview** | `/` | Account health, users, the job's availability and margin, unread alerts |
 | **Accounts** | `/accounts` | The pool: state, phone, balance, assigned user, flood-wait |
+| **Sessions** | `/sessions` | Stored Telegram sessions, each account's balance and the total, plus create and delete |
 | **Users** | `/users` | End users, joined job, message count, last seen |
 | **Tasks** | `/tasks` | The catalogue: offered, hidden, provider cost vs sell price |
 | **Messages** | `/messages` | The live four-leg feed |
 | **Alerts** | `/alerts` | Price and availability history |
 | **Withdrawals** | `/withdrawals` | History, dry-run preview, single-account withdraw |
 | **Settings** | `/settings` | Editable config, and read-only secrets |
+
+Routes are hashes: `#/accounts`, `#/sessions`, and so on.
 
 ## Page rules
 
@@ -96,9 +99,17 @@ answers one question in one glance: *is the service working, and am I losing
 money on it.*
 
 **Accounts** — the state column is the point of this page. `connected` normal,
-`degraded` amber with the flood-wait countdown, `banned` and `dead` in
+`degraded` muted with the flood-wait countdown, `banned` and `dead` in
 destructive red. An account about to die is the single most expensive thing that
 can happen here, so state is never a subtle colour shift.
+
+**Sessions** — the accounts themselves: phone, state, balance, size, last
+updated, and whether one is **in use** right now. Creating a session is a
+three-step form (phone, code, then 2FA password if the account has one).
+Deleting is a two-step confirm, and the warning says plainly that the service
+will be left with no session. **A balance of `0` is ambiguous** — an empty
+account, or one nothing has read — so it renders as *unread*, never `$0.0000`,
+and an unread balance makes the total render as incomplete.
 
 **Users** — one row per end user with their joined job. Users with no account
 assigned show as `waiting`.
@@ -117,13 +128,23 @@ admin-only and never shown to an end user.
 **Alerts** — severity ordered, unread first, with the time and the full
 message. Availability alerts are `critical`.
 
-**Withdrawals** — history with the provider's confirmation stored verbatim, and
-one account's withdrawal at a time. The action area is a **preview then
-confirm**: run `POST /api/withdrawals/preview`, show fee, minimum, net and the
-warnings, and only then enable the real button. Show the wallet address in full,
-in mono, because a wrong address is unrecoverable. The `created` status must not
-read as success — add "the provider accepted this; arrival is not confirmed",
-because the provider never confirms arrival.
+**Withdrawals** — a four-step flow, because this is the one screen that moves
+money.
+
+1. **Balances** — one row per account with a checkbox, the count, and the total.
+2. **Preview** — `POST /api/withdrawals` with `confirm: false`. The wallet in
+   full, in mono, and the network stated in plain words: most people hold USDT on
+   Tron, and a BSC address to someone expecting TRC-20 arrives and is
+   unreachable to them. Per account: balance, amount, fee, net, and any `problem`
+   in destructive red. Then the totals: accounts, total balance, total amount,
+   **total fee**, total net. Every warning verbatim.
+3. **Confirm** — two-step arm that re-shows the net and the destination.
+4. **Live progress** — per account from the SSE stream, then the results.
+
+A refused line contributes **nothing** to the totals, and the page says so. The
+`created` status must not read as success: the provider accepted the request and
+never confirms arrival, so show the server's `note` verbatim. Never recompute
+`net` client-side — the fee is deducted from the amount, not added to it.
 
 **Settings** — editable: bound user, admin ids, withdrawal wallet, dry-run
 switch, watch interval, watch job. Secrets are shown as **present / not set**
@@ -132,5 +153,16 @@ dry-run switch carries a warning, because turning it off enables real payouts.
 
 ## Login
 
-A single centred card on `--background`: wordmark, password field, button.
-Nothing else. The session cookie is the only credential.
+**Only the Telegram sign-in button, centred on `--background`.** No wordmark, no
+subtitle, no card border or padding. Telegram's widget script renders and owns
+the button, so the pre-load state is styled from the same tokens and is replaced
+the moment the script arrives.
+
+A status line and an error line sit beneath it, **hidden until there is something
+to say**, so a failed sign-in is still visible without cluttering the resting
+page. The session cookie is the only credential of ours; there is no password.
+
+Layout note that cost a fix: the wrapper is **flex with `align-items` and
+`justify-content: center`**. A grid with `min-height: 100vh` and more than one
+child stacks the rows from the top and `place-items` only centres each item
+within its own auto-height row, so the group ends up above the middle.

@@ -9,13 +9,21 @@ yet. Companion to `context.md` (facts) and `AGENTS.md` (rules).
 
 ## Where we are
 
-Working end to end on one real account, bound to one test user:
+**Deployed and running** at https://opentask.up.railway.app, with a nine-page
+admin dashboard behind Telegram Login Widget auth. One real account bound to one
+test user.
 
-- our bot `@OpenTasksBot` receives `/start` and shows **one** job as a button
-- tapping it joins the job, drives the provider, and forwards the reply
+Shipped and working:
+- our bot `@OpenTasksBot` receives `/start` and shows the catalogue as buttons
+- tapping a job joins it, drives the provider, and forwards the reply
 - `/exitjob` leaves; state survives a restart
 - every interaction is audited on all four legs
 - price and availability alerts go to admins only
+- **sessions**: created from the dashboard (phone → code → 2FA), listed with
+  balances, deletable
+- **withdrawals**: preview then execute on one endpoint, per-account lines, a
+  totals block, and live SSE progress
+- the operator CLI drives status, jobs, both stores, the catalogue and deploys
 
 **Blocking the product right now:** the job we sell, `2FA:Create FB (No mail)`,
 is **not currently listed** by the provider. The catalogue correctly resolves to
@@ -27,25 +35,35 @@ That is correct behaviour, not a bug.
 flow stops at that prompt. The bridge forwards the provider's words verbatim
 rather than guessing a parser.
 
+**And the balance is $0.0000**, so a live withdrawal will be refused by the
+provider's $0.20 minimum until the account is topped up.
+
 ---
 
 ## Milestone 1 — make one job sellable end to end
 
-*Blocked on the job returning to the provider's list.*
+*Partly blocked: the provider is not offering the job.*
 
+Built:
+- the `/start` → list → join flow, with the join persisted
+- `require_all` matching, so the right job is matched and the wrong variant is
+  never substituted for it
+- the availability alert that fires when the job is missing
+
+Blocked on the provider:
 1. Watch for the availability alert; confirm `require_all` matches on return
 2. Walk the **full** 2FA flow with a real key and record every screen
 3. Capture the credential message, then write the extractor against a **real
    sample** — never a guessed pattern
-4. Relay it to the end user through our bot
-5. Confirm the `1:1` binding survives a redeploy
+4. Relay it to the end user
 
 **Done when:** a user taps the button, completes the task, and receives the
 credential — with the provider's state intact on restart.
 
-**Risk to resolve first:** how 2FA secrets are handled. They are live
-credentials with no rotation. Encrypted at rest, or relayed and forgotten? Who
-can see them? This is a security decision, not a coding one.
+**Risk to resolve first:** how 2FA secrets are handled. The provider asks for a
+TOTP seed, which is a live credential with no rotation. Encrypted at rest, or
+relayed and forgotten? Who can see them? This is a security decision, not a
+coding one.
 
 ---
 
@@ -114,41 +132,50 @@ silent failover or an honest error — the default is an honest error.
 
 ---
 
-## Milestone 4 — admin website
+## Milestone 4 — admin website — **DONE**
 
-The audit log already records everything needed. This is a view over it, and it
-is where **all** admin capability lives — there is no separate admin surface.
+Built and deployed. Nine pages, TypeScript built by Bun to static files and
+served by the Go binary, so one process and no second runtime.
 
-- **accounts:** online, flood-wait, banned, assigned user, messages sent,
-  balance, last seen
-- **users:** joined job, message count, last seen
-- **live feed:** every message, both directions, streaming
-- **alerts:** price and availability history, with the job's availability
-  timeline
-- **withdrawals:** per-account history with the provider's confirmation stored
-  verbatim, plus a dry-run preview and a single-account withdrawal action
-  (Milestone 3b)
-- **job catalogue:** read `task.json` and show what is offered, what is hidden,
-  and the current cost versus sell price
-- auth: single password or Telegram Login Widget — **undecided**
+- **Overview** — account health, users, job availability and margin, alerts
+- **Accounts** — state, phone, balance, assigned user, flood-wait
+- **Sessions** — stored sessions with balances and a total; create (phone → code
+  → 2FA) and delete
+- **Users** — joined job, message count, last seen
+- **Tasks** — the catalogue: offered, hidden, provider cost versus sell price
+- **Messages** — the live four-leg feed
+- **Alerts** — price and availability history
+- **Withdrawals** — the preview/execute flow plus history
+- **Settings** — editable config; secrets are never returned by the API
 
-The most important screen is not traffic. It is **which account is about to die**,
-because that is what costs the business.
+Auth is the **Telegram Login Widget**, chosen over a password. A shared password
+in front of a panel that can withdraw is the weakest link in the chain, and
+there is now no secret of ours to leak or forget to rotate.
 
-Frontend is TypeScript built by Bun to static files, served by the Go binary —
-one process, no second runtime.
+Still open here: the job catalogue is unreadable to users while the provider
+withdraws the job, and the Overview cannot yet distinguish a balance that was
+never read from one that is genuinely zero.
 
 ---
 
-## Milestone 5 — deploy
+## Milestone 5 — deploy — **DONE**
 
-- Neon project with `accounts`, `users`, `assignments`, `messages`, `buttons`
+- Neon `tasklybridge` holds the critical data: accounts, users, **sessions**,
+  alerts, withdrawals, price baselines
+- Railway Postgres holds the high-volume logs: messages, audit
 - sessions in Neon via `session.Storage`, so Neon alone is a full restore point
-- one Railway service, one process, one Dockerfile
-- **sleep disabled** — a frozen service drops live MTProto connections
-- `task.json` mounted as config, not baked into the image, so prices change
-  without a redeploy
-- `/healthz` that only reports ready once at least one account is connected
+- one Railway service, one process, one Dockerfile building Bun and Go
+- `/healthz` reports ready only once an account is connected; the image's
+  healthcheck runs `-status`, which explains a failure rather than just
+  reporting one
+- `task.json` is copied in as config rather than compiled in, so prices change
+  without a rebuild
+
+**Not yet done:** Railway sleep is not explicitly disabled, and the MTProto
+session was pushed to Neon by hand via `cli session push` rather than by a
+first-run bootstrap. A cold container with an empty store would start, log
+"no session", and sit there serving the dashboard — which is deliberate, since
+the dashboard is how a session gets added.
 
 ---
 
@@ -180,18 +207,29 @@ there is no pool loop and almost no interleaving risk — one flow, one account,
 one `opMu` hold. The dangerous part is unchanged though: there is still no
 confirmation step, so the amount is irreversible.
 
-### Build it in this order
+### Build it in this order — **DONE**
 
-1. **Withdrawal record in the dashboard**, with the confirmation message
-   stored verbatim. Recording is not detection, but it makes a discrepancy
-   findable later
-2. **Dry-run mode** — walk the flow, read fee and minimum off the screen, send
-   nothing. The only place a mistake gets caught
+All four shipped. What actually differed from the plan:
+
+1. **Withdrawal history**, with the provider's confirmation stored verbatim
+2. **Preview mode** — reads balances, fee and minimum off the provider, sends
+   nothing
 3. **Single-account withdrawal**, admin-selected, with a preview showing debit,
-   fee and net **before** the final button
-4. **Address validation** — `0x` + 40 hex, and state that BEP-20 is BSC
+   fee and net before the final button
+4. **Address validation** — `0x` + 40 hex, and the network stated in plain
+   words
 
-### Guardrails it must keep
+Two things the plan did not anticipate:
+
+- **Preview and execute had to be one endpoint**, chosen by a `confirm` flag.
+  Two endpoints would mean the numbers an operator approves and the numbers that
+  are used could come from different code paths.
+- **The wallet was first threaded through a package variable.** With one
+  withdrawal running that is fine; with two, one admin's payout could go to the
+  other admin's address. It is now a parameter, and only one withdrawal may run
+  at a time.
+
+### Guardrails it keeps
 
 - **Never enter the flow on a bare user message.** The provider holds
   conversational state, so a stray message mid-flow could be read as an amount
@@ -209,27 +247,36 @@ confirmation step, so the amount is irreversible.
 
 | Item | Why not yet |
 |---|---|
-| Job status cache / monitor account | See Milestone 2. Second account doubles ban surface; needs measurement first |
+| Job status cache / monitor account | See Milestone 2. A second account doubles the ban surface; needs measurement first |
 | SMS alerts | Telegram is built and free. SMS needs a paid gateway and per-message billing |
-| Neon for state | JSON files are fine at one user. Neon at thirty |
-| Dashboard | The audit log exists; the UI can wait |
 | Bulk account registration | Never, on purpose. Automated registration is how accounts get flagged |
 | Inline `callback_data` mapping | Only needed for non-menu screens. The main menu is plain text, so the whole token table turned out unnecessary |
 | Media passthrough | No media observed. The `📹 Video instruction` may force it |
 | Rate limiting / sharding | 30 users is a hard ceiling. Skip until it isn't |
+| Failed-payout detection | The provider never confirms arrival, so this needs a chain lookup. A separate integration |
+
+Two entries were removed because they are done: **Neon for state** and
+**the dashboard**.
 
 ---
 
 ## Known gaps
 
+- **The job we sell is withdrawn by the provider**, so nothing is sellable
+  until it returns. The list has churned within a single afternoon.
+- **The account balance is $0.0000.** A live withdrawal is refused by the
+  provider's $0.20 minimum until the account is topped up.
 - **No margin.** Static 5tk against a provider cost that reached 5.20tk. The
   loss check alerts admins; it does not fix the pricing.
 - **The 2FA secret is a live credential** with no rotation, and the handling
-  policy is undecided.
+  policy is undecided. This is the largest open risk.
 - **Rejection rate is unknown.** Rejections are presumably not refunded, so the
   real cost per *accepted* job is unknown.
 - **Whether the charge lands at `Start` or at completion is unverified** — no
   balance check was sent after the one `Start`, on request.
 - **The task steps are unknown.** The instruction video has never been watched
   and the on-page instruction is empty.
-- **The job we sell is withdrawn**, so nothing is sellable until it returns.
+- **Failed payouts are undetectable.** The provider says "created" and never
+  confirms arrival, so a transfer that fails downstream is invisible here.
+- **Railway sleep is not explicitly disabled.** A frozen service would drop
+  live MTProto connections, so it should be turned off in the dashboard.

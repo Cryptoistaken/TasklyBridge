@@ -151,13 +151,24 @@ user's Telegram account, so the narrower scope is correct.
 
 ## Fallback
 
-The widget requires Telegram to be reachable. Keep a **password fallback**
-behind the same session mechanism for when the widget is unavailable, disabled
-with `ADMIN_PASSWORD`. It is strictly less safe, so the dashboard should show a
-notice while it is in use.
+**There is none, deliberately.** The widget requires Telegram to be reachable,
+and when it is not, nobody can sign in. That is the trade: a fallback password
+is a shared secret in front of a panel that can move money, and the weakest link
+in that chain should not be something we chose.
+
+`ADMIN_PASSWORD` does not exist in this project. It was in an early draft of
+this document and in the env template before the widget was wired up; both are
+gone.
+
+If Telegram being unreachable ever becomes a real problem, the answer is a
+second bot with its own audience, not a password.
 
 ## What this removes
 
-The shared `ADMIN_PASSWORD` is no longer the primary path. That matters because
-a single shared password is the weakest link in an admin panel that can move
-money: anyone who learns it can reach the withdrawal screen.
+There is no shared secret of ours to leak, share, or forget to rotate. The
+credential is a Telegram-issued JWT that the backend verifies and discards, and
+what it issues instead is a signed session cookie keyed on
+`ADMIN_SESSION_SECRET`.
+
+That matters most on a panel that can withdraw: anyone who learns a shared
+password can reach the withdrawal screen.

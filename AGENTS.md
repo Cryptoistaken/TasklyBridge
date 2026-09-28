@@ -4,6 +4,27 @@ Read this before changing anything. Every rule here exists because breaking it
 has already happened, not because it sounds tidy.
 
 **Facts about the provider live in `context.md`. Do not rediscover them here.**
+**The API contract lives in `docs/api.md`. The dashboard's rules in
+`docs/design.md`.** If code and a document disagree, the document is usually
+right and the code is the bug — but check, because `docs/api.md` has been wrong
+three times and a build passing proves nothing about either.
+
+## Where it runs
+
+| | |
+| --- | --- |
+| Dashboard | **https://opentask.up.railway.app** |
+| Railway project | `TasklyBridge` — `5d244153-60e5-4ccc-9d5d-efb5d954a31c` |
+| App service | `TasklyBridge` — `361b378a-c542-4f7e-8ccc-6fb9e1cfc35b` |
+| Environment | `production` — `2882a7ab-5888-498f-a3ae-ff6f0f81d671` |
+| Critical store | Neon `tasklybridge` — `lingering-lake-46859788` |
+| Log store | Railway `Postgres` — `5e82eaf9-6fd3-42fc-b577-d97c75cf1611` |
+| Our bot | `@OpenTasksBot` — id `8730058124` |
+
+`railway` and `gh` are on PATH and authenticated. The Railway **CLI reads its
+token from `user.token` in `~/.railway/config.json`**, not from
+`RAILWAY_TOKEN`; the CLI was rejecting a perfectly valid token until that was
+written there.
 
 ---
 
@@ -99,6 +120,37 @@ Price and availability alerts go to **`ADMIN_USER_IDS` only**. They state the
 provider's cost, which is this bridge's margin. `botNotifier` refuses to send
 when no admin is configured, so an alert fails loudly instead of leaking.
 
+### 9. Never claim a UI works because a build passed
+
+This is the rule that would have saved three fixes.
+
+The login card sat in the top-left of the page for the whole life of the project.
+The stylesheet had `.login { min-height: 100vh; place-items: center }` and the
+code never created an element with that class, so the rule was **dead CSS**. Then
+when the wrapper was added, grid placed the group above the middle because
+`place-items` centres each item within its own auto-height row rather than the
+group. Two real bugs, in the same place, both invisible to every check I ran:
+
+```
+tsc          clean
+bun run build  clean
+go vet       clean
+gofmt        clean
+go test      24 passing
+```
+
+**All of those verify the code is well-formed. None verify the page looks
+right.** A dead CSS rule and a correctly-compiled program are indistinguishable
+to all of them. Two screenshots found what the entire chain missed.
+
+**So: look at it before saying it works.** Render it and check. When a class in
+the stylesheet has no counterpart in the code, one of them is wrong — verify
+which, do not assume. And when a brief says "run tsc and bun build", that is
+the floor of the verification, never the ceiling.
+
+A cheap static check that would have caught the first one: list every
+structural class in the CSS, and confirm the code creates each one.
+
 ---
 
 ## Provider facts that will bite you
@@ -120,6 +172,26 @@ All of these cost debugging time. They are established, not guesses.
 
 ---
 
+## Two stores, split by write volume
+
+Not tidiness. **Neon scales to zero when idle**, so a write on every
+interaction keeps waking it and paying for the privilege, over an internet round
+trip.
+
+| Store | Holds | Why |
+| --- | --- | --- |
+| **Neon** (`DATABASE_URL`) | `accounts`, `users`, `sessions`, `alerts`, `withdrawals`, `price_baseline`, `job_availability` | Critical and infrequent. Deleting the whole Railway project must be recoverable from here |
+| **Railway Postgres** (`LOGS_DATABASE_URL`) | `messages`, `audit` | The bulk of the writes, and the cheapest thing to lose: a transcript of things the accounts table already describes |
+
+`sessions` holds the MTProto auth keys. **The blob is a live credential** — it is
+never logged, never printed, never returned by an API, and never committed. Only
+its size and presence are ever reported. `claude`-style mistakes here are
+permanent account compromise, so the store is treated as a secret and the CLI's
+plain output excludes it.
+
+`LOGS_DATABASE_URL` falls back to the critical store when unset, so a
+single-database setup still works.
+
 ## Concurrency
 
 One MTProto client for the process. Telegram delivers updates **only to the
@@ -138,6 +210,38 @@ Two locks on `target`, for two different reasons — do not merge them:
 Every action stamps the sequence **before** sending, so only messages arriving
 after that stamp count as the reply. A message that lands while idle must never
 be read as the answer to the next action.
+
+## Money
+
+`POST /api/withdrawals` is the only endpoint that can spend, and the only place
+in the codebase that sends a withdrawal amount.
+
+- **Preview and execute are the same endpoint**, chosen by `confirm`. Two
+  endpoints would mean the numbers an operator approves and the numbers that
+  are used could come from different code paths.
+- **Balances, fee and minimum are read live from the provider** on every call.
+  The fee has already moved once ($0.025, minimum $0.20) and a stored copy would
+  show an admin a number that is not what they will be charged.
+- The wallet is **threaded as a parameter**, never a package variable. Two
+  concurrent withdrawals would otherwise send one payout to the other's address.
+- One withdrawal at a time, guarded by `withdrawing`. Two provider
+  conversations interleaved could pay a wrong amount.
+- **"created" is not "paid".** The provider confirms a request was created and
+  never confirms arrival. Nothing in this system can prove the money landed.
+- A **zero balance is ambiguous** — an empty account, or one nothing has read.
+  It is reported as unread and never as `$0.0000`, and it marks any total it
+  contributes to as incomplete.
+
+## Secrets
+
+Nothing sensitive is committed. `Backend/.env` and the Telegram session are
+gitignored, and a scan of every staged file runs before each commit against the
+live bot token, `api_hash`, the Neon password, the phone number, the Railway
+token and the withdrawal wallet.
+
+**That scan has caught four real leaks** — a phone number in a test file, a
+wallet address in a test constant, and two others. It is not ceremony; it earns
+its place. Test fixtures use synthetic values (`+15550100`, `0x1111…`).
 
 ---
 
@@ -219,6 +323,14 @@ context.md       provider facts, decisions, open questions
 
 ## Where things still need work
 
-State lives in JSON files, not Neon. Fine for one user, wrong for thirty. See
-`context.md` §9 for the open list — in particular the 2FA secret handling, which
-is a security decision, not a coding one.
+- **The job we sell is withdrawn by the provider.** `2FA:Create FB (No mail)` is
+  not listed, so the catalogue correctly resolves to nothing and the bot offers
+  no jobs. The provider's list churned within a single afternoon.
+- **The account balance is $0.0000.** A live withdrawal will be refused by the
+  provider's $0.20 minimum, which is correct behaviour. Top up before testing.
+- **The 2FA secret handling is undecided.** The provider asks each worker for a
+  TOTP seed — a live credential with no rotation. That is a security decision,
+  not a coding one, and it is the largest open risk.
+- **No multi-user.** One bound user, one account. The 1:1 model is enforced
+  because the provider keeps per-chat state that cannot be shared.
+- See `context.md` §10 for the full open list.
