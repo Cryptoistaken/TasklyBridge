@@ -1,0 +1,16 @@
+# Never bake secrets, sessions or account data into the image.
+data/
+node_modules/
+.git/
+.gitignore
+Dockerfile
+docker-compose.yml
+*.tmp.mjs
+data/out/
+data/sessions/
+data/backup/
+*.xlsx
+*.log
+*.jsonl
+.env
+*.bak
