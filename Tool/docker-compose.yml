@@ -1,0 +1,28 @@
+# Local test. NOT the production shape - this bind-mounts your real data folder
+# so the container can read data/.env and the Telegram sessions. That is what
+# you want for a smoke test and NOT what you want in production, where those
+# come from env vars and a volume.
+services:
+  bot:
+    build: .
+    command: ["bun", "bot.js"]
+    env_file: [data/.env]
+    environment:
+      FB_HEADLESS: "1"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  # The drain changes Facebook passwords, so it needs the browser. Start it only
+  # after the bot has proved it can reach Telegram and Postgres from inside the
+  # container. --list-queued spends nothing and is the safe first run.
+  drain:
+    build: .
+    command: ["bun", "index.js", "--drain", "--list-queued"]
+    env_file: [data/.env]
+    environment:
+      FB_HEADLESS: "1"
+    volumes:
+      - ./data:/app/data
+    profiles: ["drain"]
+    restart: unless-stopped
