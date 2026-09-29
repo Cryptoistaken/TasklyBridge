@@ -717,6 +717,34 @@ async function changeFacebook(currentPw, newPw, url, cookieString) {
   }
 }
 
+// ---- Codegen (manual browser with one row's cookie, no Telegram) ----
+async function runCodegen(args) {
+  const sheets = argValues(args, "--xlsx");
+  if (!sheets.length) throw new Bail("usage: bun index.js --codegen --xlsx <sheet> [--row N]");
+  const row = Number(argValue(args, ["--row"]) ?? "1");
+  const pick = resolveRow(sheets[0], row);
+  const url = resolveUrl();
+  const context = await chromium.launchPersistentContext(path.join(__dirname, "profile"), {
+    ...DEVICES_PHONE,
+    locale: "en-US",
+    headless: false,
+    channel: "chrome",
+    args: ["--disable-blink-features=AutomationControlled"],
+  });
+  try {
+    await context.clearCookies();
+    await context.addCookies(parseCookies(pick.cookie.trim(), process.env.COOKIE_DOMAIN ?? new URL(url).hostname));
+    log.success(`${path.basename(sheets[0])}: row ${pick.row} (fp ${fingerprint(pick.cookie)})`);
+    const page = context.pages()[0] ?? (await context.newPage());
+    await page.goto("https://www.facebook.com/", { waitUntil: "load" });
+    await page.goto(url, { waitUntil: "load" });
+    log.success(`Opened ${url} - inspect, then close the window`);
+    await page.pause();
+  } finally {
+    await context.close();
+  }
+}
+
 // ---- Batch / group ----
 let curFp = "", curXlsx, curRow = 0;
 function resolveRow(file, row) {
@@ -965,9 +993,10 @@ Usage:
   bun index.js --xlsx a.xlsx --all -p <phone>          # whole sheet
   bun index.js -P <assignedPw> -o <current> --fa2 <k> --xlsx a.xlsx --row 5   # resume
   bun index.js --login <phone>                         # one-time Telegram sign-in
+  bun index.js --codegen --xlsx a.xlsx --row 5         # open browser with that row's cookie, pause for inspector
 Flags: --xlsx (repeatable/comma/space), --row, --rows f#r,.. (internal), --all,
   -p/--phone, -o/--current-password, -P/--password, --fa2, --per-session N,
-  --plan, --force, --dry-run/--probe, --login, --help
+  --plan, --force, --dry-run/--probe, --codegen, --login, --help
 Rule: one bot password covers max ${MAX_REUSE} cookies and retires after 1 success.`);
 }
 
@@ -982,6 +1011,10 @@ async function main() {
     return;
   }
   const phone = argValue(args, ["--phone", "-p"]) ?? process.env.TG_PHONE;
+  if (args.includes("--codegen")) {
+    try { await runCodegen(args); return; }
+    catch (e) { if (!(e instanceof BailLogged)) log.error(e?.message ?? e); process.exit(1); }
+  }
   const group = parseRows(argValue(args, ["--rows"]));
   if (group.length) { process.exit(await runGroup(group, args, phone)); }
   const sheets = argValues(args, "--xlsx");
