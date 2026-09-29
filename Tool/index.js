@@ -92,7 +92,7 @@ const tlog = {
   info: (m) => console.log(chalk.blue("TG"), chalk.white(m)),
   ok: (m) => console.log(chalk.green("TG"), chalk.white(m)),
   err: (m) => console.log(chalk.red("TG"), chalk.white(m)),
-  raw: (m) => console.log(chalk.gray("TG"), chalk.gray(m)),
+  raw: (m) => { if (process.env.TOOL_DEBUG) console.log(chalk.gray("TG"), chalk.gray(m)); },
 };
 const T0 = Date.now();
 const elapsed = () => `${((Date.now() - T0) / 1000).toFixed(1)}s`;
@@ -300,6 +300,59 @@ function listVerdicts() {
   return fs.readFileSync(VERDICTS_FILE, "utf8").split(/\r?\n/).filter(Boolean)
     .map((l) => { try { return JSON.parse(l); } catch { return null; } })
     .filter((r) => r && r.verdict);
+}
+
+// --check-task: is the job we sell actually listed right now? Walks the real
+// menu and looks. Nothing is started, nothing is spent - but the job list churns
+// within a day, and "absent" is not "free", it means the catalogue must resolve
+// to nothing. Cheaper to find out here than to discover it three presses into a
+// walk.
+//
+// The price is shown because this is an operator tool, not a user-facing
+// message: it is our cost and the basis of our margin. It is never shown to an
+// end user anywhere in this file.
+async function runCheckTask() {
+  const phone = argValue(process.argv.slice(2), ["--phone", "-p"]) ?? process.env.TG_PHONE;
+  const tg = await Taskly.open({ phone });
+  try {
+    await tg.obeyRateLimit(await tg.ensureMainMenu());
+    await sleep(STEP_MS);
+    await tg.obeyRateLimit(await tg.press("open Tasks", "Tasks"));
+    await sleep(STEP_MS);
+    const opened = await tg.obeyRateLimit(await tg.press(`open ${GROUP}`, GROUP));
+    if (opened.waited) { log.warn("Rate limited opening the group - try again in a moment"); return 1; }
+    await sleep(STEP_MS);
+    const listed = tg.labels().filter((l) => l.toLowerCase().includes(JOB.toLowerCase()));
+    log.info(`group "${GROUP}" lists: ${tg.labels().join(" | ") || "(no buttons)"}`);
+    if (!listed.length) {
+      log.error(`OFF: "${JOB}" is not listed under ${GROUP}. Users would see "no jobs available" - that is correct, not a bug.`);
+      return 1;
+    }
+    for (const label of listed) {
+      const price = label.match(/\$([\d.]+)/)?.[1];
+      log.success(`ON: "${label}"`);
+      if (price) {
+        const sell = readSellPrice();
+        log.info(`  provider price: $${price}  |  we sell: ${sell != null ? sell + "tk" : "(not set)"}`);
+        if (sell != null && process.env.BDT_RATE) {
+          const cost = Number(price) * Number(process.env.BDT_RATE);
+          log.warn(`  cost ~${cost.toFixed(2)}tk vs ${sell}tk sell -> ${cost > sell ? "SELLING AT A LOSS" : "margin " + (sell - cost).toFixed(2) + "tk"}`);
+        }
+      }
+    }
+    return 0;
+  } finally {
+    await tg.close();
+  }
+}
+function readSellPrice() {
+  try {
+    const f = path.join(__dirname, "task.json");
+    if (!fs.existsSync(f)) return null;
+    const cat = JSON.parse(fs.readFileSync(f, "utf8"));
+    const list = Array.isArray(cat) ? cat : cat.tasks ?? [cat];
+    return list.find((t) => JSON.stringify(t).includes(JOB))?.sell_bdt ?? null;
+  } catch { return null; }
 }
 
 // --check-verdicts: what actually happened to everything we sent.
@@ -1219,6 +1272,11 @@ export class Taskly {
     const saved = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
     const digits = normalizePhone(phone);
     const client = new TelegramClient(new StringSession(saved), apiId, apiHash, { connectionRetries: 3 });
+    // gramJS logs its own connection chatter at INFO - which DC it dialled, the
+    // layer it negotiated, disconnect notices. None of it is actionable and it
+    // was a third of the screen. This must be set on the CLIENT: the static
+    // Logger.setLevel is deprecated in 2.26 and does nothing.
+    client.setLogLevel(process.env.TOOL_DEBUG ? "debug" : "error");
     const t = new Taskly(client);
     await client.connect();
     if (!(await client.checkAuthorization())) {
@@ -1241,13 +1299,17 @@ export class Taskly {
   // The provider rate-limits us and says how long to wait. Obeying it is the
   // whole handling - the message replaces the reply we wanted, so the account
   // is still available and only the wait is missing.
+  // Returns {replies, waited}. The first attempt returned just the seconds,
+  // which silently inverted every `if (!await obey(...))` at the call sites -
+  // one of them reported a healthy group as "could not open". Both halves are
+  // returned so a caller can pass the replies on AND branch on the wait.
   async obeyRateLimit(replies) {
     const s = rateLimitSeconds(replies);
-    if (!s) return 0;
+    if (!s) return { replies, waited: 0 };
     log.warn(`Provider rate limit: waiting ${s}s as instructed`);
     audit({ leg: "internal", what: "rate-limit", waitSec: s });
     await sleep(s * 1000 + 500);
-    return s;
+    return { replies, waited: s };
   }
   // True when the provider's own timer ran out. The account is already lost by
   // then, so the only thing to add is a clear reason.
@@ -1801,7 +1863,7 @@ async function walkForPassword(tg, fp) {
     const beforeStart = await tg.latestId();
     const startReplies0 = await tg.press("click Start", "Start");
     // The rate limit is most often delivered in place of the credentials.
-    if (await tg.obeyRateLimit(startReplies0)) {
+    if ((await tg.obeyRateLimit(startReplies0)).waited) {
       audit({ leg: "internal", what: "creds", status: "rate-limited-at-start", attempt, fp });
       continue;
     }
@@ -1815,18 +1877,25 @@ async function walkForPassword(tg, fp) {
     const deadline = Date.now() + CRED_WAIT_MS;
     let startReplies = startReplies0;
     let creds = { firstName: null, lastName: null, password: null };
+    let limited = false;
     for (;;) {
       startReplies = await tg.freshSince(beforeStart, 6);
       tg.noteActionCancelled(startReplies);
-      if (await tg.obeyRateLimit(startReplies)) { audit({ leg: "internal", what: "creds", status: "rate-limited-at-start", attempt, fp }); break; }
+      // Detect only, do NOT wait here: the wait is done once after the loop.
+      // Waiting inside it would sleep on every poll tick.
+      if (rateLimitSeconds(startReplies)) { limited = true; break; }
       if (tg.isTaskCancelled(startReplies)) { log.error("The provider's timer ran out on this task - the account is lost."); audit({ leg: "internal", what: "creds", status: "provider-timer-expired", attempt, fp }); return null; }
       creds = parseCreds(startReplies);
       if (creds.password) break;
       if (Date.now() >= deadline) break;
       await sleep(250);
     }
+    if (limited) {
+      await tg.obeyRateLimit(startReplies);
+      audit({ leg: "internal", what: "creds", status: "rate-limited-at-start", attempt, fp });
+      continue;
+    }
     if (!creds.password) {
-      if (await tg.obeyRateLimit(startReplies)) { audit({ leg: "internal", what: "creds", status: "rate-limited-at-start", attempt, fp }); continue; }
       log.error(`No credentials within ${CRED_WAIT_MS}ms of Start`);
       audit({ leg: "internal", what: "creds", status: "missing-at-start", attempt, fp });
       continue;
@@ -2030,6 +2099,7 @@ Usage:
   bun index.js --login <phone>                         # one-time Telegram sign-in
   bun index.js --selftest                              # offline checks, no browser, no network
   bun index.js --check-verdicts                        # what actually happened to every report we sent
+  bun index.js --check-task                            # is the job listed right now? spends nothing
   bun index.js --check-pw --hold --xlsx a.xlsx --row 5 -o <curPw>   # on an unknown screen: dump it and keep the browser open
   bun index.js --codegen --xlsx a.xlsx --row 5         # open browser with that row's cookie, pause for inspector
   bun index.js --codegen --detect --xlsx a.xlsx --row 5   # walk to the form and report what was identified, type nothing
@@ -2039,7 +2109,8 @@ Usage:
 Flags: --xlsx (repeatable/comma/space), --row, --rows f#r,.. (internal), --all,
   -p/--phone, -o/--current-password, -P/--password, --fa2, --per-session N,
   --plan, --force, --dry-run/--probe, --codegen, --detect, --check-pw,
-  --refresh-cookie, --write-back, --hold, --selftest, --check-verdicts, --login, --help
+  --refresh-cookie, --write-back, --hold, --selftest, --check-verdicts, --check-task,
+  --no-uid-check, --login, --help
 Rule: one bot password covers max ${MAX_REUSE} cookies and retires after 1 success.`);
 }
 
@@ -2048,6 +2119,7 @@ async function main() {
   if (args.includes("--help") || args.includes("-h")) { printHelp(); return; }
   if (args.includes("--selftest")) { process.exit((await selftest()) ? 1 : 0); }
   if (args.includes("--check-verdicts")) { process.exit(checkVerdicts()); }
+  if (args.includes("--check-task")) { process.exit(await runCheckTask()); }
   if (args.includes("--login")) {
     const p = argValue(args, ["--login"]) ?? argValue(args, ["--phone", "-p"]);
     const t = await Taskly.open({ phone: p });

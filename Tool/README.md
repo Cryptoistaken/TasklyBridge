@@ -71,6 +71,8 @@ This is how the human check was found, and it is the fastest way to learn a new 
 
 Flags: `--row N`, `--force` (retry sent/gated), `--dry-run` (walk + Start, stop before Facebook), `--per-session N` (default 3), `--fa2` (override sheet key).
 
+**Every command, flag, method and screen is listed in `clidoc.md`.**
+
 ## Two separate liveness checks
 
 They answer different questions, so both run, cheap one first.
