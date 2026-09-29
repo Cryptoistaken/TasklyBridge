@@ -1,0 +1,8 @@
+.env
+sessions/
+out/
+profile/
+node_modules/
+*.har
+*.xlsx
+data/*.xlsx
