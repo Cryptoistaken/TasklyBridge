@@ -490,7 +490,11 @@ export async function checkUid(cookie) {
   return hit ? { uid, status: hit.status, message: hit.message } : { uid, status: "unknown" };
 }
 
-async function probeOnce(cookie) {
+// Exported so a sweep over many cookies can see ALIVE / DEAD / UNKNOWN
+// separately. isCookieDead() folds them into a boolean, where UNKNOWN reads as
+// "not dead" - correct for a single account in a run, but it would report
+// rate-limited or checkpointed cookies as healthy in a bulk check.
+export async function probeOnce(cookie) {
   try {
     const res = await fetch(PROBE_URL, {
       headers: {
