@@ -48,6 +48,25 @@ const DEVICES_PHONE = {
   hasTouch: true,
 };
 
+// How the browser starts, so the same code runs on a desktop and in a container.
+//
+// On a desktop: headed, real Chrome (channel "chrome"). That is the only
+// combination every measurement in this file was taken under, and Facebook
+// detection is the thing that costs accounts, so it is what we keep.
+//
+// In a container there is no display, so headed Chrome cannot start at all, and
+// "chrome" means installing a second 400MB browser that the Playwright base
+// image does not ship. So the container uses headless with the bundled Chromium.
+//
+// HEADLESS IS LESS STEALTHY. That is a real risk, not a formality: switching to
+// it is the most likely way to get an account flagged, and the accounts are the
+// product. It is behind an env var rather than hardcoded so the desktop path
+// stays byte-for-byte what was tested.
+const HEADLESS = process.env.FB_HEADLESS === "1";
+const BROWSER_CHANNEL = process.env.FB_CHANNEL || undefined; // undefined = Playwright's bundled Chromium
+const launchBrowser = () =>
+  chromium.launch({ headless: HEADLESS, channel: BROWSER_CHANNEL, args: LAUNCH_ARGS });
+
 // Ephemeral browser, fresh context, every single run. This used to be
 // launchPersistentContext against a shared ./profile folder, and that was a
 // real bug: clearCookies() clears COOKIES ONLY. localStorage, IndexedDB, cache,
@@ -58,7 +77,7 @@ const DEVICES_PHONE = {
 // some things are impossible to clean up, such as visited links - so the fix
 // is not to clean harder, it is to not share.
 //
-// Rationale and sources: data/doc/profile-reuse.md
+// Rationale and sources were kept in data/doc/profile-reuse.md, deleted on request.
 //
 // The old ./profile folder has been deleted - 68MB of shared storage that
 // nothing reads any more.
@@ -262,10 +281,23 @@ export function parseVerdict(text) {
 //
 // The hard part: a verdict carries NO identifier. No uid, no row number,
 // nothing - just "Report approved, +$0.05". The only mapping available is
-// order: the oldest unanswered submission takes the next verdict. Verdicts were
-// observed arriving in order (three approvals then one rejection), so FIFO is
-// used, and it is recorded as the assumption it is. If it is ever wrong the
-// fix is to put a marker in the sheet, not to guess harder.
+// order: the oldest unanswered submission takes the next verdict.
+//
+// Order is only meaningful WITHIN one Telegram session. There are two sessions,
+// both talking to the same bot, and each one's verdicts come back on its own
+// account. A single shared queue mixed them: a verdict arriving on session A
+// used to shift whatever sat at the front, even if session B had submitted it.
+// That is not theoretical - it is what made 2fa43 read as 38 approved when the
+// provider's own balance proved 37 (37 x $0.05 = the $1.85 withdrawn). Measured
+// on the captured history: session ...1929 is self-contained (39 submissions ->
+// 39 verdicts, delays all 64-66 min), while session ...2634 received 12
+// verdicts for 8 submissions, 4 of which had negative delays against a global
+// pairing - impossible, so they belong to submissions that are not in our data
+// at all.
+//
+// So every entry records the session it went out on, and a verdict only ever
+// claims an entry from its OWN session. If that session has nothing waiting, the
+// verdict is recorded unmatched rather than consuming somebody else's row.
 const PENDING_FILE = path.join(OUT_DIR, "pending.json");
 const VERDICTS_FILE = path.join(OUT_DIR, "verdicts.jsonl");
 // The file arguments exist so --selftest can drive this against a temp dir
@@ -281,17 +313,25 @@ function savePending(list, file = PENDING_FILE) {
   fs.writeFileSync(file, JSON.stringify(list, null, 1), "utf8");
 }
 // Called the moment the provider acknowledges a report.
-function noteSubmission({ fp, source, row }, file = PENDING_FILE) {
+function noteSubmission({ fp, source, row, phone = null }, file = PENDING_FILE) {
   const list = loadPending(file);
-  list.push({ at: new Date().toISOString(), fp, source, row });
+  list.push({ at: new Date().toISOString(), fp, source, row, phone });
   savePending(list, file);
   return list.length;
 }
-function recordVerdict(v, pendingFile = PENDING_FILE, verdictsFile = VERDICTS_FILE) {
+// phone is the session the verdict arrived on. Without it this shifts the
+// globally-oldest entry, which is how a verdict got filed against the wrong
+// sheet. Entries with no phone (written before this change) are only claimable
+// when there is nothing else, and never by a different session's verdict.
+function recordVerdict(v, phone = null, pendingFile = PENDING_FILE, verdictsFile = VERDICTS_FILE) {
   const list = loadPending(pendingFile);
-  const claim = list.shift() ?? null; // oldest first - the FIFO assumption
-  savePending(list, pendingFile);
-  const rec = { at: new Date().toISOString(), ...v, claim, matched: !!claim };
+  let idx = -1;
+  if (phone) idx = list.findIndex((e) => e.phone === phone);
+  // No entry for this session. Do NOT fall back to another session's row -
+  // consuming it would silently reassign a real submission. Record and move on.
+  const claim = idx === -1 ? null : list.splice(idx, 1)[0];
+  if (idx !== -1) savePending(list, pendingFile);
+  const rec = { at: new Date().toISOString(), ...v, session: phone, claim, matched: !!claim };
   fs.mkdirSync(path.dirname(verdictsFile), { recursive: true });
   fs.appendFileSync(verdictsFile, JSON.stringify(rec) + "\n", "utf8");
   return rec;
@@ -670,7 +710,24 @@ function accountSheet(page) {
 // These buttons live on m.facebook.com, not accountscenter, and getByRole
 // finds nothing there either (same role=none wrappers). [role=button] is a
 // DOM-level query, so it works regardless of what the a11y tree exposes.
+// Facebook's logged-out login screen, in the wordings it actually serves. The
+// m.facebook.com one is "Mobile number or email address" - same words as the
+// older "Email or phone number", opposite order, which is why the old pattern
+// never fired on the real page. Needs an identifier field specifically: the
+// re-auth form has a password and a "Log in" button but no identifier, so it
+// must not match here or a recoverable session gets filed as a dead cookie.
+const LOGIN_SCREEN_RE = /Log into Facebook|Email or phone number|Mobile number or email/i;
+
 const mButton = (page, re) => page.locator('[role="button"]').filter({ hasText: re }).first();
+// The same, but also matching a real <button>. Measured on 2fa43 row 38: the
+// automated-behaviour checkpoint renders its Dismiss as a <button>, which
+// mButton's [role="button"]-only query does NOT match - so the gate reported
+// "no Dismiss" on a page that plainly had one, twice, while dumpScreen - which
+// already used 'button,[role="button"]' - listed it correctly.
+//
+// Detect and click must use the SAME locator, or a run confirms a button with
+// one query and then tries to click a different element with another.
+const anyButton = (page, re) => page.locator('button,[role="button"]').filter({ hasText: re }).first();
 const screens = (page) => ({
   // "Brittany Welker / Continue / Use another profile / Create new account"
   continueGate: { name: "expired session - Continue", loc: page.getByText("Use another profile", { exact: true }) },
@@ -685,11 +742,21 @@ const screens = (page) => ({
   // NOTHING here (measured: getByRole textbox = 0, getByLabel = 1). Every
   // field is addressed by its <label> instead.
   passwordForm: { name: "password change form", loc: page.getByLabel("Current password", { exact: true }) },
-  // Checked LAST and matched narrowly on purpose: the re-auth form also says
+  // Checked BEFORE reauth in every walk. Both halves of this were wrong once:
+  // (1) the m.facebook.com build says "Mobile number or email address", which
+  // /Email or phone number/ does not match - same words, opposite order; and
+  // (2) waitForScreen returns the FIRST visible match while a login form has a
+  // "Log in" button, so reauth beat loggedOut and the walk typed the account's
+  // own password at a form that can never accept it - nine times on 2fa43 row
+  // 33. Fixing the wording alone would NOT have fixed that.
+  // It still requires an identifier field, which the re-auth form does not
+  // have, so a recoverable session is never filed as a dead cookie. Pinned in
+  // --selftest.
+  // (was: checked LAST and matched narrowly on purpose: the re-auth form also says
   // "Log in", so a broad /Log in/ here would file a recoverable session as a
   // dead cookie. This wants an actual email/phone field, which the re-auth
   // form does not have.
-  loggedOut: { name: "LOGGED OUT / login screen", loc: page.getByText(/Log into Facebook|Email or phone number/i).first() },
+  loggedOut: { name: "LOGGED OUT / login screen", loc: page.getByText(LOGIN_SCREEN_RE).first() },
   checkpoint: { name: "identity checkpoint dialog", loc: page.getByRole("dialog").getByText(/confirm your identity|it's you|enter your password to confirm/i).first() },
 });
 
@@ -825,7 +892,23 @@ function isCheckpointUrl(page) {
 // The "automated behaviour" interstitial, as --hold found it on 2fa100 row 9.
 // One Continue button, no Dismiss. Requiring the phrase AND the button keeps a
 // bare "Continue" on some other page from being clicked as a human check.
+//
+// Continue is NOT clicked. Measured on row 9: that click lands on a CAPTCHA
+// ("Enter the text from the image"), and a CAPTCHA is deliberately not solved
+// here. So clicking spends the account's clean screen to arrive at a dead end.
 const HUMAN_CHECK = /confirm that you'?re human|are you a robot|verify you'?re human/i;
+
+// The OTHER automated-behaviour screen, captured verbatim on 2fa43 row 38:
+//
+//   We suspect automated...
+//   To prevent your account from being hacked
+//   buttons: Dismiss
+//
+// Distinct from the human check above and must never be confused with it: that
+// one leads to a CAPTCHA and is not clicked, this one closes on Dismiss. Both
+// phrasings are required to match, and so is the button, so a bare "Dismiss"
+// on an unrelated page is never clicked.
+const AUTO_WARNING = /we suspect automated|to prevent your account from being hacked/i;
 const pageText = (page) =>
   page.locator("body").innerText({ timeout: 5000 }).then((t) => t.replace(/\s+/g, " ")).catch(() => "");
 
@@ -839,6 +922,19 @@ async function findHumanCheck(page, ms = 10_000) {
   while (Date.now() < deadline) {
     if (await page.isClosed()) return null;
     if (HUMAN_CHECK.test(await pageText(page)) && (await btn.isVisible({ timeout: 300 }).catch(() => false))) return btn;
+    await sleep(POLL_MS);
+  }
+  return null;
+}
+
+// The same shape as findHumanCheck: both the wording AND the button, so a
+// Dismiss belonging to something else cannot be clicked by accident.
+async function findAutoWarning(page, ms = 10_000) {
+  const btn = anyButton(page, /^Dismiss$/);
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await page.isClosed()) return null;
+    if (AUTO_WARNING.test(await pageText(page)) && (await btn.isVisible({ timeout: 300 }).catch(() => false))) return btn;
     await sleep(POLL_MS);
   }
   return null;
@@ -903,6 +999,10 @@ async function selftest() {
     // Continue - there is no Dismiss - so a handler written from the
     // description would have found nothing and clicked nothing.
     "Ge. Alissa Bayuk, confirm that you're human to use your account Continue",
+    // Captured verbatim on 2fa43 row 38. The OTHER automated-behaviour screen:
+    // this one closes on Dismiss, the row above leads to a CAPTCHA and is not
+    // clicked. It is a challenge, not a ban - BANNED_WORDS must not swallow it.
+    "We suspect automated activity. To prevent your account from being hacked, ...",
     "",
   ];
   let bad = 0;
@@ -914,7 +1014,75 @@ async function selftest() {
     const got = classifyCheckpointText(t);
     if (got !== "challenge") { log.error(`selftest: should be a challenge, got ${got}: "${t}"`); bad++; }
   }
-  log.info(`selftest: ${banned.length + challenge.length} checkpoint wordings checked, ${bad} wrong`);
+  // The user-facing bot's own rules, exercised without Telegram. Pinned because
+  // the message style is a requirement, not a preference: inline keyboards only,
+  // no emoji beyond the two that carry meaning, and nothing that runs long.
+  const { parseSubmission: parseSub, text: botText, kb: botKb } = await import("./bot.js");
+  // Must clear the 200-char floor the parser enforces, or every case below would
+  // fail as "not-a-cookie" and the real rules would go untested. Real cookies run
+  // 900+; this is just long enough to be realistic.
+  const C = ("datr=SYNTHETICabc123456; sb=SYNTHETICdef456789; c_user=100000000000001; fr=SYNTHETICghi789012; " +
+    "xs=SYNTHETICjkl012mno345678; pas=100000000000001%3AABCDEFGHIJKLMNOP; ps_l=1; ps_n=1; wd=491x675; dpr=2.2; " +
+    "x-referer=eyJyIjoiL21yZWN0IiwicmMiOiJodHRwczovL2wuZmFjZWJvb2suY29tL3dyaXRlLzEiLCJkIjoiaGFrZXIifQ%3D%3D");
+  const K = "LO4E WXSP MGT4 MJMU PMGM NBIL QLR6 E332";
+  for (const [got, want, what] of [
+    [parseSub(C + "\n" + K).ok, true, "two-line submission"],
+    [parseSub(C + "\t" + K).ok, true, "tab-pasted submission"],
+    [parseSub(K + "\n" + C).why, "not-a-cookie", "key sent first"],
+    [parseSub(C).why, "format", "cookie only"],
+    [parseSub("").why, "empty", "empty message"],
+    [parseSub("datr=x\n" + K).why, "not-a-cookie", "truncated cookie"],
+    [parseSub(C + "\nshort").why, "bad-key", "bad 2FA key"],
+  ]) {
+    if (got !== want) { log.error(`selftest: bot parse - ${what} gave ${got}, wanted ${want}`); bad++; }
+  }
+  const botMsgs = [botText.start(), botText.prompt(), botText.badFormat(), botText.notACookie(), botText.badKey(),
+    botText.accepted(1), botText.duplicate(), botText.cancelled(), botText.idle(),
+    botText.status({ queued: 1, inflight: 1, approved: 1, rejected: 1 })];
+  const strayEmoji = [...new Set(botMsgs.join("\n").match(/\p{Extended_Pictographic}/gu) ?? [])]
+    .filter((e) => !["✅", "❌", "▸"].includes(e));
+  if (strayEmoji.length) { log.error(`selftest: bot uses emoji it should not: ${strayEmoji.join(" ")}`); bad++; }
+  const longest = Math.max(...botMsgs.map((m) => m.length));
+  if (longest > 90) { log.error(`selftest: a bot message runs to ${longest} chars - too long`); bad++; }
+  if (!Object.values(botKb).every((f) => f().rows?.length)) { log.error("selftest: a bot keyboard has no rows"); bad++; }
+  // /start is the only command. If a user never types anything they must still be
+  // able to reach submit and status, so both have to be buttons.
+  const { BUTTONS: botButtons } = await import("./bot.js");
+  const targets = new Set(Object.values(botButtons).flat().map(([, d]) => d));
+  for (const need of ["submit", "status", "menu"]) {
+    if (!targets.has(need)) { log.error(`selftest: no inline button reaches "${need}" - the user would have to type a command`); bad++; }
+  }
+  if (botText.start().includes("/")) { log.error("selftest: the /start reply advertises a command"); bad++; }
+  log.info(`selftest: bot parse, style and keyboards checked (longest ${longest} chars, no stray emoji, buttons reach submit/status/menu)`);
+  log.info(`selftest: ${banned.length + challenge.length} checkpoint wordings checked`);
+  // loggedOut has to fire on the wording m.facebook.com really serves, and must
+  // NOT fire on a re-auth form. Both real wordings, pinned.
+  const loginCases = [
+    ["Facebook Get Facebook for iOS and browse faster. English (UK) Mobile number or email address Password Log in Forgotten password? Create new account", "m.facebook.com (2fa43 row 33)"],
+    ["Log into Facebook", "desktop"],
+    ["Email or phone number", "older wording"],
+  ];
+  for (const [text, what] of loginCases) {
+    if (!LOGIN_SCREEN_RE.test(text)) { log.error(`selftest: dead-cookie screen not detected - ${what}`); bad++; }
+  }
+  for (const [text, what] of [
+    ["Password Log in Forgotten password?", "re-auth password form"],
+    ["Save your login info?", "save-login prompt"],
+  ]) {
+    if (LOGIN_SCREEN_RE.test(text)) { log.error(`selftest: dead-cookie screen false-positives on ${what}`); bad++; }
+  }
+  log.info(`selftest: ${loginCases.length} dead-cookie wordings detected, re-auth still not misfiled`);
+  // The human check and the auto warning are handled in OPPOSITE ways - one is
+  // clicked, one is not - so a cross-match is a real bug, not a cosmetic one.
+  // Both real wordings, pinned.
+  const HUMAN_TEXT = "confirm that you're human to use your account Continue";
+  const AUTO_TEXT = "We suspect automated activity. To prevent your account from being hacked.";
+  if (!HUMAN_CHECK.test(HUMAN_TEXT)) { log.error("selftest: the human-check wording is not detected"); bad++; }
+  if (!AUTO_WARNING.test(AUTO_TEXT)) { log.error("selftest: the auto-warning wording is not detected"); bad++; }
+  if (AUTO_WARNING.test(HUMAN_TEXT)) { log.error("selftest: auto-warning regex matches the human-check screen - it would Dismiss a CAPTCHA"); bad++; }
+  if (HUMAN_CHECK.test(AUTO_TEXT)) { log.error("selftest: human-check regex matches the auto-warning screen"); bad++; }
+  if (BANNED_WORDS.test(AUTO_TEXT)) { log.error("selftest: the auto warning is being classified as a ban"); bad++; }
+  log.info("selftest: human check and auto warning detected separately, neither crosses over");
   // The four provider messages, all captured from real history. These used to
   // be unexplained failures, so each one is pinned here.
   const rateLimitCases = [
@@ -956,26 +1124,45 @@ async function selftest() {
   const dir = path.join(os.tmpdir(), "opencode", `verdict-selftest-${Date.now()}`);
   fs.mkdirSync(dir, { recursive: true });
   const pf = path.join(dir, "pending.json"), vf = path.join(dir, "verdicts.jsonl");
-  noteSubmission({ fp: "aaa", source: "a.xlsx", row: 1 }, pf);
-  noteSubmission({ fp: "bbb", source: "b.xlsx", row: 2 }, pf);
-  noteSubmission({ fp: "ccc", source: "c.xlsx", row: 3 }, pf);
-  const v1 = recordVerdict({ verdict: "approved", amount: "0.05" }, pf, vf);
-  const v2 = recordVerdict({ verdict: "rejected", accountBlocked: true, reason: "x" }, pf, vf);
-  const v3 = recordVerdict({ verdict: "approved", amount: "0.05" }, pf, vf);
+  noteSubmission({ fp: "aaa", source: "a.xlsx", row: 1, phone: "111" }, pf);
+  noteSubmission({ fp: "bbb", source: "b.xlsx", row: 2, phone: "111" }, pf);
+  noteSubmission({ fp: "ccc", source: "c.xlsx", row: 3, phone: "111" }, pf);
+  const v1 = recordVerdict({ verdict: "approved", amount: "0.05" }, "111", pf, vf);
+  const v2 = recordVerdict({ verdict: "rejected", accountBlocked: true, reason: "x" }, "111", pf, vf);
+  const v3 = recordVerdict({ verdict: "approved", amount: "0.05" }, "111", pf, vf);
   for (const [got, want, what] of [[v1.claim?.fp, "aaa", "1st verdict"], [v2.claim?.fp, "bbb", "2nd verdict"], [v3.claim?.fp, "ccc", "3rd verdict"]]) {
     if (got !== want) { log.error(`selftest: ${what} matched fp ${got}, wanted ${want}`); bad++; }
   }
   if (loadPending(pf).length !== 0) { log.error("selftest: pending queue not empty after all verdicts"); bad++; }
-  const v4 = recordVerdict({ verdict: "approved", amount: "0.05" }, pf, vf);
+  const v4 = recordVerdict({ verdict: "approved", amount: "0.05" }, "111", pf, vf);
   if (v4.matched !== false) { log.error("selftest: a verdict with nothing pending should be unmatched"); bad++; }
-  log.info("selftest: verdict FIFO pairing checked against a temp ledger");
+
+  // The bug that made 2fa43 read as 38 approved when the balance proved 37.
+  // TWO sessions, one shared queue. A verdict on session B must claim session
+  // B's submission even when session A's is older and sitting at the front -
+  // and a session with nothing waiting must come back UNMATCHED rather than
+  // consuming the other session's row.
+  const pf2 = path.join(dir, "pending2.json"), vf2 = path.join(dir, "verdicts2.jsonl");
+  noteSubmission({ fp: "AAA", source: "2fa43.xlsx", row: 6, phone: "111" }, pf2);
+  noteSubmission({ fp: "BBB", source: "2fa100.xlsx", row: 99, phone: "222" }, pf2);
+  const b1 = recordVerdict({ verdict: "approved", amount: "0.05" }, "222", pf2, vf2);
+  if (b1.claim?.fp !== "BBB") { log.error(`selftest: session 222's verdict claimed fp ${b1.claim?.fp}, wanted BBB (its own row)`); bad++; }
+  const b2 = recordVerdict({ verdict: "approved", amount: "0.05" }, "111", pf2, vf2);
+  if (b2.claim?.fp !== "AAA") { log.error(`selftest: session 111's verdict claimed fp ${b2.claim?.fp}, wanted AAA (its own row)`); bad++; }
+  // 222 has nothing left. It must NOT eat 111's next row.
+  noteSubmission({ fp: "CCC", source: "2fa49.xlsx", row: 1, phone: "111" }, pf2);
+  const b3 = recordVerdict({ verdict: "approved", amount: "0.05" }, "222", pf2, vf2);
+  if (b3.matched !== false) { log.error(`selftest: session 222 with nothing pending claimed ${b3.claim?.fp} - it stole another session's row`); bad++; }
+  const left = loadPending(pf2);
+  if (left.length !== 1 || left[0].fp !== "CCC") { log.error("selftest: the other session's pending row did not survive an empty verdict"); bad++; }
+  log.info("selftest: verdict FIFO pairing checked, and two sessions no longer share a queue");
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* temp only */ }
   log.info(`selftest: ${bad === 0 ? "all provider-message cases passed" : bad + " provider-message case(s) wrong"}`);
   if (!bad) log.success("selftest passed");
   return bad;
 }
 
-async function awaitCheckpoint(page, minutes = 10) {
+async function awaitCheckpoint(page, minutes = 10, targetUrl = null) {
   const kind = await classifyCheckpoint(page);
   if (kind === "banned") {
     // Terminal. Recorded in skipped.jsonl so it is never retried - a banned
@@ -989,27 +1176,65 @@ async function awaitCheckpoint(page, minutes = 10) {
     log.error("BANNED: Facebook says this account is disabled. Recorded in skipped.jsonl - it will not be retried.");
     return await bail(page, "account is banned");
   }
-  // The human check found by --hold: one button, Continue, and no Dismiss.
-  // It is a challenge, not a ban - the account works - so the row carries on
-  // after the click. Logged loudly because an earlier version of this file
-  // described the same screen as "click Dismiss", and that is not what it is.
-  if (await findHumanCheck(page)) {
-    log.warn("Facebook is asking to confirm we are human (one Continue button). Clicking it.");
-    const btn = mButton(page, /^Continue$/);
-    await btn.click({ timeout: 5000 }).catch((e) => log.warn(`Continue would not click: ${e?.message ?? e}`));
-    await waitForGone(mButton(page, /^Continue$/), 4_000, "the human check");
-    // Verified on 2fa100 row 9: that click lands on a CAPTCHA. Stop here
-    // rather than filling a form the CAPTCHA is sitting on top of.
-    for (let i = 0; i < 8; i++) {
-      if (await captchaVisible(page)) {
-        log.error("CAPTCHA: Facebook is asking for the text from an image. This is not solved here - a person has to do it.");
-        log.error("Run: bun index.js --codegen --xlsx <sheet> --row <n>   and type it in by hand.");
-        throw new BailLogged("captcha: needs a human");
-      }
-      await sleep(POLL_MS);
+  // "We suspect automated..." / "To prevent your account from being hacked",
+  // with a Dismiss button. This one IS dismissed and the row carries on.
+  //
+  // Checked BEFORE the human check on purpose. The two screens are different
+  // and the difference is the whole point: this one closes on Dismiss, the
+  // human check leads to a CAPTCHA and is not clicked. Neither regex matches
+  // the other's wording (pinned in --selftest), so the order is a belt-and-
+  // braces rather than the thing that makes it correct.
+  if (await findAutoWarning(page)) {
+    log.warn("Facebook served the 'we suspect automated' warning. Clicking Dismiss.");
+    const btn = anyButton(page, /^Dismiss$/);
+    await btn.click({ timeout: 5000 }).catch((e) => log.warn(`Dismiss would not click: ${e?.message ?? e}`));
+    // anyButton here too, not mButton: detect, click and confirm must all be
+    // looking at the same element, or the run dismisses one button and waits on
+    // a different one that was never there.
+    await waitForGone(anyButton(page, /^Dismiss$/), 4_000, "the automated-behaviour warning");
+    audit({ leg: "internal", what: "checkpoint", status: "auto-warning-dismissed" });
+    // After the click, Facebook does NOT go anywhere useful, and where it lands
+    // is NOT fixed. Two measured outcomes on the same day, two accounts:
+    //   m.facebook.com/gettingstarted/notifications/  "Turn on notifications"
+    //     buttons: Skip | Turn on notifications
+    //   m.facebook.com/?wtsid=...&_rdr                the plain home page
+    // Neither matches a screen in this file, so the walk would sit there for
+    // 30s and report "no known screen". The session is valid by this point, so
+    // go straight back to where we were going rather than learning an
+    // onboarding screen that only ever gets in the way.
+    if (targetUrl) {
+      log.info("Dismissed - returning to the password page");
+      await page.goto(targetUrl, { waitUntil: "load" })
+        .catch((e) => log.warn(`could not return to the target page: ${e?.message ?? e}`));
     }
-    log.warn("Continued past the human check.");
+    // Dismissed is not cleared. The walk loop re-detects whatever is on screen
+    // now, so claiming the form is up here would be a guess.
     return;
+  }
+  // The human check: one button, Continue, no Dismiss.
+  //
+  // Continue is NOT clicked. Measured on 2fa100 row 9: it lands on a CAPTCHA
+  // ("Enter the text from the image"), and a CAPTCHA is deliberately not solved
+  // here - no image reading, no audio transcription, no code lookup. Clicking
+  // would spend the account's clean screen to arrive at a dead end, and it
+  // would leave `reachedForm` set while a CAPTCHA sat on top of the form.
+  //
+  // BailLogged, NOT BailGated: this is a stop, not a verdict. The account is
+  // alive and a person clears it, so the row is retried and never skipped.
+  if (await findHumanCheck(page)) {
+    log.error("HUMAN CHECK: Facebook is asking to confirm we are human.");
+    log.error("Continue is deliberately NOT clicked - it leads to a CAPTCHA, and a CAPTCHA is not solved here.");
+    log.error("A person has to do it: bun index.js --codegen --xlsx <sheet> --row <n>");
+    audit({ leg: "internal", what: "checkpoint", status: "human-check-encountered" });
+    throw new BailLogged("human check: needs a person, Continue is not clicked");
+  }
+  // A CAPTCHA can also arrive without a human check in front of it. Same stop,
+  // same reason - it is detected and handed to a person, never filled in.
+  if (await captchaVisible(page)) {
+    log.error("CAPTCHA: Facebook is asking for the text from an image. This is not solved here - a person has to do it.");
+    log.error("Run: bun index.js --codegen --xlsx <sheet> --row <n>   and type it in by hand.");
+    audit({ leg: "internal", what: "checkpoint", status: "captcha" });
+    throw new BailLogged("captcha: needs a human");
   }
   log.warn("Facebook wants identity confirmation (a challenge, not a ban). Finish it in the browser window.");
   // With --hold, show it now instead of waiting ten minutes in silence: this
@@ -1110,11 +1335,14 @@ export async function changePassword({ context, currentPw, newPw, targetUrl, dry
     // Checked before the screen walk, the way the old FAF bot did. The URL
     // says "checkpoint" immediately, so a banned account costs no 30s screen
     // wait, and it is classified (ban vs challenge) before anything waits.
-    if (isCheckpointUrl(page)) { await awaitCheckpoint(page); reachedForm = true; break; }
+    // awaitCheckpoint returns the password form when one is actually up, and
+    // undefined when it only dismissed a warning. Breaking on undefined would
+    // claim the form was reached and start typing into whatever is on screen.
+    if (isCheckpointUrl(page)) { if (await awaitCheckpoint(page, 10, targetUrl)) { reachedForm = true; break; } continue; }
     // loggedOut is last on purpose. The re-auth form also says "Log in", so
     // anything broader would file a recoverable session as a dead cookie.
     const here = await waitForScreen(page,
-      [S.passwordForm, S.checkpoint, S.reauth, S.saveLogin, S.continueGate, S.accountChooser, S.hubChangePassword, S.accountHub, S.loggedOut],
+      [S.passwordForm, S.checkpoint, S.loggedOut, S.reauth, S.saveLogin, S.continueGate, S.accountChooser, S.hubChangePassword, S.accountHub],
       "the password form", 30_000);
     if (here === S.passwordForm) {
       if (!(await blockingDialog(page))) { reachedForm = true; break; }
@@ -1139,9 +1367,8 @@ export async function changePassword({ context, currentPw, newPw, targetUrl, dry
     }
     if (here === S.checkpoint) {
       log.warn("A real identity-confirmation dialog is open.");
-      await awaitCheckpoint(page);
-      reachedForm = true;
-      break;
+      if (await awaitCheckpoint(page, 10, targetUrl)) { reachedForm = true; break; }
+      continue;
     }
     if (here === S.accountChooser) {
       if (picked) {
@@ -1307,6 +1534,12 @@ export class Taskly {
     // Logger.setLevel is deprecated in 2.26 and does nothing.
     client.setLogLevel(process.env.TOOL_DEBUG ? "debug" : "error");
     const t = new Taskly(client);
+    // Carried on the instance so the verdict watcher can restrict pairing to
+    // submissions that went out on THIS session. See recordVerdict.
+    t.phone = digits;
+    // Where a verdict is written. "jsonl" pairs it with a sheet row; "db"
+    // pairs it with the user who submitted it. One watcher, one sink.
+    t.verdictSink = opts.verdictSink ?? "jsonl";
     await client.connect();
     if (!(await client.checkAuthorization())) {
       tlog.info(`Logging in as ${digits} (one time)`);
@@ -1356,14 +1589,32 @@ export class Taskly {
   // Verdicts arrive unprompted and sometimes mid-action, so this handler lives
   // for the whole session rather than being attached per exchange.
   installVerdictWatcher() {
-    this.client.addEventHandler((update) => {
+    this.client.addEventHandler(async (update) => {
       const { text, msg } = textFrom(update);
       if (!msg || !text || msg.out) return;
       if (!this.isFromPeer(msg.peerId)) return;
       const v = parseVerdict(text);
       if (!v) return;
-      const rec = recordVerdict(v);
-      const who = rec.claim ? `${path.basename(rec.claim.source ?? "")}:${rec.claim.row} (fp ${rec.claim.fp})` : "UNMATCHED - nothing was waiting";
+      // Two sinks, one watcher. "db" is the user-facing path: the verdict is
+      // bound to the user who sent the account. "jsonl" is the sheet path.
+      // Never both, or one verdict would be written twice and counted twice.
+      if (this.verdictSink === "db") {
+        const { bindVerdict, STATUS } = await import("./db.js");
+        const status = v.verdict === "approved" ? STATUS.APPROVED : STATUS.REJECTED;
+        const row = await bindVerdict(this.phone, status, String(v.reason ?? "").slice(0, 200));
+        if (row) {
+          log.success(`Verdict ${v.verdict} -> submission ${row.id} (fp ${row.fp})`);
+          audit({ leg: "internal", what: "verdict-db", status: v.verdict, fp: row.fp });
+        } else {
+          // Never claim another session's row. Say so loudly instead.
+          log.error(`Verdict ${v.verdict} on session ...${String(this.phone ?? "").slice(-4)} with nothing in flight - unpaired, nobody was charged for it.`);
+        }
+        return;
+      }
+      const rec = recordVerdict(v, this.phone);
+      const who = rec.claim
+        ? `${path.basename(rec.claim.source ?? "")}:${rec.claim.row} (fp ${rec.claim.fp})`
+        : `UNMATCHED - session ...${String(this.phone ?? "").slice(-4)} had nothing waiting`;
       if (v.verdict === "approved") log.success(`Verdict: APPROVED +$${v.amount} -> ${who}`);
       else log.error(`Verdict: REJECTED${v.accountBlocked ? " (says account blocked)" : ""} -> ${who}`);
       if (rec.claim) audit({ leg: "internal", what: "verdict", status: v.verdict, fp: rec.claim.fp, accountBlocked: !!v.accountBlocked });
@@ -1489,7 +1740,7 @@ export function parseCreds(replies) {
   return { firstName: field("first name"), lastName: field("last name"), password: field("password") };
 }
 async function changeFacebook(currentPw, newPw, url, cookieString, dryRun = false) {
-  const browser = await chromium.launch({ headless: false, channel: "chrome", args: LAUNCH_ARGS });
+  const browser = await launchBrowser();
   const context = await browser.newContext({ ...DEVICES_PHONE, locale: "en-US" });
   try {
     await context.addInitScript(STEALTH_INIT);
@@ -1526,26 +1777,29 @@ async function resumeSession(page, currentPw) {
   // and waitForScreen already polls. That was the point - act when it is up.
 }
 
-// DELIBERATELY UNHANDLED: the "we detected automated behaviour" interstitial.
+// TWO automated-behaviour screens, handled in opposite ways. Confusing them is
+// the bug this whole comment exists to prevent.
 //
-// It was reported as happening "sometimes" and only ever described as "click
-// Dismiss". --hold found the real screen (2fa100 row 9) and it does NOT match
-// that description:
+//   1. "confirm that you're human to use your account"  buttons: Continue
+//      2fa100 row 9, via --hold. Continue is NOT clicked. Measured: it lands on
+//      a CAPTCHA, and a CAPTCHA is not solved here. Stops and hands the row to
+//      a person.
 //
-//   https://m.facebook.com/checkpoint/1501092823525282/
-//   "Ge. Alissa Bayuk, confirm that you're human to use your account"
-//   buttons: Continue
+//   2. "We suspect automated" / "To prevent your account from being hacked"
+//      buttons: Dismiss
+//      2fa43 row 38. This one IS dismissed and the walk carries on.
 //
-// One button, Continue, and no Dismiss at all. So the handler is named for what
-// the screen actually is rather than what it was called: a human check with a
-// single Continue. That fits the existing checkpoint path instead of adding a
-// parallel one - the page already arrives at /checkpoint/.
+// An earlier version of this file handled only (1) and described it as "click
+// Dismiss" - which is what (2) actually is. A handler written from that
+// description would have found no Dismiss on row 9 and clicked nothing. So both
+// wordings are pinned in --selftest, including the assertion that neither regex
+// matches the other's screen.
 //
-// It is still a challenge, NOT a ban: the account is alive and usable, and
-// clicking Continue is what the row needs. Verified on row 9, which then went
-// on to the form. If Facebook ever relabels that button, this goes quiet and
-// the row is retried - which is the safe direction, since a wrong guess here
-// could mark a working account as gated.
+// Note (2) was first seen on a row whose password had been typed wrong by hand,
+// and the checkpoint was reached by a manual page.goto the tool never performs.
+// So the click is unproven on a natural run. It is audited
+// (checkpoint/auto-warning-dismissed) so repeated dismissals on one account are
+// visible if Facebook starts escalating.
 //
 //   bun index.js --check-pw --hold --xlsx data\sheet.xlsx --row <n> -o <pw>
 //
@@ -1553,17 +1807,169 @@ async function resumeSession(page, currentPw) {
 // text, buttons, links, inputs and dialogs, waits for the page to actually
 // render before reporting it empty, and leaves the browser open to poke at.
 
+// "Failed to load" is what m.facebook.com serves when the login POST comes back
+// without a usable page. Measured on 2fa43 row 38, in this order:
+//
+//   Continue -> password -> Log in -> "Failed to load" -> reload
+//     -> /checkpoint/ -> "We suspect automated" -> Dismiss
+//
+// Nothing in screens() matches it, so the walk used to sit there until the 30s
+// screen wait expired and report "no known screen". Matched on the exact
+// phrase only - "try again" also appears among the password form's own error
+// hints and would fire on a perfectly healthy row.
+//
+// It has to be a SCREEN, not a one-off check at the top of the walk loop. The
+// first version of --check-gate tested it once per iteration and then blocked in
+// waitForScreen for 20s - and "Failed to load" arrived during that block, so it
+// was reported as "unrecognised screen" with its own text printed right below
+// the message saying it was unrecognised. A screen that appears DURING a wait
+// has to be in the list that wait polls.
+const FAILED_TO_LOAD = /failed to load/i;
+// One reload is measured as enough. Capped because a page that keeps saying
+// "Failed to load" after a reload is a different problem, and looping on it
+// would just burn the step budget.
+const MAX_RELOADS = 2;
+
+// Exit codes, so a caller can branch without parsing the log.
+//   0 reached the password form, no gate     3 auto-warning, Dismiss present
+//   1 unrecognised screen                    4 auto-warning, Dismiss ABSENT
+//   2 ran out of steps                       5 human check, Continue present
+//   7 SMS gate / CAPTCHA                     6 human check, Continue absent
+//   8 fully dead, logged out                 9 "Failed to load"
+// Every non-zero here is a REPORT, not a failure. Nothing was changed.
+const GATE = { FORM: 0, UNKNOWN: 1, STEPS: 2, DISMISS: 3, NO_DISMISS: 4, CONTINUE: 5, NO_CONTINUE: 6, GATED: 7, DEAD: 8, FAILED: 9, DISMISSED: 10 };
+
+// Reports one gate and exits. dumpScreen prints the url, text, buttons, links,
+// inputs and dialogs, so the answer is readable from the log alone.
+async function reportGate(page, name, code, verdict) {
+  log.error(`── GATE: ${name} ──`);
+  log.error(`  verdict:  ${verdict}`);
+  log.error(`  exit code: ${code}`);
+  await dumpScreen(page, name);
+  return code;
+}
+
+// --check-gate: walk one row as far as the screens allow and REPORT the gate it
+// lands on. By default it clicks nothing that can change an account: no Dismiss,
+// no human-check Continue, no Change password.
+//
+// --dismiss makes the ONE exception: it clicks Dismiss on the automated-behaviour
+// warning, then reports what is on screen afterwards. --hold keeps the browser
+// open at that point so the next screen can be watched and recorded. That pair
+// is how a screen we have never seen gets learned: --hold dumps its url, text,
+// buttons, links, inputs and dialogs and leaves the browser for the hand.
+//
+// It does type the password when the session has expired, because the
+// automated-behaviour screen is DOWNSTREAM of the re-auth - there is no way to
+// reach it otherwise. The clicks needed to get there (Continue on the session
+// gate, Log in) are navigation rather than gate handling, and each is logged.
+async function runCheckGate(args) {
+  const { context, page, url, browser } = await openRowBrowser(args);
+  const currentPw = argValue(args, ["--current-password", "-o"]) ?? process.env.FB_CURRENT_PASSWORD;
+  const S = { ...screens(page), failedToLoad: { name: "Failed to load (reload)", loc: page.getByText(FAILED_TO_LOAD).first() } };
+  // The m.facebook.com login wording. screens().loggedOut still carries the
+  // older /Email or phone number/ pattern, which the real page does not use, so
+  // the reporter matches the wording it was measured on rather than relying on
+  // a detector that does not fire.
+  const loginScreen = /log into facebook|email or phone number|mobile number or email/i;
+  let reloads = 0;
+  try {
+    for (let step = 1; step <= 10; step++) {
+      if (await codePromptVisible(page)) return await reportGate(page, "SMS gate", GATE.GATED, "Facebook wants a code by SMS - not solved here");
+      if (isCheckpointUrl(page)) {
+        const text = await pageText(page);
+        // findAutoWarning / findHumanCheck POLL for the button; do not replace
+        // these with a one-shot isVisible. Measured on 2fa43 row 38: a single
+        // 400ms check reported "Dismiss is ABSENT" while dumpScreen, a moment
+        // later, listed the Dismiss button on the very same page. The checkpoint
+        // renders late (see the comment above findHumanCheck), so the button has
+        // to be waited for, not sampled.
+        if (AUTO_WARNING.test(text)) {
+          const btn = await findAutoWarning(page);
+          if (!btn) return await reportGate(page, "automated-behaviour warning", GATE.NO_DISMISS, "Dismiss never appeared - nothing to click");
+          if (!args.includes("--dismiss")) {
+            return await reportGate(page, "automated-behaviour warning", GATE.DISMISS,
+              "DISMISS IS PRESENT - not clicked. Add --dismiss to click it, --hold to keep the browser open afterwards.");
+          }
+          // The one gate this tool clicks. Opt-in via --dismiss, and audited,
+          // so repeated dismissals on one account are visible if Facebook ever
+          // starts escalating.
+          log.warn("--dismiss: clicking Dismiss on the automated-behaviour warning");
+          audit({ leg: "internal", what: "checkpoint", status: "auto-warning-dismissed" });
+          await btn.click({ timeout: 8000 }).catch((e) => log.warn(`Dismiss would not click: ${e?.message ?? e}`));
+          await waitForGone(anyButton(page, /^Dismiss$/), 5_000, "the automated-behaviour warning");
+          // Dismissed does not go anywhere useful, and the landing page is not
+          // fixed - measured twice on the same day: gettingstarted/
+          // notifications/ ("Turn on notifications") and plain m.facebook.com.
+          // Neither matches a screen here, so the walk would report "no known
+          // screen" and sit for 30s. Go back to the password page instead.
+          log.success("Dismissed. Facebook dropped us on an onboarding page; going to the password page instead.");
+          log.info(`  it landed on: ${page.url().slice(0, 110)}`);
+          await page.goto(url, { waitUntil: "load" })
+            .catch((e) => log.warn(`could not reach the target page: ${e?.message ?? e}`));
+          if (HOLD) {
+            log.success(`Now on the password page: ${page.url().slice(0, 110)}`);
+            log.warn("Holding this browser open. Ctrl+C in this terminal to end.");
+            await holdForInspection(page, "after Dismiss, back on the target page - held open by --hold");
+          }
+          continue;
+        }
+        if (HUMAN_CHECK.test(text)) {
+          const btn = await findHumanCheck(page);
+          return await reportGate(page, "human check", btn ? GATE.CONTINUE : GATE.NO_CONTINUE,
+            btn ? "CONTINUE IS PRESENT - not clicked (dry run)" : "Continue never appeared");
+        }
+        if (await captchaVisible(page)) return await reportGate(page, "CAPTCHA", GATE.GATED, "not solved, by design");
+        return await reportGate(page, "checkpoint, wording unrecognised", GATE.UNKNOWN, "neither wording matched");
+      }
+      if (await captchaVisible(page)) return await reportGate(page, "CAPTCHA", GATE.GATED, "not solved, by design");
+      const body = await pageText(page);
+      if (loginScreen.test(body)) return await reportGate(page, "LOGGED OUT (fully dead cookie)", GATE.DEAD, "wants an email/phone this sheet does not have");
+      // failedToLoad leads the list: it is the one screen that turns up WHILE a
+      // wait is already running, and it is unambiguous - no other screen is on
+      // the page at the same time.
+      const here = await waitForScreen(page,
+        [S.failedToLoad, S.passwordForm, S.checkpoint, S.reauth, S.saveLogin, S.continueGate, S.accountChooser, S.hubChangePassword, S.accountHub],
+        "a gate or the form", 20_000);
+      if (!here) return await reportGate(page, "unrecognised screen", GATE.UNKNOWN, `nothing matched in 20s. Last text: ${body.slice(0, 120)}`);
+      log.success(`[${elapsed()}] step ${step}: ${here.name}`);
+      if (here === S.passwordForm) {
+        if (await blockingDialog(page)) { log.warn("a dialog covers the form - waiting"); await sleep(POLL_MS); continue; }
+        return await reportGate(page, "password change form", GATE.FORM, "NO GATE - this cookie walks straight through");
+      }
+      // The recovery, measured: a RELOAD is what takes "Failed to load" on to
+      // the /checkpoint/ screen. Not a click - that page has no buttons on it.
+      if (here === S.failedToLoad) {
+        if (reloads >= MAX_RELOADS) return await reportGate(page, "Failed to load", GATE.FAILED, `still failing after ${reloads} reload(s) - reloading is not fixing it`);
+        reloads++;
+        log.warn(`"Failed to load" - reloading (${reloads}/${MAX_RELOADS}). This is what reaches the checkpoint.`);
+        await page.reload({ waitUntil: "load" }).catch((e) => log.warn(`reload failed: ${e?.message ?? e}`));
+        continue;
+      }
+      // Navigation only. Every click that RESOLVES a gate is deliberately absent.
+      if (here === S.continueGate) { log.info("navigating: session-expired Continue"); await clickScreenAway(mButton(page, /^Continue$/), S.continueGate, "Continue"); continue; }
+      if (here === S.reauth) { log.info("navigating: re-auth - types the password, because the gate is downstream of it"); await resumeSession(page, currentPw); continue; }
+      if (here === S.saveLogin) { log.info("navigating: Save login"); await clickScreenAway(mButton(page, /^Save$/), S.saveLogin, "Save"); continue; }
+      if (here === S.accountChooser) { await pickAccount(page); continue; }
+      await here.loc.first().click();
+    }
+    return await reportGate(page, "ran out of steps", GATE.STEPS, "10 steps, no gate reached");
+  } finally {
+    await closeAll(browser, context);
+  }
+}
+
 // ---- Codegen (manual browser with one row's cookie, no Telegram) ----
 // cookieOverride lets a caller open the browser with a cookie that is not the
 // one in the sheet - used by --refresh-cookie to retest a freshly issued
 // session in a clean browser.
 async function openRowBrowser(args, cookieOverride) {
   const sheets = argValues(args, "--xlsx");
-  if (!sheets.length) throw new Bail("usage: bun index.js --codegen [--detect|--check-pw|--refresh-cookie] --xlsx <sheet> [--row N]");
+  if (!sheets.length) throw new Bail("usage: bun index.js --codegen [--detect|--check-gate|--check-pw|--refresh-cookie] --xlsx <sheet> [--row N]");
   const pick = resolveRow(sheets[0], Number(argValue(args, ["--row"]) ?? "1"));
   const url = resolveUrl();
   const cookie = (cookieOverride ?? pick.cookie).trim();
-  const browser = await chromium.launch({ headless: false, channel: "chrome", args: LAUNCH_ARGS });
+  const browser = await launchBrowser();
   const context = await browser.newContext({ ...DEVICES_PHONE, locale: "en-US" });
   try {
     await context.addInitScript(STEALTH_INIT);
@@ -1609,7 +2015,7 @@ async function runDetect(args) {
     for (let step = 1; step <= 10; step++) {
       if (await codePromptVisible(page)) await bailCodePrompt((await codePromptText(page)) ?? "confirmation code");
       const here = await waitForScreen(page,
-        [S.passwordForm, S.checkpoint, S.reauth, S.saveLogin, S.continueGate, S.accountChooser, S.hubChangePassword, S.accountHub, S.loggedOut],
+        [S.passwordForm, S.checkpoint, S.loggedOut, S.reauth, S.saveLogin, S.continueGate, S.accountChooser, S.hubChangePassword, S.accountHub],
         "the password form", 30_000);
       if (!here) {
         const text = await page.locator("body").innerText({ timeout: 5000 })
@@ -1755,7 +2161,7 @@ async function runRefreshCookie(args) {
     for (let step = 1; step <= 10 && !form; step++) {
       if (await codePromptVisible(probe.page)) { hops.push("SMS gate"); break; }
       const here = await waitForScreen(probe.page,
-        [S.passwordForm, S.checkpoint, S.reauth, S.saveLogin, S.continueGate, S.accountChooser, S.hubChangePassword, S.accountHub, S.loggedOut],
+        [S.passwordForm, S.checkpoint, S.loggedOut, S.reauth, S.saveLogin, S.continueGate, S.accountChooser, S.hubChangePassword, S.accountHub],
         "the password form", 15_000);
       if (!here) break;
       if (here === S.passwordForm) { form = true; break; }
@@ -1797,6 +2203,99 @@ async function runRefreshCookie(args) {
   } finally {
     await closeAll(probe.browser, probe.context);
   }
+}
+
+// ---- Drain: user submissions -> taskly ----
+// bot.js only writes rows. This is the other half: it waits for the job to be
+// listed, then sends queued accounts and binds each verdict back to the user who
+// sent it. Separate process on purpose - a taskly outage must not stop users
+// submitting, and a bot restart must not lose a half-finished submission.
+//
+// The pairing is the whole point. A taskly verdict carries no identifier, so it
+// is bound to the oldest INFLIGHT row for the session it arrived on, and to
+// nothing else. bindVerdict returns null when that session has nothing waiting,
+// which is the honest answer - the alternative is filing a verdict against
+// somebody else's account, which is the bug that made 2fa43 read as 38
+// approved when the balance proved 37.
+async function runDrain(args) {
+  const { migrate, totals, claimNextQueued, markSent, bindVerdict, releaseToQueued, markStatus, closeDb, STATUS } = await import("./db.js");
+  await migrate();
+  const limit = Number(argValue(args, ["--limit"]) ?? 0) || 0;   // 0 = until the queue is empty
+  const phone = argValue(args, ["--phone", "-p"]) ?? process.env.TG_PHONE;
+  const currentPw = argValue(args, ["--current-password", "-o"]) ?? SHARED_PASSWORD;
+  const url = resolveUrl();
+  const listOnly = args.includes("--list-queued");
+
+  const before = await totals();
+  log.info(`queue: ${before.queued} queued, ${before.inflight} in review, ${before.all} total`);
+  if (listOnly) { log.info("--list-queued: nothing was sent"); return 0; }
+
+  // Nothing is spent until the job is actually listed. Same rule as a real run.
+  // The session opened here is also the one that will receive the verdicts, so
+  // it is opened with the DB sink and kept for --watch.
+  const watch = args.includes("--watch");
+  let tg = null;
+  if (!args.includes("--skip-task-check") || watch) {
+    tg = await Taskly.open({ phone, verdictSink: "db" });
+    try {
+      const a = await taskAvailability(tg);
+      if (a.on === false) {
+        log.error(`"${JOB}" is not listed under ${GROUP}. ${before.queued} submission(s) stay queued.`);
+        log.info("Re-check any time with: bun index.js --check-task");
+        if (!watch) { await tg.close(); await closeDb(); return 1; }
+        log.warn("--watch: staying up anyway. Verdicts from earlier sends will still be recorded.");
+      } else if (a.on === null) log.warn(`Could not confirm the job is listed (${a.why}) - carrying on anyway`);
+      else log.success(`Job is listed: ${a.listed.join(" | ")}`);
+    } catch (e) {
+      await tg.close().catch(() => {}); tg = null;
+      if (!watch) throw e;
+      log.warn(`Could not reach taskly: ${e.message}`);
+    }
+  }
+
+  let sent = 0, released = 0, stopped = null;
+  for (let i = 1; !limit || i <= limit; i++) {
+    const job = await claimNextQueued();       // one statement, so two drains cannot collide
+    if (!job) break;
+    const tag = `row ${job.id} (fp ${job.fp}, uid ${maskUid(uidOf(job.cookie))})`;
+    try {
+      log.info(`── draining ${tag}`);
+      const changed = await changeFacebook(currentPw, "", url, job.cookie, true);
+      if (!changed.ok) throw new Bail(`facebook did not accept the form: ${changed.verdict}`);
+      // It is with taskly now, so it counts as sent whatever happens next.
+      await markSent(job.id, String(phone ?? ""), null);
+      sent++;
+      log.success(`Sent to taskly. Awaiting a verdict.`);
+    } catch (e) {
+      // Only release it if taskly never saw it. Once the credentials were
+      // requested the account is gone, and a verdict may still be coming.
+      const gone = /creds|Start|password after|no password|Task cancelled|rate limit/i.test(String(e?.message ?? ""));
+      if (gone) {
+        await markStatus(job.id, STATUS.DEAD, String(e.message).slice(0, 200));
+        log.error(`Dead - recorded, never retried: ${e.message}`);
+      } else {
+        await releaseToQueued(job.id, String(e.message).slice(0, 200));
+        released++;
+        log.warn(`Back in the queue - taskly never saw it: ${e.message}`);
+      }
+      stopped = String(e.message);
+    }
+  }
+  const after = await totals();
+  log.info(`drained ${sent}, re-queued ${released}`);
+  log.info(`queue now: ${after.queued} queued, ${after.inflight} in review, ${after.approved} approved, ${after.rejected} rejected`);
+  if (stopped) log.info(`last problem: ${stopped}`);
+
+  if (watch && tg) {
+    // Verdicts land about 64 minutes after the send, so this process has to
+    // outlive the sending. Ctrl+C ends it.
+    log.info("--watch: listening for verdicts. They arrive about 64 minutes after each send.");
+    log.info("Ctrl+C in this terminal to stop.");
+    await new Promise(() => {});
+  }
+  await tg?.close().catch(() => {});
+  await closeDb();
+  return sent ? 0 : 1;
 }
 
 // ---- Batch / group ----
@@ -2038,7 +2537,7 @@ async function runGroup(group, args, phone) {
             markSent({ fp, source: job.file, row: pick.row, job: JOB });
             // The receipt is not the outcome. Queue the row so the verdict that
             // arrives up to 64 minutes later can be matched to it.
-            noteSubmission({ fp, source: job.file, row: pick.row });
+            noteSubmission({ fp, source: job.file, row: pick.row, phone: tg.phone });
             markPasswordUsed(resumePw);
             ok++;
           } else failed.push(tag);
@@ -2102,7 +2601,7 @@ async function runGroup(group, args, phone) {
           markSent({ fp, source: job.file, row: pick.row, job: JOB });
           // The receipt is not the outcome - queue it so the verdict that
           // arrives up to 64 minutes later can be matched to this row.
-          noteSubmission({ fp, source: job.file, row: pick.row });
+          noteSubmission({ fp, source: job.file, row: pick.row, phone: tg.phone });
           audit({ leg: "internal", what: "job", status: "received", fp });
           log.success(`Recorded in sent.jsonl (fp ${fp}) - awaiting the provider's verdict`);
           ok++;
@@ -2157,10 +2656,17 @@ Usage:
   bun index.js --check-pw --xlsx a.xlsx --row 5 -o <curPw>   # fill the form, prove the button enables, do NOT submit
   bun index.js --refresh-cookie --xlsx a.xlsx --row 5 -o <curPw>          # log in once, retest the new cookie, compare
   bun index.js --refresh-cookie --xlsx a.xlsx --row 5 -o <curPw> --write-back   # ...and save it if it is trusted
+  bun index.js --codegen --check-gate --xlsx a.xlsx --row 5 -o <curPw>   # report which gate this row hits. Clicks no gate button.
+  bun index.js --codegen --check-gate --dismiss --hold --xlsx a.xlsx --row 5   # ...click Dismiss, show what follows, leave the browser open
+  bun index.js --drain                                     # send queued user submissions, spend nothing
+  bun index.js --drain --watch                             # ...and stay up to receive the verdicts (~64m)
+  bun index.js --drain --list-queued                       # queue depth only, send nothing
+  bun bot.js                                               # the user-facing Telegram bot (separate process)
 Flags: --xlsx (repeatable/comma/space), --row, --rows f#r,.. (internal), --all,
   -p/--phone, -o/--current-password, -P/--password, --fa2, --per-session N,
   --plan, --force, --dry-run/--probe, --codegen, --detect, --check-pw,
-  --refresh-cookie, --write-back, --hold, --selftest, --check-verdicts, --check-task,
+  --check-gate, --dismiss, --refresh-cookie, --write-back, --hold, --selftest,
+  --check-verdicts, --check-task, --drain, --watch, --limit N, --list-queued,
   --no-uid-check, --skip-task-check, --login, --help
 Rule: one bot password covers max ${MAX_REUSE} cookies and retires after 1 success.`);
 }
@@ -2170,6 +2676,7 @@ async function main() {
   if (args.includes("--help") || args.includes("-h")) { printHelp(); return; }
   if (args.includes("--selftest")) { process.exit((await selftest()) ? 1 : 0); }
   if (args.includes("--check-verdicts")) { process.exit(checkVerdicts()); }
+  if (args.includes("--drain")) { process.exit(await runDrain(args)); }
   if (args.includes("--check-task")) { process.exit(await runCheckTask()); }
   if (args.includes("--login")) {
     const p = argValue(args, ["--login"]) ?? argValue(args, ["--phone", "-p"]);
@@ -2179,11 +2686,12 @@ async function main() {
     return;
   }
   const phone = argValue(args, ["--phone", "-p"]) ?? process.env.TG_PHONE;
-  if (args.includes("--codegen") || args.includes("--check-pw") || args.includes("--refresh-cookie")) {
+  if (args.includes("--codegen") || args.includes("--check-pw") || args.includes("--refresh-cookie") || args.includes("--check-gate")) {
     HOLD = args.includes("--hold");
     try {
       if (args.includes("--refresh-cookie")) process.exit(await runRefreshCookie(args));
       if (args.includes("--check-pw")) process.exit(await runCheckPw(args));
+      if (args.includes("--check-gate")) process.exit(await runCheckGate(args));
       if (args.includes("--detect")) process.exit(await runDetect(args));
       await runCodegen(args);
       return;
