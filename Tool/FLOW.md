@@ -4,6 +4,19 @@ Proven against live captures; anything else is marked UNVERIFIED.
 
 ## Bot (one Start per password, not per cookie)
 
+Four provider replies that used to look like failures, all real (see
+`What the provider says back` in README):
+
+- `You are making requests too often. Please wait N sec.` -> wait N, press
+  again. It replaces the reply we wanted, so the account is still there.
+- `Time's up! Task cancelled.` -> the provider's own timer, minutes not
+  seconds, and the length varies. The account is already lost; say so.
+- `Action cancelled.` -> OURS. Confirmation that pressing Cancel cleared a
+  modal state. Expected, never a failure.
+- `Report approved, +$0.05` / `Report rejected...` -> the real verdict, up to
+  64 min later and out of band. Recorded to `out/verdicts.jsonl` and matched to
+  its row by order. `--check-verdicts` reports it.
+
 1. `/start` raw -> welcome. Buttons must include Balance or Cancel-clear and retry (3x).
 2. Press whole `Tasks` label -> task list.
 3. Press whole `Cookies` label -> job list.
@@ -11,7 +24,7 @@ Proven against live captures; anything else is marked UNVERIFIED.
 5. Press whole `Start` label -> `Please enter your 2FA key`. Poll history 5s for `First/Last name:/Password:` (colon mandatory). No password after 3 walks = stop, nothing sent.
 6. Change Facebook FIRST (below). Only then send the row's 2FA key raw -> expect a cookie prompt.
 7. Send cookie raw -> expect a confirm-registration prompt. The cookie alone never finishes the job.
-8. Press whole `Account registered` label -> `report has been received` = success, record in `sent.jsonl`.
+8. Press whole `Account registered` label -> `report has been received` = receipt, NOT the outcome. Queue the row for its verdict.
 
 ## Reuse (saves one Start per failed cookie)
 

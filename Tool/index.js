@@ -190,6 +190,145 @@ function audit(rec) {
 }
 const preview = (t, n = 300) => String(t ?? "").replace(/\s+/g, " ").slice(0, n);
 
+// ---- What the provider says back ----
+// All four of these are real messages, captured from 1000 messages of history
+// across both sessions. Each one used to be an unexplained failure.
+
+// "You are making requests too often. Please wait 9 sec."  (seen 2, 4 and 9)
+// It REPLACES the reply we were waiting for, so the account was still there and
+// we gave up on it for nothing. It states the wait, so there is nothing to guess.
+const RATE_LIMIT = /too often\.?\s*please wait\s*(\d+)\s*sec/i;
+
+// "Time's up! Task cancelled."  (seen 4 times)
+// The PROVIDER's own timer, not ours, and how long it allows has been observed
+// anywhere from a minute to about eight. So no duration is assumed anywhere in
+// this file - only this message is matched. When it appears the account is
+// already lost; the only useful thing is to say so plainly instead of
+// reporting a confusing generic failure.
+const TASK_CANCELLED = /time'?s up!?\s*task cancelled/i;
+
+// "Action cancelled."  (seen 2 times)
+// This one is OURS and it is expected: it is the confirmation that the
+// Cancel button we press to clear a modal state did its job (ensureMainMenu
+// does exactly that). It is NOT a rejected report and NOT a provider timeout -
+// do not let the two "cancelled" messages be confused for each other.
+const ACTION_CANCELLED = /action cancelled/i;
+
+// "Report approved, +$0.05" / "Report rejected..."  (39 / 4)
+const VERDICT_APPROVED = /report\s+approved/i;
+const VERDICT_REJECTED = /report\s+rejected/i;
+
+// ---- Two facts recorded, deliberately NOT acted on ----
+//
+// 1. The job card's "Report instruction:" field arrives EMPTY ("Report
+//    instruction: ."). There is no instruction to follow. Do not go looking for
+//    one, and do not fail a run over it.
+//
+// 2. The provider's rejection text carries a standing rule we must not break:
+//      "after registration, you must NOT log out of the account, otherwise the
+//       cookies become invalid automatically. You should clear your browser
+//       history and cookies after registration, but stay logged into the
+//       account."
+//    Every run does clearCookies() and then addCookies() with the sheet's
+//    cookie, which is exactly "clear cookies but stay logged in", so the
+//    current behaviour is already correct. This note is here so nobody tidies
+//    the per-run cookie reload into a persistent login, or shares one browser
+//    session across accounts, and silently invalidates every cookie.
+
+function rateLimitSeconds(replies) {
+  for (const t of Array.isArray(replies) ? replies : [replies]) {
+    const m = String(t ?? "").match(RATE_LIMIT);
+    if (m) return Number(m[1]);
+  }
+  return 0;
+}
+// Exported so it can be run against real provider history, which is a better
+// test than the hand-written samples in --selftest.
+export function parseVerdict(text) {
+  const t = String(text ?? "");
+  if (VERDICT_APPROVED.test(t)) return { verdict: "approved", amount: t.match(/\$([\d.]+)/)?.[1] ?? null };
+  if (VERDICT_REJECTED.test(t)) {
+    return { verdict: "rejected", reason: t.replace(/\s+/g, " ").trim().slice(0, 300), accountBlocked: /account blocked/i.test(t) };
+  }
+  return null;
+}
+
+// ---- Verdict ledger (./out) ----
+// "Your report has been received! Please wait" is a RECEIPT, not a decision.
+// The decision arrives unprompted up to ~64 minutes later, and in the captured
+// history 7 of them landed in the middle of an unrelated action. So the
+// listener is permanent for the whole session, not attached per exchange.
+//
+// The hard part: a verdict carries NO identifier. No uid, no row number,
+// nothing - just "Report approved, +$0.05". The only mapping available is
+// order: the oldest unanswered submission takes the next verdict. Verdicts were
+// observed arriving in order (three approvals then one rejection), so FIFO is
+// used, and it is recorded as the assumption it is. If it is ever wrong the
+// fix is to put a marker in the sheet, not to guess harder.
+const PENDING_FILE = path.join(__dirname, "out", "pending.json");
+const VERDICTS_FILE = path.join(__dirname, "out", "verdicts.jsonl");
+// The file arguments exist so --selftest can drive this against a temp dir
+// instead of the real ledgers.
+function loadPending(file = PENDING_FILE) {
+  try {
+    const a = JSON.parse(fs.readFileSync(file, "utf8"));
+    return Array.isArray(a) ? a : [];
+  } catch { return []; }
+}
+function savePending(list, file = PENDING_FILE) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(list, null, 1), "utf8");
+}
+// Called the moment the provider acknowledges a report.
+function noteSubmission({ fp, source, row }, file = PENDING_FILE) {
+  const list = loadPending(file);
+  list.push({ at: new Date().toISOString(), fp, source, row });
+  savePending(list, file);
+  return list.length;
+}
+function recordVerdict(v, pendingFile = PENDING_FILE, verdictsFile = VERDICTS_FILE) {
+  const list = loadPending(pendingFile);
+  const claim = list.shift() ?? null; // oldest first - the FIFO assumption
+  savePending(list, pendingFile);
+  const rec = { at: new Date().toISOString(), ...v, claim, matched: !!claim };
+  fs.mkdirSync(path.dirname(verdictsFile), { recursive: true });
+  fs.appendFileSync(verdictsFile, JSON.stringify(rec) + "\n", "utf8");
+  return rec;
+}
+function listVerdicts() {
+  if (!fs.existsSync(VERDICTS_FILE)) return [];
+  return fs.readFileSync(VERDICTS_FILE, "utf8").split(/\r?\n/).filter(Boolean)
+    .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+    .filter((r) => r && r.verdict);
+}
+
+// --check-verdicts: what actually happened to everything we sent.
+function checkVerdicts() {
+  const v = listVerdicts();
+  const pending = loadPending();
+  const approved = v.filter((r) => r.verdict === "approved");
+  const rejected = v.filter((r) => r.verdict === "rejected");
+  const unmatched = v.filter((r) => !r.matched);
+  log.info(`verdicts recorded : ${v.length}`);
+  log.info(`  approved        : ${approved.length}  ${approved.reduce((s, r) => s + Number(r.amount ?? 0), 0).toFixed(4)}`);
+  log.info(`  rejected        : ${rejected.length}`);
+  log.info(`  unmatched       : ${unmatched.length}${unmatched.length ? " - more verdicts than submissions, the queue was empty" : ""}`);
+  log.info(`  awaiting verdict: ${pending.length}`);
+  for (const r of rejected) {
+    const who = r.claim ? `${path.basename(r.claim.source ?? "")}:${r.claim.row ?? "?"} (fp ${r.claim.fp})` : "UNMATCHED";
+    log.warn(`rejected: ${who}  ${r.accountBlocked ? "[says ACCOUNT BLOCKED] " : ""}${(r.reason ?? "").slice(0, 90)}`);
+  }
+  const blocked = rejected.filter((r) => r.accountBlocked && r.claim);
+  if (blocked.length) {
+    log.warn(`${blocked.length} rejected report(s) say the account was blocked.`);
+    log.info("They are NOT auto-skipped: the pairing is FIFO, and a wrong pairing would skip a good account.");
+    log.info("Fingerprints: " + blocked.map((r) => r.claim.fp).join(", "));
+  }
+  const sent = fs.existsSync(SENT_FILE) ? readJsonl(SENT_FILE).length : 0;
+  log.info(`sent.jsonl says ${sent} sent. ${sent - rejected.length} of those are not known to be rejected.`);
+  return 0;
+}
+
 // ---- xlsx ----
 function resolveFile(f) {
   if (fs.existsSync(f)) return f;
@@ -697,6 +836,62 @@ async function selftest() {
     if (got !== "challenge") { log.error(`selftest: should be a challenge, got ${got}: "${t}"`); bad++; }
   }
   log.info(`selftest: ${banned.length + challenge.length} checkpoint wordings checked, ${bad} wrong`);
+  // The four provider messages, all captured from real history. These used to
+  // be unexplained failures, so each one is pinned here.
+  const rateLimitCases = [
+    ["You are making requests too often. Please wait 9 sec.", 9],
+    ["You are making requests too often. Please wait 2 sec.", 2],
+    ["You are making requests too often. Please wait 4 sec.", 4],
+    ["Report approved, +$0.05", 0],
+    ["Time's up! Task cancelled.", 0],
+  ];
+  for (const [text, want] of rateLimitCases) {
+    const got = rateLimitSeconds([text]);
+    if (got !== want) { log.error(`selftest: rate limit "${text}" gave ${got}, wanted ${want}`); bad++; }
+  }
+  for (const [text, want] of [["Time's up! Task cancelled.", true], ["Action cancelled.", false], ["Report approved, +$0.05", false]]) {
+    const got = [text].some((t) => TASK_CANCELLED.test(t));
+    if (got !== want) { log.error(`selftest: task-cancelled "${text}" gave ${got}, wanted ${want}`); bad++; }
+  }
+  // "Action cancelled." is OUR cancel; "Time's up" is the provider's. They must
+  // never be confused for one another, which is the whole reason both exist.
+  for (const [text, want] of [["Action cancelled.", true], ["Time's up! Task cancelled.", false]]) {
+    const got = [text].some((t) => ACTION_CANCELLED.test(t));
+    if (got !== want) { log.error(`selftest: action-cancelled "${text}" gave ${got}, wanted ${want}`); bad++; }
+  }
+  const verdictCases = [
+    ["Report approved, +$0.05", "approved"],
+    ["Report rejected. Reason: your report was rejected because the account was either blocked", "rejected"],
+    ["Report rejected: account blocked", "rejected"],
+    ["Your report has been received! Please wait.", null],
+    ["Action cancelled.", null],
+  ];
+  for (const [text, want] of verdictCases) {
+    const got = parseVerdict(text)?.verdict ?? null;
+    if (got !== want) { log.error(`selftest: verdict "${text}" gave ${got}, wanted ${want}`); bad++; }
+  }
+  if (!parseVerdict("Report rejected: account blocked")?.accountBlocked) { log.error("selftest: 'account blocked' not flagged"); bad++; }
+  if (parseVerdict("Report rejected. Reason: the account was either blocked or invalid")?.accountBlocked) { log.error("selftest: false 'account blocked' on the long-form rejection"); bad++; }
+  // FIFO round trip. The whole verdict feature rests on this pairing, and it
+  // rests on an ASSUMPTION, so it is exercised rather than asserted.
+  const dir = path.join(os.tmpdir(), "opencode", `verdict-selftest-${Date.now()}`);
+  fs.mkdirSync(dir, { recursive: true });
+  const pf = path.join(dir, "pending.json"), vf = path.join(dir, "verdicts.jsonl");
+  noteSubmission({ fp: "aaa", source: "a.xlsx", row: 1 }, pf);
+  noteSubmission({ fp: "bbb", source: "b.xlsx", row: 2 }, pf);
+  noteSubmission({ fp: "ccc", source: "c.xlsx", row: 3 }, pf);
+  const v1 = recordVerdict({ verdict: "approved", amount: "0.05" }, pf, vf);
+  const v2 = recordVerdict({ verdict: "rejected", accountBlocked: true, reason: "x" }, pf, vf);
+  const v3 = recordVerdict({ verdict: "approved", amount: "0.05" }, pf, vf);
+  for (const [got, want, what] of [[v1.claim?.fp, "aaa", "1st verdict"], [v2.claim?.fp, "bbb", "2nd verdict"], [v3.claim?.fp, "ccc", "3rd verdict"]]) {
+    if (got !== want) { log.error(`selftest: ${what} matched fp ${got}, wanted ${want}`); bad++; }
+  }
+  if (loadPending(pf).length !== 0) { log.error("selftest: pending queue not empty after all verdicts"); bad++; }
+  const v4 = recordVerdict({ verdict: "approved", amount: "0.05" }, pf, vf);
+  if (v4.matched !== false) { log.error("selftest: a verdict with nothing pending should be unmatched"); bad++; }
+  log.info("selftest: verdict FIFO pairing checked against a temp ledger");
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* temp only */ }
+  log.info(`selftest: ${bad === 0 ? "all provider-message cases passed" : bad + " provider-message case(s) wrong"}`);
   if (!bad) log.success("selftest passed");
   return bad;
 }
@@ -1039,9 +1234,50 @@ export class Taskly {
     fs.writeFileSync(file, client.session.save(), "utf8");
     tlog.ok(`Session ready for ${digits}`);
     t.peer = await client.getEntity(process.env.TG_TARGET ?? env.TG_TARGET ?? "tasklyBux_bot");
+    t.installVerdictWatcher();
     return t;
   }
   async close() { await this.client.disconnect().catch(() => {}); }
+  // The provider rate-limits us and says how long to wait. Obeying it is the
+  // whole handling - the message replaces the reply we wanted, so the account
+  // is still available and only the wait is missing.
+  async obeyRateLimit(replies) {
+    const s = rateLimitSeconds(replies);
+    if (!s) return 0;
+    log.warn(`Provider rate limit: waiting ${s}s as instructed`);
+    audit({ leg: "internal", what: "rate-limit", waitSec: s });
+    await sleep(s * 1000 + 500);
+    return s;
+  }
+  // True when the provider's own timer ran out. The account is already lost by
+  // then, so the only thing to add is a clear reason.
+  isTaskCancelled(replies) {
+    return (Array.isArray(replies) ? replies : [replies]).some((t) => TASK_CANCELLED.test(String(t ?? "")));
+  }
+  // "Action cancelled." is OUR confirmation that pressing Cancel cleared a
+  // modal state. Expected, not a failure - logged so it is not mistaken for a
+  // rejected report or a provider timeout.
+  noteActionCancelled(replies) {
+    if (!(Array.isArray(replies) ? replies : [replies]).some((t) => ACTION_CANCELLED.test(String(t ?? "")))) return false;
+    tlog.ok("Action cancelled - that was our own Cancel button clearing provider state");
+    return true;
+  }
+  // Verdicts arrive unprompted and sometimes mid-action, so this handler lives
+  // for the whole session rather than being attached per exchange.
+  installVerdictWatcher() {
+    this.client.addEventHandler((update) => {
+      const { text, msg } = textFrom(update);
+      if (!msg || !text || msg.out) return;
+      if (!this.isFromPeer(msg.peerId)) return;
+      const v = parseVerdict(text);
+      if (!v) return;
+      const rec = recordVerdict(v);
+      const who = rec.claim ? `${path.basename(rec.claim.source ?? "")}:${rec.claim.row} (fp ${rec.claim.fp})` : "UNMATCHED - nothing was waiting";
+      if (v.verdict === "approved") log.success(`Verdict: APPROVED +$${v.amount} -> ${who}`);
+      else log.error(`Verdict: REJECTED${v.accountBlocked ? " (says account blocked)" : ""} -> ${who}`);
+      if (rec.claim) audit({ leg: "internal", what: "verdict", status: v.verdict, fp: rec.claim.fp, accountBlocked: !!v.accountBlocked });
+    });
+  }
   isConnected() {
     try { return this.client.connected === true; } catch { return false; }
   }
@@ -1139,13 +1375,16 @@ export class Taskly {
     return this.labels().find((l) => l.toLowerCase().includes(q)) ?? null;
   }
   hasButton(want) { return !!this.resolveLabel(want); }
+  // Returns the replies so the caller can look for a rate limit in them.
   async ensureMainMenu() {
     for (let attempt = 1; attempt <= 3; attempt++) {
-      await this.sendRaw("knock", "/start");
-      if (this.hasButton("Balance")) return;
+      const replies = await this.sendRaw("knock", "/start");
+      if (this.hasButton("Balance")) return replies;
       tlog.err(`attempt ${attempt}: not on the main menu, clearing provider state`);
       if (!this.hasButton("Cancel")) throw new Error("provider is not on the main menu and offers no Cancel");
-      await this.press("clear state", "Cancel");
+      // "Action cancelled." is the expected confirmation of our own Cancel. It
+      // is deliberately NOT treated as a failure - see ACTION_CANCELLED.
+      this.noteActionCancelled(await this.press("clear state", "Cancel"));
     }
     throw new Error("could not return to the main menu after 3 attempts");
   }
@@ -1549,27 +1788,45 @@ async function walkForPassword(tg, fp) {
       await tg.sendRaw("restart", "/start");
       await sleep(STEP_MS);
     }
-    await tg.ensureMainMenu();
+    // Any of these can be rate limited. Wait as instructed rather than walking
+    // away from an account that was still available.
+    await tg.obeyRateLimit(await tg.ensureMainMenu());
     await sleep(STEP_MS);
-    await tg.press("open Tasks", "Tasks");
+    await tg.obeyRateLimit(await tg.press("open Tasks", "Tasks"));
     await sleep(STEP_MS);
-    if (GROUP) await tg.press(`open ${GROUP}`, GROUP);
+    if (GROUP) await tg.obeyRateLimit(await tg.press(`open ${GROUP}`, GROUP));
     await sleep(STEP_MS);
-    await tg.press(`open job ${JOB}`, JOB);
+    await tg.obeyRateLimit(await tg.press(`open job ${JOB}`, JOB));
     await sleep(STEP_MS);
     const beforeStart = await tg.latestId();
-    await tg.press("click Start", "Start");
+    const startReplies0 = await tg.press("click Start", "Start");
+    // The rate limit is most often delivered in place of the credentials.
+    if (await tg.obeyRateLimit(startReplies0)) {
+      audit({ leg: "internal", what: "creds", status: "rate-limited-at-start", attempt, fp });
+      continue;
+    }
+    // The provider's own timer. Length is unknown and assumed nowhere - all we
+    // can honestly say is that this account is already gone.
+    if (tg.isTaskCancelled(startReplies0)) {
+      log.error("The provider's timer ran out on this task - the account is lost.");
+      audit({ leg: "internal", what: "creds", status: "provider-timer-expired", attempt, fp });
+      return null;
+    }
     const deadline = Date.now() + CRED_WAIT_MS;
-    let startReplies = [];
+    let startReplies = startReplies0;
     let creds = { firstName: null, lastName: null, password: null };
     for (;;) {
       startReplies = await tg.freshSince(beforeStart, 6);
+      tg.noteActionCancelled(startReplies);
+      if (await tg.obeyRateLimit(startReplies)) { audit({ leg: "internal", what: "creds", status: "rate-limited-at-start", attempt, fp }); break; }
+      if (tg.isTaskCancelled(startReplies)) { log.error("The provider's timer ran out on this task - the account is lost."); audit({ leg: "internal", what: "creds", status: "provider-timer-expired", attempt, fp }); return null; }
       creds = parseCreds(startReplies);
       if (creds.password) break;
       if (Date.now() >= deadline) break;
       await sleep(250);
     }
     if (!creds.password) {
+      if (await tg.obeyRateLimit(startReplies)) { audit({ leg: "internal", what: "creds", status: "rate-limited-at-start", attempt, fp }); continue; }
       log.error(`No credentials within ${CRED_WAIT_MS}ms of Start`);
       audit({ leg: "internal", what: "creds", status: "missing-at-start", attempt, fp });
       continue;
@@ -1650,12 +1907,18 @@ async function runGroup(group, args, phone) {
           const result = await changeFacebook(currentPw, resumePw, url, pick.cookie);
           if (!result.ok) throw new Bail(`Facebook did not confirm the change: ${result.verdict}`);
           const keyReplies = await tg.sendRaw("send 2FA key", fa2Key);
+          if (await tg.obeyRateLimit(keyReplies)) continue;
+          if (tg.isTaskCancelled(keyReplies)) throw new Bail("the provider's timer ran out after the 2FA key");
           if (!keyReplies.some((r) => /cookie/i.test(r))) throw new Bail("expected a cookie prompt after the 2FA key");
           const cookieReplies = await tg.sendRaw("send cookie", pick.cookie.trim());
+          if (await tg.obeyRateLimit(cookieReplies)) continue;
           if (!cookieReplies.some((r) => /confirm registration/i.test(r))) throw new Bail("no confirmation prompt after the cookie");
           const final = await tg.press("confirm registration", "Account registered");
           if (final.some((r) => /report has been received/i.test(r))) {
             markSent({ fp, source: job.file, row: pick.row, job: JOB });
+            // The receipt is not the outcome. Queue the row so the verdict that
+            // arrives up to 64 minutes later can be matched to it.
+            noteSubmission({ fp, source: job.file, row: pick.row });
             markPasswordUsed(resumePw);
             ok++;
           } else failed.push(tag);
@@ -1705,14 +1968,23 @@ async function runGroup(group, args, phone) {
 
         if (!fa2Key) throw new Bail("Bot wants a 2FA key but none was given (--fa2 / sheet col B)");
         const keyReplies = await tg.sendRaw("send 2FA key", fa2Key);
+        // These three can each be replaced by a rate limit or the provider's
+        // own timeout, both of which used to look like "no reply came back".
+        if (await tg.obeyRateLimit(keyReplies)) continue;
+        if (tg.isTaskCancelled(keyReplies)) throw new Bail("the provider's timer ran out after the 2FA key");
         if (!keyReplies.some((r) => /cookie/i.test(r))) throw new Bail("expected a cookie prompt after the 2FA key, got something else");
         const cookieReplies = await tg.sendRaw("send cookie", pick.cookie.trim());
+        if (await tg.obeyRateLimit(cookieReplies)) continue;
+        if (tg.isTaskCancelled(cookieReplies)) throw new Bail("the provider's timer ran out after the cookie");
         if (!cookieReplies.some((r) => /confirm registration/i.test(r))) throw new Bail("no confirmation prompt after the cookie");
         const final = await tg.press("confirm registration", "Account registered");
         if (final.some((r) => /report has been received/i.test(r))) {
           markSent({ fp, source: job.file, row: pick.row, job: JOB });
+          // The receipt is not the outcome - queue it so the verdict that
+          // arrives up to 64 minutes later can be matched to this row.
+          noteSubmission({ fp, source: job.file, row: pick.row });
           audit({ leg: "internal", what: "job", status: "received", fp });
-          log.success(`Recorded in sent.jsonl (fp ${fp})`);
+          log.success(`Recorded in sent.jsonl (fp ${fp}) - awaiting the provider's verdict`);
           ok++;
         } else {
           log.warn("Confirmation sent, but no 'report received' in the reply");
@@ -1757,6 +2029,7 @@ Usage:
   bun index.js -P <assignedPw> -o <current> --fa2 <k> --xlsx a.xlsx --row 5   # resume
   bun index.js --login <phone>                         # one-time Telegram sign-in
   bun index.js --selftest                              # offline checks, no browser, no network
+  bun index.js --check-verdicts                        # what actually happened to every report we sent
   bun index.js --check-pw --hold --xlsx a.xlsx --row 5 -o <curPw>   # on an unknown screen: dump it and keep the browser open
   bun index.js --codegen --xlsx a.xlsx --row 5         # open browser with that row's cookie, pause for inspector
   bun index.js --codegen --detect --xlsx a.xlsx --row 5   # walk to the form and report what was identified, type nothing
@@ -1766,7 +2039,7 @@ Usage:
 Flags: --xlsx (repeatable/comma/space), --row, --rows f#r,.. (internal), --all,
   -p/--phone, -o/--current-password, -P/--password, --fa2, --per-session N,
   --plan, --force, --dry-run/--probe, --codegen, --detect, --check-pw,
-  --refresh-cookie, --write-back, --hold, --selftest, --login, --help
+  --refresh-cookie, --write-back, --hold, --selftest, --check-verdicts, --login, --help
 Rule: one bot password covers max ${MAX_REUSE} cookies and retires after 1 success.`);
 }
 
@@ -1774,6 +2047,7 @@ async function main() {
   const args = process.argv.slice(2);
   if (args.includes("--help") || args.includes("-h")) { printHelp(); return; }
   if (args.includes("--selftest")) { process.exit((await selftest()) ? 1 : 0); }
+  if (args.includes("--check-verdicts")) { process.exit(checkVerdicts()); }
   if (args.includes("--login")) {
     const p = argValue(args, ["--login"]) ?? argValue(args, ["--phone", "-p"]);
     const t = await Taskly.open({ phone: p });

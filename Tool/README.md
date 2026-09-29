@@ -88,6 +88,34 @@ The UID check runs first, before any Telegram session opens and before the brows
 
 `--no-uid-check` skips the filter if you want the old behaviour.
 
+## What the provider says back
+
+Four messages that used to be unexplained failures, all captured from 1000 messages of real history:
+
+| Message | Handling |
+| --- | --- |
+| `You are making requests too often. Please wait 9 sec.` | Wait exactly as long as it says, then press again. It replaces the reply we wanted, so the account was still there. |
+| `Time's up! Task cancelled.` | The **provider's** timer, not ours. Length has been seen from a minute to about eight, so no duration is assumed anywhere. The account is already lost; the message just says so plainly. |
+| `Action cancelled.` | **Ours, and expected** — it confirms the `Cancel` button cleared a modal state. Not a rejected report, not a timeout. |
+| `Report approved, +$0.05` / `Report rejected...` | The real outcome, up to 64 minutes later. See below. |
+
+## The verdict — the receipt is not the result
+
+`Your report has been received! Please wait` is a receipt. The decision arrives unprompted, sometimes in the middle of an unrelated action (7 of 153 Start presses in the captured history). So a permanent listener watches every inbound message and writes each verdict to `out/verdicts.jsonl`, matched to its row through `out/pending.json`.
+
+```
+bun index.js --check-verdicts
+```
+
+**The awkward part, stated plainly:** a verdict carries no identifier — no UID, no row number, nothing. The only available mapping is order: the oldest unanswered submission takes the next verdict. Verdicts were observed arriving in order, so FIFO is used, and it is recorded as the assumption it is. If it is ever wrong the fix is a marker in the sheet, not guessing harder.
+
+For that reason a rejection saying *account blocked* is **reported but not auto-skipped** — a wrong pairing would throw away a good account. `--check-verdicts` prints the fingerprints so you can decide.
+
+## Two things deliberately left alone
+
+- The job card's `Report instruction:` field arrives **empty** (`Report instruction: .`). Nothing to follow.
+- The rejection text carries a standing rule: *after registration you must NOT log out, but you SHOULD clear browser history and cookies and stay logged in.* The per-run `clearCookies()` + `addCookies()` already does exactly that. Don't "tidy" it into a persistent login — that invalidates every cookie.
+
 ## Password reuse rule
 
 One bot password covers max 3 cookies and retires after 1 success. A gated/dead cookie is recorded in `out/skipped.jsonl` and the same password carries to the next cookie with no new Start. Used passwords are hashed in `out/used-passwords.json`.
