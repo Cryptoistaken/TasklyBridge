@@ -32,6 +32,8 @@ One password covers max 3 cookies, retires after 1 success (hash in `used-passwo
 | --- | --- |
 | Dead cookie (probe DEAD twice) | Skip before browser/Telegram; nothing spent |
 | SMS gate at any point (incl. mid-fill, mid-watch) | `BailGated` -> `skipped.jsonl`, never retried |
+| `/checkpoint/` says "confirm we're human" | Click Continue once, then a CAPTCHA appears - stop, a human does it |
+| `/checkpoint/` shows a CAPTCHA | Not solved. Row stops, is NOT marked dead, retry or `--codegen` by hand |
 | `/checkpoint/` says disabled/blocked/violates terms | Banned -> `skipped.jsonl`, never retried |
 | `/checkpoint/` says "confirm your identity" and the rest | Challenge, not a ban; wait for a human, then continue |
 | Button disabled / field mismatch / no known screen | Bail with screenshot + page text; row retried next run |

@@ -263,6 +263,90 @@ export async function isCookieDead(cookie) {
   return (await probeOnce(cookie)) === "DEAD";
 }
 
+// Set from --hold. Makes every give-up path stop and keep the browser instead
+// of closing, so an unrecognised screen can be inspected and recorded.
+let HOLD = false;
+
+// ---- Capturing a screen we do not understand ----
+// When a screen is unrecognised, the useful thing is not a guess at the wording
+// - it is a picture of the page and a browser the operator can poke at. This is
+// the dump from the old FAF bot's logScreen, trimmed to what is needed here.
+async function dumpScreen(page, why) {
+  // A checkpoint page is often still blank when we give up on it - the first
+  // dump of a real one came back with no text, no buttons and no inputs. So
+  // give the page a few seconds to render before reporting it empty, otherwise
+  // the dump is worthless exactly when it is needed most.
+  const grab = () => page.evaluate(() => {
+    const vis = (e) => !!(e.offsetWidth || e.offsetHeight);
+    const uniq = (els, label, max) => {
+      const seen = new Set(), out = [];
+      for (const el of els) {
+        if (!vis(el)) continue;
+        const n = label(el);
+        if (!n || seen.has(n)) continue;
+        seen.add(n);
+        out.push(n);
+        if (out.length >= max) break;
+      }
+      return out;
+    };
+    const btn = (e) => (e.getAttribute("aria-label") || e.innerText || "").replace(/\s+/g, " ").trim();
+    // A password input has no visible name at all, so reach for its <label>.
+    const inp = (e) => (e.labels?.[0]?.innerText || e.getAttribute("aria-label") || e.placeholder || e.name || e.id || e.type || "").replace(/\s+/g, " ").trim();
+    return {
+      buttons: uniq([...document.querySelectorAll('button,[role="button"]')], btn, 30),
+      links: uniq([...document.querySelectorAll("a")], btn, 15),
+      inputs: uniq([...document.querySelectorAll('input,textarea,[role="textbox"]')], inp, 12),
+      dialogs: [...document.querySelectorAll('[role="dialog"],[role="alert"]')].filter(vis)
+        .map((e) => e.innerText.replace(/\s+/g, " ").trim().slice(0, 200)),
+      text: (document.body?.innerText ?? "").replace(/\s+/g, " ").trim().slice(0, 800),
+    };
+  }).catch(() => null);
+  let info = await grab();
+  if (!info || (!info.text && !info.buttons.length && !info.inputs.length)) {
+    for (let i = 0; i < 8; i++) {
+      await sleep(750);
+      const again = await grab();
+      if (again && (again.text || again.buttons.length || again.inputs.length)) { info = again; break; }
+    }
+  }
+  // A checkpoint's wording is often inside an iframe, where the top document
+  // has nothing at all.
+  const frameText = [];
+  for (const f of page.frames()) {
+    if (f === page.mainFrame()) continue;
+    const t = await f.locator("body").innerText({ timeout: 1000 })
+      .then((s) => s.replace(/\s+/g, " ").trim().slice(0, 300)).catch(() => "");
+    if (t) frameText.push(`${f.url().slice(0, 60)}: ${t}`);
+  }
+  log.error(`── screen: ${why} ──`);
+  log.error(`  url:     ${page.url().slice(0, 160)}`);
+  if (!info) { log.error("  (could not read the page - it may have closed)"); return null; }
+  log.error(`  text:    ${info.text || "(empty)"}`);
+  log.error(`  buttons: ${info.buttons.join(" | ") || "(none)"}`);
+  log.error(`  links:   ${info.links.join(" | ") || "(none)"}`);
+  log.error(`  inputs:  ${info.inputs.join(" | ") || "(none)"}`);
+  for (const d of info.dialogs) log.error(`  dialog:  ${d}`);
+  for (const t of frameText) log.error(`  frame:   ${t}`);
+  if (!info.text && !info.buttons.length && !info.inputs.length && !frameText.length) {
+    log.error("  (the page rendered nothing - the state is not in the DOM, so it must be read off the screen by eye)");
+  }
+  return info;
+}
+
+// Never returns. The browser stays open so the screen can be inspected and the
+// steps recorded by hand, which is the only way to learn a state we have never
+// seen. Ctrl+C in this terminal ends the run and closes it.
+async function holdForInspection(page, why) {
+  const info = await dumpScreen(page, why);
+  if (info?.buttons.some((b) => /^dismiss$/i.test(b))) {
+    log.warn("There IS a Dismiss button on this screen. That is the state described as 'automated behaviour'.");
+  }
+  log.warn("Browser held OPEN on purpose. Do the steps by hand and note them down.");
+  log.warn("Press Ctrl+C in this terminal when you are finished.");
+  await new Promise(() => {});
+}
+
 // ---- Waiting on the UI ----
 // Fixed sleeps are the wrong shape here: a slow page pays the full sleep, a
 // fast one still waits it out. This polls instead and returns the moment the
@@ -462,10 +546,43 @@ async function waitForScreen(page, list, what, ms = WAIT_MS) {
 // in both directions: wait on a banned account for ten minutes, or throw away a
 // good one. So read the page and split them.
 const BANNED_WORDS = /your account (has been |was )?(disabled|deactivated)|account disabled|you'?re temporarily blocked|this account (has been |was )?(disabled|deactivated)|violat(ed|ion) of our terms|account is not usable/i;
-const CHALLENGE_WORDS = /confirm your identity|it'?s you|enter your password to confirm|security check|confirm it'?s you|we detected|unusual login/i;
+const CHALLENGE_WORDS = /confirm your identity|it'?s you|enter your password to confirm|security check|confirm it'?s you|we detected|unusual login|confirm that you'?re human|are you a robot/i;
 function isCheckpointUrl(page) {
   return /checkpoint/i.test(page.url());
 }
+// The "automated behaviour" interstitial, as --hold found it on 2fa100 row 9.
+// One Continue button, no Dismiss. Requiring the phrase AND the button keeps a
+// bare "Continue" on some other page from being clicked as a human check.
+const HUMAN_CHECK = /confirm that you'?re human|are you a robot|verify you'?re human/i;
+const pageText = (page) =>
+  page.locator("body").innerText({ timeout: 5000 }).then((t) => t.replace(/\s+/g, " ")).catch(() => "");
+
+// The checkpoint page is blank for several seconds after the redirect - the
+// first dump of a real one had no text, no buttons and no inputs at all. So
+// this WAITS for the wording rather than reading once; reading once found
+// nothing and fell through to the ten-minute human wait.
+async function findHumanCheck(page, ms = 10_000) {
+  const btn = mButton(page, /^Continue$/);
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await page.isClosed()) return null;
+    if (HUMAN_CHECK.test(await pageText(page)) && (await btn.isVisible({ timeout: 300 }).catch(() => false))) return btn;
+    await sleep(POLL_MS);
+  }
+  return null;
+}
+
+// The first Continue on the human check leads to a CAPTCHA: "Enter the text
+// from the image / Hear this code or get a new code / Type the text". That is a
+// control whose whole purpose is to stop a program, so it is deliberately NOT
+// solved here - no image reading, no audio transcription, no code lookup. The
+// row stops and says so, and a person does it by hand with --codegen.
+//
+// The account itself is usually fine, so this is NOT recorded as dead or
+// skipped. It is a stop, not a verdict on the cookie.
+const CAPTCHA = /enter the text from the image|type the text|enter the characters you see|recaptcha/i;
+const captchaVisible = (page) => pageText(page).then((t) => CAPTCHA.test(t));
+
 // "banned" | "challenge". A challenge is the safe default: waiting costs time,
 // wrongly calling a live account banned costs the account itself.
 function classifyCheckpointText(text) {
@@ -497,7 +614,11 @@ async function selftest() {
     "Enter your password to confirm it's you",
     "Security check",
     "We detected unusual login activity",
-    "Please confirm you are human",
+    // Captured verbatim from a real run (2fa100 row 9) via --hold. This is
+    // the screen that was reported as "click Dismiss". The button is
+    // Continue - there is no Dismiss - so a handler written from the
+    // description would have found nothing and clicked nothing.
+    "Ge. Alissa Bayuk, confirm that you're human to use your account Continue",
     "",
   ];
   let bad = 0;
@@ -528,7 +649,33 @@ async function awaitCheckpoint(page, minutes = 10) {
     log.error("BANNED: Facebook says this account is disabled. Recorded in skipped.jsonl - it will not be retried.");
     return await bail(page, "account is banned");
   }
+  // The human check found by --hold: one button, Continue, and no Dismiss.
+  // It is a challenge, not a ban - the account works - so the row carries on
+  // after the click. Logged loudly because an earlier version of this file
+  // described the same screen as "click Dismiss", and that is not what it is.
+  if (await findHumanCheck(page)) {
+    log.warn("Facebook is asking to confirm we are human (one Continue button). Clicking it.");
+    const btn = mButton(page, /^Continue$/);
+    await btn.click({ timeout: 5000 }).catch((e) => log.warn(`Continue would not click: ${e?.message ?? e}`));
+    await waitForGone(mButton(page, /^Continue$/), 4_000, "the human check");
+    // Verified on 2fa100 row 9: that click lands on a CAPTCHA. Stop here
+    // rather than filling a form the CAPTCHA is sitting on top of.
+    for (let i = 0; i < 8; i++) {
+      if (await captchaVisible(page)) {
+        log.error("CAPTCHA: Facebook is asking for the text from an image. This is not solved here - a person has to do it.");
+        log.error("Run: bun index.js --codegen --xlsx <sheet> --row <n>   and type it in by hand.");
+        throw new BailLogged("captcha: needs a human");
+      }
+      await sleep(POLL_MS);
+    }
+    log.warn("Continued past the human check.");
+    return;
+  }
   log.warn("Facebook wants identity confirmation (a challenge, not a ban). Finish it in the browser window.");
+  // With --hold, show it now instead of waiting ten minutes in silence: this
+  // is the one screen whose wording decides whether an account gets written
+  // off, and it is not in the DOM until the page has rendered.
+  if (HOLD) return await holdForInspection(page, "checkpoint - challenge (not classified as a ban)");
   const deadline = Date.now() + minutes * 60_000;
   while (Date.now() < deadline) {
     if (page.isClosed()) throw new BailLogged("Browser closed during the checkpoint");
@@ -541,6 +688,8 @@ async function awaitCheckpoint(page, minutes = 10) {
   await bail(page, "Checkpoint was not cleared in time");
 }
 async function bail(page, reason) {
+  // --hold: never close on an unknown screen. Print it and keep the browser.
+  if (HOLD) return await holdForInspection(page, reason);
   const dir = path.join(os.tmpdir(), "opencode");
   const file = path.join(dir, `pc-fail-${new Date().toISOString().replace(/[:.]/g, "-")}.png`);
   let text = "";
@@ -682,6 +831,7 @@ export async function changePassword({ context, currentPw, newPw, targetUrl, dry
     if (here === S.hubChangePassword) { log.info("On the hub — clicking 'Change password'"); await here.loc.first().click(); continue; }
     if (here === S.accountHub) { log.info("Opening the profile menu"); await here.loc.first().click(); continue; }
     if (!here) {
+      if (HOLD) { await holdForInspection(page, `no known screen after ${step} step(s)`); }
       const text = await page.locator("body").innerText({ timeout: 5000 })
         .then((t) => t.replace(/\s+/g, " ").trim().slice(0, 500)).catch(() => "");
       log.error(`Step ${step}: no known screen after 30000ms. On screen: ${text || "(could not read)"}`);
@@ -986,16 +1136,29 @@ async function resumeSession(page, currentPw) {
 // DELIBERATELY UNHANDLED: the "we detected automated behaviour" interstitial.
 //
 // It was reported as happening "sometimes" and only ever described as "click
-// Dismiss". That is not enough to code against: the exact copy was never seen,
-// a guessed label risks clicking the wrong thing, and if it is a Chrome
-// infobar rather than a page element no DOM query can see it at all. So there
-// is no handler here on purpose - not an oversight.
+// Dismiss". --hold found the real screen (2fa100 row 9) and it does NOT match
+// that description:
 //
-// What happens instead: the walk reaches no known screen, bail() screenshots
-// the page, and the row is retried later. If a cookie lands in this state,
-// run codegen on it, record the real steps, and only then add a handler.
+//   https://m.facebook.com/checkpoint/1501092823525282/
+//   "Ge. Alissa Bayuk, confirm that you're human to use your account"
+//   buttons: Continue
 //
-//   bun index.js --codegen --xlsx data\sheet.xlsx --row <n>
+// One button, Continue, and no Dismiss at all. So the handler is named for what
+// the screen actually is rather than what it was called: a human check with a
+// single Continue. That fits the existing checkpoint path instead of adding a
+// parallel one - the page already arrives at /checkpoint/.
+//
+// It is still a challenge, NOT a ban: the account is alive and usable, and
+// clicking Continue is what the row needs. Verified on row 9, which then went
+// on to the form. If Facebook ever relabels that button, this goes quiet and
+// the row is retried - which is the safe direction, since a wrong guess here
+// could mark a working account as gated.
+//
+//   bun index.js --check-pw --hold --xlsx data\sheet.xlsx --row <n> -o <pw>
+//
+// --hold is still the tool for the next unknown screen: it prints the url,
+// text, buttons, links, inputs and dialogs, waits for the page to actually
+// render before reporting it empty, and leaves the browser open to poke at.
 
 // ---- Codegen (manual browser with one row's cookie, no Telegram) ----
 // cookieOverride lets a caller open the browser with a cookie that is not the
@@ -1488,6 +1651,7 @@ Usage:
   bun index.js -P <assignedPw> -o <current> --fa2 <k> --xlsx a.xlsx --row 5   # resume
   bun index.js --login <phone>                         # one-time Telegram sign-in
   bun index.js --selftest                              # offline checks, no browser, no network
+  bun index.js --check-pw --hold --xlsx a.xlsx --row 5 -o <curPw>   # on an unknown screen: dump it and keep the browser open
   bun index.js --codegen --xlsx a.xlsx --row 5         # open browser with that row's cookie, pause for inspector
   bun index.js --codegen --detect --xlsx a.xlsx --row 5   # walk to the form and report what was identified, type nothing
   bun index.js --check-pw --xlsx a.xlsx --row 5 -o <curPw>   # fill the form, prove the button enables, do NOT submit
@@ -1496,7 +1660,7 @@ Usage:
 Flags: --xlsx (repeatable/comma/space), --row, --rows f#r,.. (internal), --all,
   -p/--phone, -o/--current-password, -P/--password, --fa2, --per-session N,
   --plan, --force, --dry-run/--probe, --codegen, --detect, --check-pw,
-  --refresh-cookie, --write-back, --selftest, --login, --help
+  --refresh-cookie, --write-back, --hold, --selftest, --login, --help
 Rule: one bot password covers max ${MAX_REUSE} cookies and retires after 1 success.`);
 }
 
@@ -1513,6 +1677,7 @@ async function main() {
   }
   const phone = argValue(args, ["--phone", "-p"]) ?? process.env.TG_PHONE;
   if (args.includes("--codegen") || args.includes("--check-pw") || args.includes("--refresh-cookie")) {
+    HOLD = args.includes("--hold");
     try {
       if (args.includes("--refresh-cookie")) process.exit(await runRefreshCookie(args));
       if (args.includes("--check-pw")) process.exit(await runCheckPw(args));

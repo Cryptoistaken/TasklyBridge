@@ -41,9 +41,29 @@ Nothing waits a fixed number of seconds for the UI. `waitForAny` polls for the e
 
 A checkpoint is not one thing. Facebook uses `/checkpoint/` both for a **ban** and for an ordinary identity challenge, and guessing wrong is expensive in both directions — waiting ten minutes on a dead account, or discarding a live one. The page text decides: disabled / blocked / violates-our-terms means banned, and the row goes to `out/skipped.jsonl` so it is never retried. Everything else is treated as a challenge, which is the recoverable side.
 
-## Not handled: the automated-behaviour interstitial
+## The automated-behaviour screen
 
-There is no handler for it, on purpose. It has only ever been described as "click Dismiss", and a guessed label risks clicking the wrong thing — or nothing, if it is a Chrome infobar rather than a page element. When it appears, the walk finds no known screen, `bail` screenshots the page, and the row is retried later. If a cookie lands in that state, run `--codegen` on it, do the steps yourself, and add a handler from what you actually saw.
+Found for real, using `--hold`, on `2fa100` row 9. It is **not** what it was described as:
+
+```
+https://m.facebook.com/checkpoint/1501092823525282/
+"Ge. Alissa Bayuk, confirm that you're human to use your account"
+buttons: Continue
+```
+
+One `Continue` button and no `Dismiss` at all — a handler written from the description would have found nothing and clicked nothing. It is handled as a human check: the phrase **and** the button must both be present, so a bare `Continue` elsewhere is never clicked.
+
+Clicking that `Continue` leads to a **CAPTCHA** ("Enter the text from the image / Hear this code / Type the text"). That is not solved here — no image reading, no audio transcription, no code lookup. The row stops and tells you to run `--codegen` and type it in. The account is *not* marked dead or skipped: that is a stop, not a verdict on the cookie.
+
+## `--hold`
+
+The tool for the next screen we do not recognise. When the walk gives up it prints the url, text, buttons, links, inputs and dialogs, **waits for the page to actually render first** (the first dump of a real checkpoint came back completely empty, because the page is blank for several seconds after the redirect), reads iframe text as well, then leaves the browser open to poke at. Ctrl+C in the terminal closes it.
+
+```
+bun index.js --check-pw --hold --xlsx data\2fa100.xlsx --row 9 -o <pw>
+```
+
+This is how the human check was found, and it is the fastest way to learn a new state.
 
 ## Anti-detection
 
