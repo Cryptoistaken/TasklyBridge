@@ -51,6 +51,14 @@ const LAUNCH_ARGS = [
   "--hide-crash-restore-bubble",
 ];
 
+// navigator.webdriver is still true even with the Blink feature flag off, so
+// any page that reads the property sees us. The old FAF bot set both; we only
+// had the flag. Cheap, and it is the one stealth measure that does not require
+// guessing at Facebook's heuristics.
+const STEALTH_INIT = () => {
+  Object.defineProperty(Navigator.prototype, "webdriver", { get: () => false, configurable: true });
+};
+
 // exit_type=Crashed survives in the profile until Chrome next starts, and then
 // every launch opens with a "Restore pages?" bubble over the page we are
 // driving. Clearing it is safe: the worst case is losing a session we did not
@@ -76,6 +84,9 @@ export const log = {
   success: (m) => console.log(chalk.green("SUCCESS"), chalk.white(m)),
   error: (m) => console.log(chalk.red("ERROR"), chalk.white(m)),
   warn: (m) => console.log(chalk.yellow("WARN"), chalk.white(m)),
+  // Off unless TOOL_DEBUG is set, so the per-tick wait tracing does not drown
+  // the run by default.
+  debug: (m) => { if (process.env.TOOL_DEBUG) console.log(chalk.gray("DEBUG"), chalk.gray(m)); },
 };
 const tlog = {
   info: (m) => console.log(chalk.blue("TG"), chalk.white(m)),
@@ -252,6 +263,48 @@ export async function isCookieDead(cookie) {
   return (await probeOnce(cookie)) === "DEAD";
 }
 
+// ---- Waiting on the UI ----
+// Fixed sleeps are the wrong shape here: a slow page pays the full sleep, a
+// fast one still waits it out. This polls instead and returns the moment the
+// expected thing is on screen - the waitForAny shape from the old FAF bot.
+// Progress is logged at most every 2s so a long wait is visible without
+// flooding the log.
+let lastWaitLog = 0;
+async function waitForAny(candidates, ms, what, onTimeout) {
+  const start = Date.now();
+  const deadline = start + ms;
+  let tick = 0;
+  while (Date.now() < deadline) {
+    tick++;
+    for (let i = 0; i < candidates.length; i++) {
+      const loc = candidates[i];
+      try {
+        const n = await loc.count();
+        if (n > 0 && (await loc.nth(0).isVisible({ timeout: 250 }))) return { loc: loc.nth(0), waitedMs: Date.now() - start };
+      } catch { /* mid-render */ }
+    }
+    if (Date.now() - lastWaitLog >= 2000) {
+      lastWaitLog = Date.now();
+      log.debug(`waiting for ${what} (${Date.now() - start}ms, ${tick} ticks)`);
+    }
+    await sleep(POLL_MS);
+  }
+  log.warn(`gave up waiting for ${what} after ${ms}ms`);
+  if (onTimeout) await onTimeout();
+  return null;
+}
+
+// The same wait, for "did this disappear yet" - used after a click so the
+// next step starts on the new screen instead of the old one.
+async function waitForGone(loc, ms, what) {
+  const start = Date.now();
+  while (Date.now() - start < ms) {
+    if (!(await loc.nth(0).isVisible({ timeout: 250 }).catch(() => false))) return true;
+    await sleep(POLL_MS);
+  }
+  return false;
+}
+
 // ---- Facebook screens ----
 // m.facebook.com/index.php?next=...&deoia=1&no_universal_links=1 is the door
 // into an expired session: the cookie still identifies the account, but
@@ -356,17 +409,24 @@ async function pickAccount(page) {
     ["Facebook label", sheet.getByText("Facebook", { exact: true })],
     ["account name", sheet.getByText(/^[A-Z][a-z'’-]+ [A-Z][a-z'’-]+$/)],
   ];
+  // Wait for the row rather than assuming it is already there. The sheet can
+  // finish loading and hand over to the password form between the screen being
+  // detected and this call, and reaching into a sheet that has already gone
+  // used to log a scary "could not find the account row" on a perfectly fine
+  // run - the walk simply carried on afterwards.
   for (const [label, loc] of candidates) {
-    try {
-      if (await loc.first().isVisible({ timeout: 500 })) {
-        const who = (await loc.first().innerText({ timeout: 1000 })).trim();
-        await loc.first().click({ timeout: 5000 });
-        log.success(`Picked account "${who}" via ${label}`);
-        return;
-      }
-    } catch { /* next candidate */ }
+    const hit = await waitForAny([loc], 3_000, `the account row (${label})`);
+    if (!hit) continue;
+    const who = (await hit.loc.innerText({ timeout: 1000 }).catch(() => "")).trim();
+    await hit.loc.click({ timeout: 5000 }).catch(() => {});
+    log.success(`Picked account "${who}" via ${label}`);
+    return;
   }
   if (await codePromptVisible(page)) await bailCodePrompt((await codePromptText(page)) ?? "confirmation code");
+  if (!(await sheet.first().isVisible({ timeout: 500 }).catch(() => false))) {
+    log.info("The account sheet closed on its own - the form is probably already up");
+    return;
+  }
   const text = await sheet.innerText({ timeout: 2000 })
     .then((t) => t.replace(/\s+/g, " ").trim().slice(0, 200)).catch(() => "");
   log.error(`Could not find the account row in the sheet. Sheet says: ${text || "(empty)"}`);
@@ -397,8 +457,78 @@ async function waitForScreen(page, list, what, ms = WAIT_MS) {
   }
   return null;
 }
+// A checkpoint is not one thing. Facebook uses /checkpoint/ for a real ban
+// AND for an ordinary identity challenge, and treating them the same is costly
+// in both directions: wait on a banned account for ten minutes, or throw away a
+// good one. So read the page and split them.
+const BANNED_WORDS = /your account (has been |was )?(disabled|deactivated)|account disabled|you'?re temporarily blocked|this account (has been |was )?(disabled|deactivated)|violat(ed|ion) of our terms|account is not usable/i;
+const CHALLENGE_WORDS = /confirm your identity|it'?s you|enter your password to confirm|security check|confirm it'?s you|we detected|unusual login/i;
+function isCheckpointUrl(page) {
+  return /checkpoint/i.test(page.url());
+}
+// "banned" | "challenge". A challenge is the safe default: waiting costs time,
+// wrongly calling a live account banned costs the account itself.
+function classifyCheckpointText(text) {
+  if (text && BANNED_WORDS.test(text)) return "banned";
+  return "challenge";
+}
+// null when the page is not a checkpoint at all
+async function classifyCheckpoint(page) {
+  if (!isCheckpointUrl(page)) return null;
+  let text = "";
+  try { text = (await page.locator("body").innerText({ timeout: 5000 })).replace(/\s+/g, " "); } catch { /* closed */ }
+  return classifyCheckpointText(text);
+}
+
+// The account is the product and a false "banned" discards a live one, so the
+// split is asserted rather than assumed. Every sample below is real Facebook
+// wording, and most exist to prove they are NOT treated as a ban.
+async function selftest() {
+  const banned = [
+    "Your account has been disabled",
+    "Your account was deactivated",
+    "You're temporarily blocked from using Facebook",
+    "This account has been disabled because it violates our terms",
+    "Account disabled. You can't use Facebook right now.",
+  ];
+  const challenge = [
+    "Confirm your identity",
+    "It's you",
+    "Enter your password to confirm it's you",
+    "Security check",
+    "We detected unusual login activity",
+    "Please confirm you are human",
+    "",
+  ];
+  let bad = 0;
+  for (const t of banned) {
+    const got = classifyCheckpointText(t);
+    if (got !== "banned") { log.error(`selftest: should be banned, got ${got}: "${t}"`); bad++; }
+  }
+  for (const t of challenge) {
+    const got = classifyCheckpointText(t);
+    if (got !== "challenge") { log.error(`selftest: should be a challenge, got ${got}: "${t}"`); bad++; }
+  }
+  log.info(`selftest: ${banned.length + challenge.length} checkpoint wordings checked, ${bad} wrong`);
+  if (!bad) log.success("selftest passed");
+  return bad;
+}
+
 async function awaitCheckpoint(page, minutes = 10) {
-  log.warn("Facebook wants identity confirmation. Finish it in the browser window.");
+  const kind = await classifyCheckpoint(page);
+  if (kind === "banned") {
+    // Terminal. Recorded in skipped.jsonl so it is never retried - a banned
+    // account will still be banned tomorrow, and retrying it is exactly how a
+    // ban gets escalated.
+    const fp = curFp;
+    if (fp) {
+      markSkipped({ fp, reason: "banned: facebook served a checkpoint saying the account is disabled", source: curXlsx, row: curRow });
+      audit({ leg: "internal", what: "account", status: "banned", fp });
+    }
+    log.error("BANNED: Facebook says this account is disabled. Recorded in skipped.jsonl - it will not be retried.");
+    return await bail(page, "account is banned");
+  }
+  log.warn("Facebook wants identity confirmation (a challenge, not a ban). Finish it in the browser window.");
   const deadline = Date.now() + minutes * 60_000;
   while (Date.now() < deadline) {
     if (page.isClosed()) throw new BailLogged("Browser closed during the checkpoint");
@@ -488,7 +618,10 @@ export async function changePassword({ context, currentPw, newPw, targetUrl, dry
   // before the real form, and the old budget ran out mid-recovery.
   for (let step = 1; step <= 10; step++) {
     if (await codePromptVisible(page)) await bailCodePrompt((await codePromptText(page)) ?? "confirmation code");
-    await dismissAutomationWarning(page);
+    // Checked before the screen walk, the way the old FAF bot did. The URL
+    // says "checkpoint" immediately, so a banned account costs no 30s screen
+    // wait, and it is classified (ban vs challenge) before anything waits.
+    if (isCheckpointUrl(page)) { await awaitCheckpoint(page); reachedForm = true; break; }
     // loggedOut is last on purpose. The re-auth form also says "Log in", so
     // anything broader would file a recoverable session as a dead cookie.
     const here = await waitForScreen(page,
@@ -819,6 +952,7 @@ async function changeFacebook(currentPw, newPw, url, cookieString, dryRun = fals
     args: LAUNCH_ARGS,
   });
   try {
+    await context.addInitScript(STEALTH_INIT);
     await context.clearCookies();
     await context.addCookies(parseCookies(cookieString.trim(), process.env.COOKIE_DOMAIN ?? new URL(url).hostname));
     log.success("Cookies loaded");
@@ -835,29 +969,33 @@ async function changeFacebook(currentPw, newPw, url, cookieString, dryRun = fals
 // account - a cookie that resolves to nothing goes down the dead path instead.
 async function resumeSession(page, currentPw) {
   log.warn("Session expired but the cookie still identifies the account - resuming");
-  await sleep(STEP_MS);
+  // Poll for the password field rather than sleeping a fixed second: the page
+  // after Continue took anywhere from 2s to 5s in the measured runs.
   const field = page.locator('input[type="password"]').first();
-  if (!(await field.isVisible({ timeout: 10_000 }).catch(() => false))) {
-    await bail(page, "Continue did not lead to the password form");
-  }
-  await typeClean(page, field, currentPw, "Re-auth password");
+  const hit = await waitForAny([field], 10_000, "the re-auth password field",
+    () => bail(page, "Continue did not lead to the password form"));
+  if (!hit) return;
+  await typeClean(page, hit.loc, currentPw, "Re-auth password");
   // No Show password click: it is cosmetic, and every probe shows the label
   // absent on this form, so asking for it only produced a false warning.
   await tryClick(mButton(page, /^Log in$/), "Log in");
-  // The "Save your login info?" prompt that follows is detected by the loop.
+  // Do not sleep here waiting for the next screen: the walk loop re-detects it,
+  // and waitForScreen already polls. That was the point - act when it is up.
 }
 
-// UNVERIFIED: reported as happening "sometimes", exact copy and placement
-// unknown. Silent when absent - it is asked for on every step, so a warning
-// each time would bury the real ones.
-async function dismissAutomationWarning(page) {
-  const btn = mButton(page, /^Dismiss$/);
-  if (!(await btn.isVisible({ timeout: 300 }).catch(() => false))) return;
-  await btn.click({ timeout: 3000 }).then(
-    () => log.info("Dismissed the automated-behaviour warning"),
-    () => log.warn("automation warning would not dismiss"),
-  );
-}
+// DELIBERATELY UNHANDLED: the "we detected automated behaviour" interstitial.
+//
+// It was reported as happening "sometimes" and only ever described as "click
+// Dismiss". That is not enough to code against: the exact copy was never seen,
+// a guessed label risks clicking the wrong thing, and if it is a Chrome
+// infobar rather than a page element no DOM query can see it at all. So there
+// is no handler here on purpose - not an oversight.
+//
+// What happens instead: the walk reaches no known screen, bail() screenshots
+// the page, and the row is retried later. If a cookie lands in this state,
+// run codegen on it, record the real steps, and only then add a handler.
+//
+//   bun index.js --codegen --xlsx data\sheet.xlsx --row <n>
 
 // ---- Codegen (manual browser with one row's cookie, no Telegram) ----
 // cookieOverride lets a caller open the browser with a cookie that is not the
@@ -878,6 +1016,7 @@ async function openRowBrowser(args, cookieOverride) {
     args: LAUNCH_ARGS,
   });
   try {
+    await context.addInitScript(STEALTH_INIT);
     await context.clearCookies();
     await context.addCookies(parseCookies(cookie, process.env.COOKIE_DOMAIN ?? new URL(url).hostname));
     log.success(`${path.basename(sheets[0])}: row ${pick.row} (fp ${fingerprint(pick.cookie)})`);
@@ -1348,6 +1487,7 @@ Usage:
   bun index.js --xlsx a.xlsx --all -p <phone>          # whole sheet
   bun index.js -P <assignedPw> -o <current> --fa2 <k> --xlsx a.xlsx --row 5   # resume
   bun index.js --login <phone>                         # one-time Telegram sign-in
+  bun index.js --selftest                              # offline checks, no browser, no network
   bun index.js --codegen --xlsx a.xlsx --row 5         # open browser with that row's cookie, pause for inspector
   bun index.js --codegen --detect --xlsx a.xlsx --row 5   # walk to the form and report what was identified, type nothing
   bun index.js --check-pw --xlsx a.xlsx --row 5 -o <curPw>   # fill the form, prove the button enables, do NOT submit
@@ -1356,13 +1496,14 @@ Usage:
 Flags: --xlsx (repeatable/comma/space), --row, --rows f#r,.. (internal), --all,
   -p/--phone, -o/--current-password, -P/--password, --fa2, --per-session N,
   --plan, --force, --dry-run/--probe, --codegen, --detect, --check-pw,
-  --refresh-cookie, --write-back, --login, --help
+  --refresh-cookie, --write-back, --selftest, --login, --help
 Rule: one bot password covers max ${MAX_REUSE} cookies and retires after 1 success.`);
 }
 
 async function main() {
   const args = process.argv.slice(2);
   if (args.includes("--help") || args.includes("-h")) { printHelp(); return; }
+  if (args.includes("--selftest")) { process.exit((await selftest()) ? 1 : 0); }
   if (args.includes("--login")) {
     const p = argValue(args, ["--login"]) ?? argValue(args, ["--phone", "-p"]);
     const t = await Taskly.open({ phone: p });

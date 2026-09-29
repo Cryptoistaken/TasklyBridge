@@ -24,9 +24,30 @@ bun index.js --login <phone>                              # one-time Telegram si
 bun index.js --codegen --xlsx data\a.xlsx --row 5        # open browser with that row's cookie, pause for inspector
 bun index.js --codegen --detect --xlsx data\a.xlsx --row 5   # report which screen is detected, type nothing
 bun index.js --check-pw --xlsx data\a.xlsx --row 5 -o <curPw>   # fill the form, prove the button enables, never submits
+bun index.js --refresh-cookie --xlsx data\a.xlsx --row 5 -o <curPw>          # log in once, retest the new cookie, compare
+bun index.js --refresh-cookie --xlsx data\a.xlsx --row 5 -o <curPw> --write-back   # ...and save it if it is trusted
+bun index.js --selftest                             # offline checks, no browser, no network
 ```
 
-`--detect` walks to the password form and names every screen it hits, typing nothing. `--check-pw` goes one step further: it fills all three fields with a throwaway password and confirms Facebook enables **Change password**, then stops. It never clicks it, so the account password is unchanged. Both need the row's cookie and spend nothing.
+`--detect` walks to the password form and names every screen it hits, typing nothing. `--check-pw` goes one step further: it fills all three fields with a throwaway password and confirms Facebook enables **Change password**, then stops. It never clicks it, so the account password is unchanged. `--refresh-cookie` does the Continue/re-auth flow once, then reopens a clean browser with the cookie Facebook issued and reports which recovery hops it still needs — measured, that is usually none. Both need the row's cookie and spend nothing.
+
+`--selftest` checks the ban/challenge split offline. Run it after any change to those wordings, and before trusting a run that will mark accounts as banned.
+
+## Waiting on the page
+
+Nothing waits a fixed number of seconds for the UI. `waitForAny` polls for the expected element and acts the moment it is on screen; `waitForScreen` does the same for the walk. Set `TOOL_DEBUG=1` to see per-tick wait tracing. The Telegram side deliberately still sleeps — that is throttling, not UI waiting.
+
+## Two screens that are not the same
+
+A checkpoint is not one thing. Facebook uses `/checkpoint/` both for a **ban** and for an ordinary identity challenge, and guessing wrong is expensive in both directions — waiting ten minutes on a dead account, or discarding a live one. The page text decides: disabled / blocked / violates-our-terms means banned, and the row goes to `out/skipped.jsonl` so it is never retried. Everything else is treated as a challenge, which is the recoverable side.
+
+## Not handled: the automated-behaviour interstitial
+
+There is no handler for it, on purpose. It has only ever been described as "click Dismiss", and a guessed label risks clicking the wrong thing — or nothing, if it is a Chrome infobar rather than a page element. When it appears, the walk finds no known screen, `bail` screenshots the page, and the row is retried later. If a cookie lands in that state, run `--codegen` on it, do the steps yourself, and add a handler from what you actually saw.
+
+## Anti-detection
+
+`navigator.webdriver` is forced to `false` on every page, alongside the Blink flag. That is a start, not a disguise.
 
 Flags: `--row N`, `--force` (retry sent/gated), `--dry-run` (walk + Start, stop before Facebook), `--per-session N` (default 3), `--fa2` (override sheet key).
 

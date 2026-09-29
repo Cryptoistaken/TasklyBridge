@@ -32,5 +32,13 @@ One password covers max 3 cookies, retires after 1 success (hash in `used-passwo
 | --- | --- |
 | Dead cookie (probe DEAD twice) | Skip before browser/Telegram; nothing spent |
 | SMS gate at any point (incl. mid-fill, mid-watch) | `BailGated` -> `skipped.jsonl`, never retried |
+| `/checkpoint/` says disabled/blocked/violates terms | Banned -> `skipped.jsonl`, never retried |
+| `/checkpoint/` says "confirm your identity" and the rest | Challenge, not a ban; wait for a human, then continue |
 | Button disabled / field mismatch / no known screen | Bail with screenshot + page text; row retried next run |
 | Dropped Telegram connection | Group stops; later rows fail closed and retry next run |
+
+A checkpoint is deliberately split into those two rows. Facebook uses the same URL
+for a ban and for an ordinary challenge, and the wording decides. Wrong the other way
+is not symmetric: waiting on a banned account costs minutes, calling a live account
+banned costs the account. `--selftest` asserts the split on 12 real wordings.
+
