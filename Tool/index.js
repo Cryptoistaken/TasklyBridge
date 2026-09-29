@@ -225,6 +225,60 @@ export function resolveUrl() {
   if (!url) throw new Bail("TARGET_URL is not set in .env");
   return url;
 }
+// ---- Account liveness (the UID check) ----
+// check.fb.tools answers "is this account still alive" from the UID alone, with
+// no cookie and no browser. Same endpoint SheetSubmit's worker calls.
+//
+// It runs BEFORE the cookie probe on purpose. The cookie probe costs a request
+// to Facebook and a 3s confirmation wait, and it can only ever say the SESSION
+// is dead - which is true of a banned account too. The UID check answers the
+// question that actually matters: is the ACCOUNT still there. A dead UID is
+// permanent, so the row is skipped outright instead of being retried forever.
+const UID_CHECK_URL = process.env.CHECK_URL ?? "https://check.fb.tools/api/check/facebook";
+const uidOf = (cookie) => cookie.match(/c_user=(\d+)/)?.[1] ?? null;
+// The UID identifies an account, so it is masked in logs the same way a cookie
+// is - only ever shown in full to the checker itself.
+const maskUid = (uid) => (uid ? `***${uid.slice(-4)}` : "(none)");
+
+// "valid" | "dead" | "unknown". Anything unreadable is "unknown" and must NOT
+// be treated as dead: guessing here throws away a working account.
+export async function checkUids(uids) {
+  const out = new Map();
+  const list = [...new Set(uids.filter(Boolean))].slice(0, 500);
+  if (!list.length) return out;
+  try {
+    const res = await fetch(UID_CHECK_URL, {
+      method: "POST",
+      headers: { accept: "application/x-ndjson", "content-type": "application/json" },
+      signal: AbortSignal.timeout(30_000),
+      body: JSON.stringify({ inputData: list, userLang: "en", checkFriends: false }),
+    });
+    if (!res.ok) { log.warn(`UID check responded ${res.status} - treating as unknown`); return out; }
+    const text = await res.text();
+    if (text.length > 1_000_000) { log.warn("UID check response too large - ignoring"); return out; }
+    for (const line of text.split("\n")) {
+      // SheetSubmit does the same: the stream prefixes each record.
+      const i = line.indexOf("{");
+      if (i === -1) continue;
+      try {
+        const x = JSON.parse(line.slice(i));
+        const seen = String(x?.data?.uid || x?.data?.account || "");
+        if (!seen) continue;
+        out.set(seen, { status: x?.data?.status?.name === "valid" ? "valid" : "dead", message: x?.data?.status?.message });
+      } catch { /* not a JSON line */ }
+    }
+  } catch (e) {
+    log.warn(`UID check failed: ${e?.message ?? e} - treating as unknown`);
+  }
+  return out;
+}
+export async function checkUid(cookie) {
+  const uid = uidOf(cookie);
+  if (!uid) return { uid: null, status: "unknown" };
+  const hit = (await checkUids([uid])).get(uid);
+  return hit ? { uid, status: hit.status, message: hit.message } : { uid, status: "unknown" };
+}
+
 async function probeOnce(cookie) {
   try {
     const res = await fetch(PROBE_URL, {
@@ -582,6 +636,18 @@ async function findHumanCheck(page, ms = 10_000) {
 // skipped. It is a stop, not a verdict on the cookie.
 const CAPTCHA = /enter the text from the image|type the text|enter the characters you see|recaptcha/i;
 const captchaVisible = (page) => pageText(page).then((t) => CAPTCHA.test(t));
+
+// Two reasons a row is written off, and they are NOT the same thing:
+//
+//   account dead  - the UID check says the account is gone. Permanent. The
+//                   account itself is the product; retrying it cannot help.
+//   captcha       - Facebook asked for the text from an image. Deliberately
+//                   NOT solved (see CAPTCHA in this file). A stop, not a
+//                   verdict, so the row is NOT skipped - the account is fine
+//                   and a person can do it with --codegen.
+//
+// So a captcha does NOT mean a banned account. It is a bot check on the way
+// back in, and it is not evidence about the account itself.
 
 // "banned" | "challenge". A challenge is the safe default: waiting costs time,
 // wrongly calling a live account banned costs the account itself.
@@ -1403,7 +1469,8 @@ async function runRefreshCookie(args) {
   }
 }
 
-// ---- Batch / group ----let curFp = "", curXlsx, curRow = 0;
+// ---- Batch / group ----
+let curFp = "", curXlsx, curRow = 0;
 function resolveRow(file, row) {
   const accounts = readAccounts(file);
   const pick = accounts.find((a) => a.row === row);
@@ -1421,12 +1488,35 @@ async function runBatch(files, args) {
     for (const a of accounts) {
       const fp = fingerprint(a.cookie);
       if (isSent(fp) || isSkipped(fp)) continue;
-      queue.push({ file, row: a.row });
+      // The cookie rides along so the UID filter below does not re-read the
+      // whole sheet once per row.
+      queue.push({ file, row: a.row, cookie: a.cookie, fp });
     }
   }
   if (!queue.length) {
     if (files.length && readErrors === files.length) { log.error("no sheets could be read"); return 1; }
     log.success("nothing left to do - every row is sent or skipped"); return 0;
+  }
+  // Drop dead ACCOUNTS here, before any Telegram session opens. A blocked
+  // account cannot be worked, so a bot password spent discovering that is a
+  // waste - and the UID check costs one request for the whole batch.
+  if (!args.includes("--no-uid-check")) {
+    const live = await checkUids(queue.map((j) => uidOf(j.cookie)));
+    if (live.size) {
+      const alive = queue.filter((j) => {
+        const hit = live.get(uidOf(j.cookie));
+        if (!hit || hit.status === "valid") return true; // unknown -> keep it, never discard on a guess
+        markSkipped({ fp: j.fp, reason: `account dead (uid check: ${hit.message ?? "not valid"})`, source: j.file, row: j.row });
+        log.error(`${path.basename(j.file)}:${j.row} - account ${maskUid(uidOf(j.cookie))} is dead (${hit.message ?? "not valid"}), never retried`);
+        return false;
+      });
+      log.info(`UID check: ${queue.length - alive.length} of ${queue.length} account(s) are dead and were dropped`);
+      queue.length = 0;
+      queue.push(...alive);
+      if (!queue.length) { log.success("every queued account is dead - nothing to do"); return 0; }
+    } else {
+      log.warn("UID check gave no usable answer - carrying on without it");
+    }
   }
   const perSession = Math.max(1, Number(argValue(args, ["--per-session"]) ?? PER_SESSION) || PER_SESSION);
   const groups = [];
@@ -1496,6 +1586,9 @@ async function walkForPassword(tg, fp) {
   return null;
 }
 
+// One UID check per fingerprint per group, not one per row: the same cookie
+// can appear twice in a sheet and the answer will not have changed.
+const uidChecked = new Set();
 async function runGroup(group, args, phone) {
   if (!group.length) { log.error("nothing to run - no rows given"); return 1; }
   const force = args.includes("--force");
@@ -1530,6 +1623,19 @@ async function runGroup(group, args, phone) {
         log.success(`${path.basename(job.file)}: row ${pick.row} (fp ${fp})`);
         if (isSent(fp) && !force) throw new Bail(`row ${pick.row} already in sent.jsonl. Use --force.`);
         if (isSkipped(fp) && !force) throw new Bail(`row ${pick.row} SMS-gated. Use --force.`);
+        // Account liveness first, then the cookie. A dead account is skipped
+        // outright; only a live one is worth spending a cookie probe on.
+        if (!dryRun && !force && !uidChecked.has(fp)) {
+          uidChecked.add(fp);
+          const acc = await checkUid(pick.cookie);
+          audit({ leg: "internal", what: "uid", status: acc.status, fp });
+          if (acc.status === "dead") {
+            markSkipped({ fp, reason: `account dead (uid check: ${acc.message ?? "not valid"})`, source: job.file, row: pick.row });
+            log.error(`Row ${pick.row}: account ${maskUid(acc.uid)} is dead - recorded in skipped.jsonl, never retried.`);
+            throw new BailLogged(`row ${pick.row} account is dead.`);
+          }
+          log.info(`Row ${pick.row}: account ${maskUid(acc.uid)} is ${acc.status} - checking the cookie`);
+        }
         if (!dryRun && !resumePw && !force && (await isCookieDead(pick.cookie))) {
           markSkipped({ fp, reason: "cookie confirmed dead at accountscenter", source: job.file, row: pick.row });
           audit({ leg: "internal", what: "cookie", status: "dead-confirmed", fp });

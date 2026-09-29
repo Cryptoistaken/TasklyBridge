@@ -71,6 +71,23 @@ This is how the human check was found, and it is the fastest way to learn a new 
 
 Flags: `--row N`, `--force` (retry sent/gated), `--dry-run` (walk + Start, stop before Facebook), `--per-session N` (default 3), `--fa2` (override sheet key).
 
+## Two separate liveness checks
+
+They answer different questions, so both run, cheap one first.
+
+| Check | Asks | Cost | If it says no |
+| --- | --- | --- | --- |
+| **UID check** (`check.fb.tools`) | is the *account* still there? | one request, 500 UIDs per call | permanent — `skipped.jsonl`, never retried |
+| **Cookie probe** (`accountscenter/profiles`) | is the *session* still valid? | a request to Facebook, confirmed twice, 3s apart | that cookie is spent, try another |
+
+The UID check runs first, before any Telegram session opens and before the browser. A blocked account cannot be worked, so a bot password spent discovering that is a waste. Measured on `2fa100`: 1 of 86 queued accounts was `Blocked` and got dropped without opening a session. `--plan` shows the same drop, so it costs nothing to look.
+
+**A captcha does not mean a banned account.** Row 9 shows a captcha *and* the UID check reports it `Blocked` — but the point is we now know that before opening a browser, so the row is skipped outright and the captcha is never reached. A captcha on its own is a bot check, and the account may be perfectly fine.
+
+**Unknown is never treated as dead.** If the checker is unreachable, times out or returns something unreadable, the row is kept and the reason is logged. Guessing "dead" there would throw away working accounts.
+
+`--no-uid-check` skips the filter if you want the old behaviour.
+
 ## Password reuse rule
 
 One bot password covers max 3 cookies and retires after 1 success. A gated/dead cookie is recorded in `out/skipped.jsonl` and the same password carries to the next cookie with no new Start. Used passwords are hashed in `out/used-passwords.json`.
