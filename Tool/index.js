@@ -3,7 +3,7 @@ import { config } from "dotenv";
 import path from "path";
 import fs from "node:fs";
 import os from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "url";
 import { spawnSync } from "node:child_process";
 import * as XLSX from "xlsx";
@@ -39,6 +39,36 @@ const DEVICES_PHONE = {
   isMobile: true,
   hasTouch: true,
 };
+
+const PROFILE_DIR = path.join(__dirname, "profile");
+const LAUNCH_ARGS = [
+  "--disable-blink-features=AutomationControlled",
+  // Chrome's own crash-recovery UI. It is NOT a Playwright concern - the
+  // docs do not mention it - it appears only when the profile was left with
+  // exit_type=Crashed, which a force-kill does. Playwright's guidance for
+  // that is handleSIGINT (default true): close the browser instead of killing
+  // it. This flag just stops the leftover state from interrupting a run.
+  "--hide-crash-restore-bubble",
+];
+
+// exit_type=Crashed survives in the profile until Chrome next starts, and then
+// every launch opens with a "Restore pages?" bubble over the page we are
+// driving. Clearing it is safe: the worst case is losing a session we did not
+// want restored anyway.
+function clearStaleCrashFlag() {
+  const prefs = path.join(PROFILE_DIR, "Default", "Preferences");
+  if (!fs.existsSync(prefs)) return;
+  try {
+    const j = JSON.parse(fs.readFileSync(prefs, "utf8"));
+    if (j?.profile?.exit_type !== "Crashed") return;
+    j.profile.exit_type = "Normal";
+    j.profile.exited_cleanly = true;
+    fs.writeFileSync(prefs, JSON.stringify(j), "utf8");
+    log.info("Cleared a stale Chrome crash flag left by a previous force-kill");
+  } catch (e) {
+    log.warn(`could not clear the Chrome crash flag: ${e?.message ?? e}`);
+  }
+}
 
 // ---- Log ----
 export const log = {
@@ -223,15 +253,37 @@ export async function isCookieDead(cookie) {
 }
 
 // ---- Facebook screens ----
+// m.facebook.com/index.php?next=...&deoia=1&no_universal_links=1 is the door
+// into an expired session: the cookie still identifies the account, but
+// m.facebook.com answers with a "Continue" interstitial and then a re-auth
+// form. Going straight to accountscenter from a cold profile can land here
+// instead of the password page.
 function accountSheet(page) {
   return page.getByRole("dialog").filter({ hasText: /choose an account|continue as/i }).first();
 }
+// These buttons live on m.facebook.com, not accountscenter, and getByRole
+// finds nothing there either (same role=none wrappers). [role=button] is a
+// DOM-level query, so it works regardless of what the a11y tree exposes.
+const mButton = (page, re) => page.locator('[role="button"]').filter({ hasText: re }).first();
 const screens = (page) => ({
+  // "Brittany Welker / Continue / Use another profile / Create new account"
+  continueGate: { name: "expired session - Continue", loc: page.getByText("Use another profile", { exact: true }) },
+  // After Continue: Password textbox + Log in + Forgotten password?
+  reauth: { name: "re-auth password form", loc: mButton(page, /^Log in$/) },
+  // "Save your login info?" / "We'll save the login info for <name>" / Save / Not now
+  saveLogin: { name: "save login info prompt", loc: page.getByText("Save your login info?", { exact: false }).first() },
   accountChooser: { name: "account chooser sheet", loc: accountSheet(page) },
   accountHub: { name: "account hub (profile picker)", loc: page.getByRole("button", { name: /Profile picture,/ }).first() },
   hubChangePassword: { name: "hub tile 'Change password'", loc: page.getByText("Change password", { exact: true }).first() },
-  passwordForm: { name: "password change form", loc: page.getByRole("textbox", { name: "Current password" }) },
-  loggedOut: { name: "LOGGED OUT / login screen", loc: page.getByText(/Log into Facebook|Email or phone number|Passcode or password/i).first() },
+  // The password inputs sit under role=none wrappers, so getByRole finds
+  // NOTHING here (measured: getByRole textbox = 0, getByLabel = 1). Every
+  // field is addressed by its <label> instead.
+  passwordForm: { name: "password change form", loc: page.getByLabel("Current password", { exact: true }) },
+  // Checked LAST and matched narrowly on purpose: the re-auth form also says
+  // "Log in", so a broad /Log in/ here would file a recoverable session as a
+  // dead cookie. This wants an actual email/phone field, which the re-auth
+  // form does not have.
+  loggedOut: { name: "LOGGED OUT / login screen", loc: page.getByText(/Log into Facebook|Email or phone number/i).first() },
   checkpoint: { name: "identity checkpoint dialog", loc: page.getByRole("dialog").getByText(/confirm your identity|it's you|enter your password to confirm/i).first() },
 });
 
@@ -292,7 +344,7 @@ export async function blockingDialog(page) {
     if (!(await d.isVisible({ timeout: 300 }).catch(() => false))) continue;
     const text = await d.innerText({ timeout: 500 }).then((t) => t.replace(/\s+/g, " ")).catch(() => "");
     if (/choose an account|continue as/i.test(text)) continue;
-    if (await d.getByRole("textbox", { name: "Current password" }).first().isVisible({ timeout: 400 }).catch(() => false)) continue;
+    if (await d.getByLabel("Current password", { exact: true }).first().isVisible({ timeout: 400 }).catch(() => false)) continue;
     return true;
   }
   return false;
@@ -337,6 +389,10 @@ async function waitForScreen(page, list, what, ms = WAIT_MS) {
       } catch { /* still loading */ }
     }
     if (page.url() !== lastUrl) { lastUrl = page.url(); log.info(`[${elapsed()}] Waiting for ${what}… (${lastUrl})`); }
+    // The code prompt can appear *while* we wait — a dialog matching none of the
+    // screens. Without this the wait times out and a gated cookie is reported as
+    // "no known screen", so it retries forever instead of being skipped.
+    if (await codePromptVisible(page)) await bailCodePrompt((await codePromptText(page)) ?? "confirmation code");
     await sleep(POLL_MS);
   }
   return null;
@@ -369,6 +425,17 @@ async function tryClick(loc, label) {
   try { await loc.click({ timeout: 2000 }); }
   catch { log.warn(`Skipped optional click: ${label}`); }
 }
+// A click that times out is only a failure if the screen is STILL there.
+// Facebook tears the old markup down while the click is in flight, so a
+// timeout usually means the navigation already won the race - retrying then
+// just throws on a button that no longer exists.
+async function clickScreenAway(btn, screen, label) {
+  try { await btn.click({ timeout: 5000 }); return; }
+  catch (e) {
+    if (await screen.loc.first().isVisible({ timeout: 1000 }).catch(() => false)) throw e;
+    log.info(`${label}: screen already moved on, the click was not needed`);
+  }
+}
 async function validationHints(page) {
   const hints = page.getByText(/must be different|do not match|at least \d+ characters|incorrect|wrong|required|try again/i);
   const out = new Set();
@@ -379,6 +446,8 @@ async function validationHints(page) {
   }
   return [...out];
 }
+// A missing aria-disabled means enabled here - Facebook deletes the attribute
+// rather than setting it to "false".
 const isEnabled = (loc) =>
   loc.evaluate((el) => el.getAttribute("aria-disabled") !== "true" && !el.disabled).catch(() => false);
 
@@ -406,7 +475,7 @@ async function typeClean(page, loc, value, label) {
   await bail(page, `${label} field would not accept the value (autofill fighting?)`);
 }
 
-export async function changePassword({ context, currentPw, newPw, targetUrl }) {
+export async function changePassword({ context, currentPw, newPw, targetUrl, dryRun = false }) {
   const page = context.pages()[0] ?? (await context.newPage());
   await page.goto("https://www.facebook.com/", { waitUntil: "load" });
   log.success("Established session on https://www.facebook.com/");
@@ -415,10 +484,15 @@ export async function changePassword({ context, currentPw, newPw, targetUrl }) {
   const S = screens(page);
   let picked = false;
   let reachedForm = false;
-  for (let step = 1; step <= 6; step++) {
+  // 10 steps, not 6: Continue -> password -> Log in -> Save is four hops
+  // before the real form, and the old budget ran out mid-recovery.
+  for (let step = 1; step <= 10; step++) {
     if (await codePromptVisible(page)) await bailCodePrompt((await codePromptText(page)) ?? "confirmation code");
+    await dismissAutomationWarning(page);
+    // loggedOut is last on purpose. The re-auth form also says "Log in", so
+    // anything broader would file a recoverable session as a dead cookie.
     const here = await waitForScreen(page,
-      [S.passwordForm, S.checkpoint, S.accountChooser, S.hubChangePassword, S.accountHub, S.loggedOut],
+      [S.passwordForm, S.checkpoint, S.reauth, S.saveLogin, S.continueGate, S.accountChooser, S.hubChangePassword, S.accountHub, S.loggedOut],
       "the password form", 30_000);
     if (here === S.passwordForm) {
       if (!(await blockingDialog(page))) { reachedForm = true; break; }
@@ -427,6 +501,20 @@ export async function changePassword({ context, currentPw, newPw, targetUrl }) {
       continue;
     }
     if (here === S.loggedOut) await bail(page, "Session is logged out — the cookie is dead");
+    // Not tryClick. A screen is only reported when it is already visible, so
+    // a genuine failure must surface rather than warn and re-detect the same
+    // screen until the budget runs out.
+    if (here === S.continueGate) {
+      log.info("Expired session - clicking Continue");
+      await clickScreenAway(mButton(page, /^Continue$/), S.continueGate, "Continue");
+      continue;
+    }
+    if (here === S.reauth) { await resumeSession(page, currentPw); continue; }
+    if (here === S.saveLogin) {
+      log.info("Facebook offered to save the login - accepting");
+      await clickScreenAway(mButton(page, /^Save$/), S.saveLogin, "Save");
+      continue;
+    }
     if (here === S.checkpoint) {
       log.warn("A real identity-confirmation dialog is open.");
       await awaitCheckpoint(page);
@@ -442,7 +530,10 @@ export async function changePassword({ context, currentPw, newPw, targetUrl }) {
           if (!(await blockingDialog(page)) && (await S.passwordForm.loc.first().isVisible({ timeout: 400 }).catch(() => false))) { formReady = true; break; }
           await sleep(POLL_MS);
         }
-        if (formReady) break;
+        // BUG: this broke out of the loop without setting reachedForm, so the
+        // one screen that DID work - form found right after picking the
+        // account - fell through to "Never reached a usable password form".
+        if (formReady) { reachedForm = true; break; }
         const sheetText = await accountSheet(page).innerText({ timeout: 2000 }).catch(() => "");
         if (/loading/i.test(sheetText) && !/current password/i.test(sheetText)) {
           log.error("Account sheet stuck on 'Loading...' - skipping row.");
@@ -468,9 +559,9 @@ export async function changePassword({ context, currentPw, newPw, targetUrl }) {
     if (await codePromptVisible(page)) await bailCodePrompt((await codePromptText(page)) ?? "confirmation code");
     await bail(page, "Never reached a usable password form - see the screenshot");
   }
-  const current = page.getByRole("textbox", { name: "Current password" });
-  const next = page.getByRole("textbox", { name: "New password", exact: true });
-  const retype = page.getByRole("textbox", { name: "Retype new password" });
+  const current = page.getByLabel("Current password", { exact: true });
+  const next = page.getByLabel("New password", { exact: true });
+  const retype = page.getByLabel("Retype new password", { exact: true });
   if (newPw === currentPw) await bail(page, "New password is identical to the current one — Facebook disables the button");
   await typeClean(page, current, currentPw, "Current password");
   await typeClean(page, next, newPw, "New password");
@@ -479,12 +570,31 @@ export async function changePassword({ context, currentPw, newPw, targetUrl }) {
   await tryClick(show.nth(2), "Show password #3");
   await tryClick(show.nth(1), "Show password #2");
   await tryClick(show.first(), "Show password #1");
-  const submit = page.getByRole("button", { name: "Change password" }).first();
+  // getByRole("button", {name}) returns 0 here too - the accessible name is
+  // stripped by the role=none wrapper, so match the DOM directly.
+  //
+  // Do NOT put [aria-disabled] in this selector. Facebook REMOVES that
+  // attribute when the form becomes valid (measured: "true" -> absent), so
+  // filtering on its presence made the button stop matching at the exact
+  // moment it turned clickable, and isEnabled() then read false forever.
+  //
+  // Two role=button elements say "Change password": the sidebar nav tile
+  // (y~179) and the real submit below the fields (y~748). The submit is last
+  // in DOM order, and that held across every measured run.
+  const submit = page.locator('[role="button"]').filter({ hasText: /^Change password$/ }).last();
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline && !(await isEnabled(submit))) await page.waitForTimeout(POLL_MS);
   if (!(await isEnabled(submit))) {
     const hints = await validationHints(page);
     await bail(page, "Change password button stayed disabled. " + (hints.length ? `Page says: ${hints.join(" | ")}` : "No error text found."));
+  }
+  // --check-pw stops here on purpose: the form accepted both passwords and
+  // Facebook enabled the button, which is everything that can be proven
+  // without spending the change.
+  if (dryRun) {
+    log.success("CHECK PASSED: both fields accepted, 'Change password' is enabled");
+    log.warn("NOT submitted - the password was not changed. Nothing was sent to the bot either.");
+    return { ok: true, verdict: "dry run: form validated, submit not clicked" };
   }
   await submit.click();
   log.success("Clicked Change password — watching the screen for 10s");
@@ -699,45 +809,90 @@ export function parseCreds(replies) {
     text.match(new RegExp(`\\b${name}\\s*[:=]\\s*(\\S+)`, "i"))?.[1]?.trim() ?? null;
   return { firstName: field("first name"), lastName: field("last name"), password: field("password") };
 }
-async function changeFacebook(currentPw, newPw, url, cookieString) {
-  const context = await chromium.launchPersistentContext(path.join(__dirname, "profile"), {
+async function changeFacebook(currentPw, newPw, url, cookieString, dryRun = false) {
+  clearStaleCrashFlag();
+  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
     ...DEVICES_PHONE,
     locale: "en-US",
     headless: false,
     channel: "chrome",
-    args: ["--disable-blink-features=AutomationControlled"],
+    args: LAUNCH_ARGS,
   });
   try {
     await context.clearCookies();
     await context.addCookies(parseCookies(cookieString.trim(), process.env.COOKIE_DOMAIN ?? new URL(url).hostname));
     log.success("Cookies loaded");
-    return await changePassword({ context, currentPw, newPw, targetUrl: url });
+    return await changePassword({ context, currentPw, newPw, targetUrl: url, dryRun });
   } finally {
     await context.close();
   }
 }
 
+// Expired-session recovery: Continue -> re-enter password -> Log in ->
+// "Save your login info?" -> Save. The password here is the account's OWN
+// current password (same one the change flow starts from), so this spends
+// nothing and changes nothing. Only reached when the cookie still names an
+// account - a cookie that resolves to nothing goes down the dead path instead.
+async function resumeSession(page, currentPw) {
+  log.warn("Session expired but the cookie still identifies the account - resuming");
+  await sleep(STEP_MS);
+  const field = page.locator('input[type="password"]').first();
+  if (!(await field.isVisible({ timeout: 10_000 }).catch(() => false))) {
+    await bail(page, "Continue did not lead to the password form");
+  }
+  await typeClean(page, field, currentPw, "Re-auth password");
+  // No Show password click: it is cosmetic, and every probe shows the label
+  // absent on this form, so asking for it only produced a false warning.
+  await tryClick(mButton(page, /^Log in$/), "Log in");
+  // The "Save your login info?" prompt that follows is detected by the loop.
+}
+
+// UNVERIFIED: reported as happening "sometimes", exact copy and placement
+// unknown. Silent when absent - it is asked for on every step, so a warning
+// each time would bury the real ones.
+async function dismissAutomationWarning(page) {
+  const btn = mButton(page, /^Dismiss$/);
+  if (!(await btn.isVisible({ timeout: 300 }).catch(() => false))) return;
+  await btn.click({ timeout: 3000 }).then(
+    () => log.info("Dismissed the automated-behaviour warning"),
+    () => log.warn("automation warning would not dismiss"),
+  );
+}
+
 // ---- Codegen (manual browser with one row's cookie, no Telegram) ----
-async function runCodegen(args) {
+// cookieOverride lets a caller open the browser with a cookie that is not the
+// one in the sheet - used by --refresh-cookie to retest a freshly issued
+// session in a clean browser.
+async function openRowBrowser(args, cookieOverride) {
   const sheets = argValues(args, "--xlsx");
-  if (!sheets.length) throw new Bail("usage: bun index.js --codegen --xlsx <sheet> [--row N]");
-  const row = Number(argValue(args, ["--row"]) ?? "1");
-  const pick = resolveRow(sheets[0], row);
+  if (!sheets.length) throw new Bail("usage: bun index.js --codegen [--detect|--check-pw|--refresh-cookie] --xlsx <sheet> [--row N]");
+  const pick = resolveRow(sheets[0], Number(argValue(args, ["--row"]) ?? "1"));
   const url = resolveUrl();
-  const context = await chromium.launchPersistentContext(path.join(__dirname, "profile"), {
+  const cookie = (cookieOverride ?? pick.cookie).trim();
+  clearStaleCrashFlag();
+  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
     ...DEVICES_PHONE,
     locale: "en-US",
     headless: false,
     channel: "chrome",
-    args: ["--disable-blink-features=AutomationControlled"],
+    args: LAUNCH_ARGS,
   });
   try {
     await context.clearCookies();
-    await context.addCookies(parseCookies(pick.cookie.trim(), process.env.COOKIE_DOMAIN ?? new URL(url).hostname));
+    await context.addCookies(parseCookies(cookie, process.env.COOKIE_DOMAIN ?? new URL(url).hostname));
     log.success(`${path.basename(sheets[0])}: row ${pick.row} (fp ${fingerprint(pick.cookie)})`);
     const page = context.pages()[0] ?? (await context.newPage());
     await page.goto("https://www.facebook.com/", { waitUntil: "load" });
     await page.goto(url, { waitUntil: "load" });
+    return { context, page, url };
+  } catch (e) {
+    await context.close();
+    throw e;
+  }
+}
+async function runCodegen(args) {
+  const { context, page, url } = await openRowBrowser(args);
+  try {
     log.success(`Opened ${url} - inspect, then close the window`);
     await page.pause();
   } finally {
@@ -745,8 +900,208 @@ async function runCodegen(args) {
   }
 }
 
-// ---- Batch / group ----
-let curFp = "", curXlsx, curRow = 0;
+// --detect: walks the same screens changePassword does and prints what it
+// identifies. It clicks navigation tiles only - nothing is typed, nothing is
+// submitted, so the account is untouched. Exit 0 = the form was found.
+async function runDetect(args) {
+  const { context, page } = await openRowBrowser(args);
+  const S = screens(page);
+  const currentPw = argValue(args, ["--current-password", "-o"]) ?? SHARED_PASSWORD;
+  try {
+    for (let step = 1; step <= 10; step++) {
+      if (await codePromptVisible(page)) await bailCodePrompt((await codePromptText(page)) ?? "confirmation code");
+      const here = await waitForScreen(page,
+        [S.passwordForm, S.checkpoint, S.reauth, S.saveLogin, S.continueGate, S.accountChooser, S.hubChangePassword, S.accountHub, S.loggedOut],
+        "the password form", 30_000);
+      if (!here) {
+        const text = await page.locator("body").innerText({ timeout: 5000 })
+          .then((t) => t.replace(/\s+/g, " ").trim().slice(0, 300)).catch(() => "");
+        log.error(`UNKNOWN: nothing matched in 30s. On screen: ${text || "(could not read)"}`);
+        return 1;
+      }
+      log.success(`[${elapsed()}] step ${step}: ${here.name}`);
+      if (here === S.passwordForm) {
+        if (await blockingDialog(page)) { log.warn("a dialog covers the form - waiting for it"); await sleep(POLL_MS); continue; }
+        log.success("DETECTED: the password change form. The run would type and submit here.");
+        return 0;
+      }
+      if (here === S.loggedOut) { log.error("DEAD: logged out, the cookie is not a session"); return 1; }
+      if (here === S.checkpoint) { log.error("CHECKPOINT: an identity dialog is open - a human has to clear it"); return 1; }
+      // --detect does the navigation hops, including re-auth, because whether
+      // those work IS the thing being detected. It never reaches the form,
+      // which is where typing would start.
+      if (here === S.continueGate) { await clickScreenAway(mButton(page, /^Continue$/), S.continueGate, "Continue"); continue; }
+      if (here === S.reauth) { await resumeSession(page, currentPw); continue; }
+      if (here === S.saveLogin) { await clickScreenAway(mButton(page, /^Save$/), S.saveLogin, "Save"); continue; }
+      if (here === S.accountChooser) { await pickAccount(page); continue; }
+      await here.loc.first().click();
+    }
+    log.error("UNKNOWN: 10 steps and no password form");
+    return 1;
+  } finally {
+    await context.close();
+  }
+}
+
+// Facebook requires >=6 chars mixing letters, numbers and one of !$@%.
+// randomBytes().toString("base64url") can emit - and _, which are NOT in
+// that set, so it produced a password the form silently refused. Hex is
+// letters and digits only; the trailing ! supplies the special character.
+const throwawayPassword = () => `Chk${randomBytes(6).toString("hex")}9a!`;
+
+// --check-pw: fills the real password form with a throwaway password and stops
+// once Facebook enables the submit button. The button is never clicked, so the
+// account password is unchanged and nothing is sent to the provider.
+async function runCheckPw(args) {
+  const currentPw = argValue(args, ["--current-password", "-o"]) ?? process.env.FB_CURRENT_PASSWORD;
+  if (!currentPw) throw new Bail("--check-pw needs the current password: pass -o <password> or set FB_CURRENT_PASSWORD");
+  // Facebook requires >=6 chars mixing letters, numbers and one of !$@%.
+  // randomBytes().toString("base64url") can emit - and _, which are NOT in
+  // that set, so it produced a password the form silently refused. Hex is
+  // letters and digits only; the trailing ! supplies the special character.
+  const newPw = argValue(args, ["--password", "-P"]) ?? throwawayPassword();
+  if (newPw === currentPw) throw new Bail("--check-pw: the throwaway password equals the current one - Facebook disables the button");
+  const { context, page, url } = await openRowBrowser(args);
+  try {
+    const pick = resolveRow(argValues(args, "--xlsx")[0], Number(argValue(args, ["--row"]) ?? "1"));
+    log.info(`Filling the form with a throwaway password (${newPw.length} chars). Nothing will be submitted.`);
+    const r = await changePassword({ context, currentPw, newPw, targetUrl: url, dryRun: true });
+    log.info(`row ${pick.row} / fp ${fingerprint(pick.cookie)}`);
+    return r.ok ? 0 : 1;
+  } finally {
+    await context.close();
+  }
+}
+
+const cookieNames = (c) => [...new Set(c.split(";").map((p) => p.split("=")[0].trim()).filter(Boolean))];
+// Values are NEVER printed or logged - a cookie is a live credential. Only
+// names, lengths and hashes are safe to show.
+const cookieDigest = (c) => createHash("sha256").update(c).digest("hex").slice(0, 12);
+
+// Rewrites column A of one row, leaving column B (the 2FA key) alone. The
+// sheet is the source of truth for every account we own, so it is copied to
+// .bak first and the write is read back before it is called a success.
+function writeCookieToSheet(file, row, cookie) {
+  const real = resolveFile(file);
+  const bak = `${real}.bak`;
+  if (!fs.existsSync(bak)) fs.copyFileSync(real, bak);
+  const wb = XLSX.readFile(real);
+  const name = wb.SheetNames[0];
+  const sheet = wb.Sheets[name];
+  const addr = XLSX.utils.encode_cell({ r: row - 1, c: 0 });
+  if (!sheet[addr]) throw new Bail(`row ${row} column A is empty in ${path.basename(real)} - not writing`);
+  XLSX.utils.sheet_add_aoa(sheet, [[cookie]], { origin: addr });
+  XLSX.writeFile(wb, real);
+  const back = String(XLSX.utils.sheet_to_json(XLSX.readFile(real).Sheets[name], { header: 1, raw: false })[row - 1]?.[0] ?? "");
+  if (back.trim() !== cookie.trim()) throw new Bail(`write-back did not verify in ${path.basename(real)} - restore from ${path.basename(bak)}`);
+  return bak;
+}
+
+// --refresh-cookie: does the Continue -> password -> Save login flow once, then
+// reads the session Facebook hands back. A completed login should be more
+// trusted than the cookie we started with, so this proves it: reopen a fresh
+// browser with the NEW cookie only and see whether the Continue gate is gone.
+//
+// Read-only. It never writes the new cookie back to the sheet - it prints the
+// comparison and leaves that decision to you.
+async function runRefreshCookie(args) {
+  const file = argValues(args, "--xlsx")[0];
+  if (!file) throw new Bail("usage: bun index.js --refresh-cookie --xlsx <sheet> --row N [-o <currentPw>]");
+  const row = Number(argValue(args, ["--row"]) ?? "1");
+  const pick = resolveRow(file, row);
+  const currentPw = argValue(args, ["--current-password", "-o"]) ?? process.env.FB_CURRENT_PASSWORD;
+  if (!currentPw) throw new Bail("--refresh-cookie needs the current password: pass -o <password> or set FB_CURRENT_PASSWORD");
+  const url = resolveUrl();
+  const oldCookie = pick.cookie.trim();
+
+  log.info(`Row ${pick.row}: logging in once to get a trusted cookie (nothing is submitted to Facebook)`);
+  const { context, page } = await openRowBrowser(args);
+  let newCookie;
+  try {
+    // dryRun stops at the enabled button, which is past Save login and on the
+    // password page - the point the new session cookie exists.
+    const r = await changePassword({ context, currentPw, newPw: throwawayPassword(), targetUrl: url, dryRun: true });
+    if (!r.ok) log.warn("the walk did not confirm the form - reading the cookie anyway");
+    // Full URLs, not bare domains: the filter rejects anything that is not a
+    // parseable URL ("Invalid URL").
+    const jar = await context.cookies(["https://www.facebook.com/", "https://accountscenter.facebook.com/", "https://m.facebook.com/"]);
+    newCookie = jar.map((c) => `${c.name}=${c.value}`).join("; ");
+    if (!newCookie) throw new Bail("no .facebook.com cookies came back - nothing to compare");
+  } finally {
+    await context.close();
+  }
+
+  const before = cookieNames(oldCookie), after = cookieNames(newCookie);
+  const added = after.filter((n) => !before.includes(n));
+  const dropped = before.filter((n) => !after.includes(n));
+  log.info("── cookie comparison ──");
+  log.info(`  old: ${before.length} names, ${oldCookie.length} chars, fp ${cookieDigest(oldCookie)}`);
+  log.info(`  new: ${after.length} names, ${newCookie.length} chars, fp ${cookieDigest(newCookie)}`);
+  log.info(`  added:   ${added.join(", ") || "(none)"}`);
+  log.info(`  dropped: ${dropped.join(", ") || "(none)"}`);
+  // The markers that make a session "logged in" rather than "recognised".
+  const trust = ["c_user", "xs", "session_id", "sd", "spin"];
+  const gained = trust.filter((n) => after.includes(n) && !before.includes(n));
+  log.info(`  trust markers gained: ${gained.join(", ") || "(none)"}`);
+
+  // The actual question: does the NEW cookie still need the recovery flow?
+  // Walk it the way a real run would and record which recovery hops it had to
+  // take. Landing on the account chooser is NOT a failure - that is the normal
+  // screen a healthy cookie gets, and the run handles it with no login.
+  log.info("Reopening a clean browser with the NEW cookie only…");
+  const probe = await openRowBrowser(args, newCookie);
+  try {
+    const S = screens(probe.page);
+    const hops = [];
+    let form = false;
+    for (let step = 1; step <= 10 && !form; step++) {
+      if (await codePromptVisible(probe.page)) { hops.push("SMS gate"); break; }
+      const here = await waitForScreen(probe.page,
+        [S.passwordForm, S.checkpoint, S.reauth, S.saveLogin, S.continueGate, S.accountChooser, S.hubChangePassword, S.accountHub, S.loggedOut],
+        "the password form", 15_000);
+      if (!here) break;
+      if (here === S.passwordForm) { form = true; break; }
+      if (here === S.loggedOut) { hops.push("logged out (dead cookie)"); break; }
+      if (here === S.checkpoint) { hops.push("checkpoint"); break; }
+      if (here === S.continueGate) {
+        hops.push("Continue");
+        await clickScreenAway(mButton(probe.page, /^Continue$/), S.continueGate, "Continue");
+        continue;
+      }
+      if (here === S.reauth) { hops.push("re-auth password"); await resumeSession(probe.page, currentPw); continue; }
+      if (here === S.saveLogin) {
+        hops.push("Save login");
+        await clickScreenAway(mButton(probe.page, /^Save$/), S.saveLogin, "Save");
+        continue;
+      }
+      if (here === S.accountChooser) { await pickAccount(probe.page); continue; }
+      await here.loc.first().click();
+    }
+    log.info(`recovery hops needed with the new cookie: ${hops.length ? hops.join(" -> ") : "(none)"}`);
+    if (form && !hops.length) {
+      log.success("TRUSTED: straight to the password form, no Continue and no re-auth");
+      if (args.includes("--write-back")) {
+        const bak = writeCookieToSheet(file, row, newCookie);
+        log.success(`Wrote the refreshed cookie to ${path.basename(file)} row ${row} (backup: ${path.basename(bak)})`);
+      } else {
+        log.info("the sheet is unchanged - add --write-back to replace the cookie in place");
+      }
+      return 0;
+    }
+    if (form) {
+      log.warn(`PARTIAL: it reaches the form but still needs ${hops.join(" -> ")}`);
+      log.info("the sheet is unchanged - add --write-back to replace the cookie in place");
+      return 1;
+    }
+    log.error(`NOT TRUSTED: the new cookie never reached the form (${hops.join(" -> ") || "nothing recognised"})`);
+    log.info(`the sheet is unchanged; old fp ${cookieDigest(oldCookie)} still in use`);
+    return 1;
+  } finally {
+    await probe.context.close();
+  }
+}
+
+// ---- Batch / group ----let curFp = "", curXlsx, curRow = 0;
 function resolveRow(file, row) {
   const accounts = readAccounts(file);
   const pick = accounts.find((a) => a.row === row);
@@ -994,9 +1349,14 @@ Usage:
   bun index.js -P <assignedPw> -o <current> --fa2 <k> --xlsx a.xlsx --row 5   # resume
   bun index.js --login <phone>                         # one-time Telegram sign-in
   bun index.js --codegen --xlsx a.xlsx --row 5         # open browser with that row's cookie, pause for inspector
+  bun index.js --codegen --detect --xlsx a.xlsx --row 5   # walk to the form and report what was identified, type nothing
+  bun index.js --check-pw --xlsx a.xlsx --row 5 -o <curPw>   # fill the form, prove the button enables, do NOT submit
+  bun index.js --refresh-cookie --xlsx a.xlsx --row 5 -o <curPw>          # log in once, retest the new cookie, compare
+  bun index.js --refresh-cookie --xlsx a.xlsx --row 5 -o <curPw> --write-back   # ...and save it if it is trusted
 Flags: --xlsx (repeatable/comma/space), --row, --rows f#r,.. (internal), --all,
   -p/--phone, -o/--current-password, -P/--password, --fa2, --per-session N,
-  --plan, --force, --dry-run/--probe, --codegen, --login, --help
+  --plan, --force, --dry-run/--probe, --codegen, --detect, --check-pw,
+  --refresh-cookie, --write-back, --login, --help
 Rule: one bot password covers max ${MAX_REUSE} cookies and retires after 1 success.`);
 }
 
@@ -1011,8 +1371,14 @@ async function main() {
     return;
   }
   const phone = argValue(args, ["--phone", "-p"]) ?? process.env.TG_PHONE;
-  if (args.includes("--codegen")) {
-    try { await runCodegen(args); return; }
+  if (args.includes("--codegen") || args.includes("--check-pw") || args.includes("--refresh-cookie")) {
+    try {
+      if (args.includes("--refresh-cookie")) process.exit(await runRefreshCookie(args));
+      if (args.includes("--check-pw")) process.exit(await runCheckPw(args));
+      if (args.includes("--detect")) process.exit(await runDetect(args));
+      await runCodegen(args);
+      return;
+    }
     catch (e) { if (!(e instanceof BailLogged)) log.error(e?.message ?? e); process.exit(1); }
   }
   const group = parseRows(argValue(args, ["--rows"]));

@@ -6,3 +6,4 @@ node_modules/
 *.har
 *.xlsx
 data/*.xlsx
+*.bak

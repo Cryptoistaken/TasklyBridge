@@ -22,7 +22,11 @@ bun index.js --xlsx data\a.xlsx --all --plan -p <phone>   # grouping only, spend
 bun index.js -P <assignedPw> -o <current> --fa2 <key> --xlsx data\a.xlsx --row 5   # resume
 bun index.js --login <phone>                              # one-time Telegram sign-in
 bun index.js --codegen --xlsx data\a.xlsx --row 5        # open browser with that row's cookie, pause for inspector
+bun index.js --codegen --detect --xlsx data\a.xlsx --row 5   # report which screen is detected, type nothing
+bun index.js --check-pw --xlsx data\a.xlsx --row 5 -o <curPw>   # fill the form, prove the button enables, never submits
 ```
+
+`--detect` walks to the password form and names every screen it hits, typing nothing. `--check-pw` goes one step further: it fills all three fields with a throwaway password and confirms Facebook enables **Change password**, then stops. It never clicks it, so the account password is unchanged. Both need the row's cookie and spend nothing.
 
 Flags: `--row N`, `--force` (retry sent/gated), `--dry-run` (walk + Start, stop before Facebook), `--per-session N` (default 3), `--fa2` (override sheet key).
 
