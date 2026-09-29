@@ -11,8 +11,16 @@ import chalk from "chalk";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
 
-config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// Everything that is not code lives under ./data: the sheets, the Telegram
+// sessions, the credentials, the docs, the archive and the ledgers. One place
+// to look, one rule for gitignore.
+const DATA_DIR = path.join(__dirname, "data");
+const OUT_DIR = path.join(DATA_DIR, "out");
+// Pointed at data/.env explicitly. Bare config() only looks in the CWD, so
+// moving the file into data/ silently emptied the environment - which showed up
+// as "Several sessions exist, pass -p <phone>" rather than as a missing .env.
+config({ path: path.join(DATA_DIR, ".env") });
 
 // ---- Config ----
 const GROUP = process.env.TASK_GROUP ?? "Cookies";
@@ -40,15 +48,27 @@ const DEVICES_PHONE = {
   hasTouch: true,
 };
 
-const PROFILE_DIR = path.join(__dirname, "profile");
+// Ephemeral browser, fresh context, every single run. This used to be
+// launchPersistentContext against a shared ./profile folder, and that was a
+// real bug: clearCookies() clears COOKIES ONLY. localStorage, IndexedDB, cache,
+// service workers and visited links all survived, so leftover state from one
+// account was readable during the next account's run, and every account shared
+// one Chrome client-id / storage fingerprint. Playwright's own guidance for
+// "start from scratch or cleanup in between" says cleanup is easy to forget and
+// some things are impossible to clean up, such as visited links - so the fix
+// is not to clean harder, it is to not share.
+//
+// Rationale and sources: data/doc/profile-reuse.md
+//
+// The old ./profile folder has been deleted - 68MB of shared storage that
+// nothing reads any more.
 const LAUNCH_ARGS = [
   "--disable-blink-features=AutomationControlled",
-  // Chrome's own crash-recovery UI. It is NOT a Playwright concern - the
-  // docs do not mention it - it appears only when the profile was left with
-  // exit_type=Crashed, which a force-kill does. Playwright's guidance for
-  // that is handleSIGINT (default true): close the browser instead of killing
-  // it. This flag just stops the leftover state from interrupting a run.
-  "--hide-crash-restore-bubble",
+  // No --hide-crash-restore-bubble: that existed only because a shared
+  // profile folder could be left with exit_type=Crashed, which produced a
+  // "Restore pages?" bubble over the page being driven. With no folder there
+  // is nothing to be left behind, so the flag and the crash-flag patch it
+  // needed are both gone.
 ];
 
 // navigator.webdriver is still true even with the Blink feature flag off, so
@@ -58,25 +78,6 @@ const LAUNCH_ARGS = [
 const STEALTH_INIT = () => {
   Object.defineProperty(Navigator.prototype, "webdriver", { get: () => false, configurable: true });
 };
-
-// exit_type=Crashed survives in the profile until Chrome next starts, and then
-// every launch opens with a "Restore pages?" bubble over the page we are
-// driving. Clearing it is safe: the worst case is losing a session we did not
-// want restored anyway.
-function clearStaleCrashFlag() {
-  const prefs = path.join(PROFILE_DIR, "Default", "Preferences");
-  if (!fs.existsSync(prefs)) return;
-  try {
-    const j = JSON.parse(fs.readFileSync(prefs, "utf8"));
-    if (j?.profile?.exit_type !== "Crashed") return;
-    j.profile.exit_type = "Normal";
-    j.profile.exited_cleanly = true;
-    fs.writeFileSync(prefs, JSON.stringify(j), "utf8");
-    log.info("Cleared a stale Chrome crash flag left by a previous force-kill");
-  } catch (e) {
-    log.warn(`could not clear the Chrome crash flag: ${e?.message ?? e}`);
-  }
-}
 
 // ---- Log ----
 export const log = {
@@ -140,9 +141,9 @@ export function parseRows(raw) {
 export function fingerprint(cookie) {
   return createHash("sha256").update(cookie.trim()).digest("hex").slice(0, 12);
 }
-const SENT_FILE = path.join(__dirname, "out", "sent.jsonl");
-const SKIP_FILE = path.join(__dirname, "out", "skipped.jsonl");
-const USEDPW_FILE = path.join(__dirname, "out", "used-passwords.json");
+const SENT_FILE = path.join(OUT_DIR, "sent.jsonl");
+const SKIP_FILE = path.join(OUT_DIR, "skipped.jsonl");
+const USEDPW_FILE = path.join(OUT_DIR, "used-passwords.json");
 function readJsonl(file) {
   if (!fs.existsSync(file)) return [];
   return fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean).map((l) => {
@@ -182,7 +183,7 @@ function markPasswordUsed(pw) {
 // ---- Audit (./out/audit-YYYY-MM-DD.jsonl) ----
 function audit(rec) {
   try {
-    const dir = path.join(__dirname, "out");
+    const dir = OUT_DIR;
     fs.mkdirSync(dir, { recursive: true });
     const f = path.join(dir, `audit-${new Date().toISOString().slice(0, 10)}.jsonl`);
     fs.appendFileSync(f, JSON.stringify({ at: new Date().toISOString(), ...rec }) + "\n", "utf8");
@@ -265,8 +266,8 @@ export function parseVerdict(text) {
 // observed arriving in order (three approvals then one rejection), so FIFO is
 // used, and it is recorded as the assumption it is. If it is ever wrong the
 // fix is to put a marker in the sheet, not to guess harder.
-const PENDING_FILE = path.join(__dirname, "out", "pending.json");
-const VERDICTS_FILE = path.join(__dirname, "out", "verdicts.jsonl");
+const PENDING_FILE = path.join(OUT_DIR, "pending.json");
+const VERDICTS_FILE = path.join(OUT_DIR, "verdicts.jsonl");
 // The file arguments exist so --selftest can drive this against a temp dir
 // instead of the real ledgers.
 function loadPending(file = PENDING_FILE) {
@@ -302,11 +303,30 @@ function listVerdicts() {
     .filter((r) => r && r.verdict);
 }
 
-// --check-task: is the job we sell actually listed right now? Walks the real
-// menu and looks. Nothing is started, nothing is spent - but the job list churns
-// within a day, and "absent" is not "free", it means the catalogue must resolve
-// to nothing. Cheaper to find out here than to discover it three presses into a
-// walk.
+// Is the job listed right now? Reuses an already-open connection.
+// Returns {on: true|false|null, ...}. null means "could not tell" and MUST NOT
+// stop a run - only a definitive absence of the job is a reason to stop, because
+// a flaky network is not evidence that the provider delisted anything.
+async function taskAvailability(tg) {
+  try {
+    await tg.obeyRateLimit(await tg.ensureMainMenu());
+    await sleep(STEP_MS);
+    await tg.obeyRateLimit(await tg.press("open Tasks", "Tasks"));
+    await sleep(STEP_MS);
+    const opened = await tg.obeyRateLimit(await tg.press(`open ${GROUP}`, GROUP));
+    if (opened.waited) return { on: null, listed: [], why: "rate limited opening the group" };
+    await sleep(STEP_MS);
+    const all = tg.labels();
+    const listed = all.filter((l) => l.toLowerCase().includes(JOB.toLowerCase()));
+    return { on: listed.length > 0, listed, all };
+  } catch (e) {
+    return { on: null, listed: [], why: e?.message ?? String(e) };
+  }
+}
+
+// --check-task: report the availability of the job we sell. Nothing is started,
+// nothing is spent - but the list churns within a day, and "absent" is not
+// "free", it means the catalogue must resolve to nothing.
 //
 // The price is shown because this is an operator tool, not a user-facing
 // message: it is our cost and the basis of our margin. It is never shown to an
@@ -315,20 +335,19 @@ async function runCheckTask() {
   const phone = argValue(process.argv.slice(2), ["--phone", "-p"]) ?? process.env.TG_PHONE;
   const tg = await Taskly.open({ phone });
   try {
-    await tg.obeyRateLimit(await tg.ensureMainMenu());
-    await sleep(STEP_MS);
-    await tg.obeyRateLimit(await tg.press("open Tasks", "Tasks"));
-    await sleep(STEP_MS);
-    const opened = await tg.obeyRateLimit(await tg.press(`open ${GROUP}`, GROUP));
-    if (opened.waited) { log.warn("Rate limited opening the group - try again in a moment"); return 1; }
-    await sleep(STEP_MS);
-    const listed = tg.labels().filter((l) => l.toLowerCase().includes(JOB.toLowerCase()));
-    log.info(`group "${GROUP}" lists: ${tg.labels().join(" | ") || "(no buttons)"}`);
-    if (!listed.length) {
-      log.error(`OFF: "${JOB}" is not listed under ${GROUP}. Users would see "no jobs available" - that is correct, not a bug.`);
+    const a = await taskAvailability(tg);
+    if (a.on === null) {
+      log.error(`Could not read the job list (${a.why}). Not proof of anything - try again.`);
       return 1;
     }
-    for (const label of listed) {
+    log.info(`group "${GROUP}" lists: ${a.all.join(" | ") || "(no buttons)"}`);
+    if (!a.on) {
+      log.error(`OFF: "${JOB}" is not listed under ${GROUP}. Users would see "no jobs available" - that is correct, not a bug.`);
+      const others = (a.all ?? []).filter((l) => /\$[\d.]+/.test(l) && !l.toLowerCase().includes(GROUP.toLowerCase()));
+      if (others.length) log.info(`listed instead: ${others.join(" | ")}`);
+      return 1;
+    }
+    for (const label of a.listed) {
       const price = label.match(/\$([\d.]+)/)?.[1];
       log.success(`ON: "${label}"`);
       if (price) {
@@ -792,7 +811,10 @@ async function waitForScreen(page, list, what, ms = WAIT_MS) {
 // in both directions: wait on a banned account for ten minutes, or throw away a
 // good one. So read the page and split them.
 const BANNED_WORDS = /your account (has been |was )?(disabled|deactivated)|account disabled|you'?re temporarily blocked|this account (has been |was )?(disabled|deactivated)|violat(ed|ion) of our terms|account is not usable/i;
-const CHALLENGE_WORDS = /confirm your identity|it'?s you|enter your password to confirm|security check|confirm it'?s you|we detected|unusual login|confirm that you'?re human|are you a robot/i;
+// There is deliberately no CHALLENGE_WORDS list. A challenge is the default -
+// classifyCheckpointText returns it for anything that is not a ban - so a list
+// of challenge phrases would be an unreachable second opinion that only looks
+// like it is doing work. It existed once and was never called.
 function isCheckpointUrl(page) {
   return /checkpoint/i.test(page.url());
 }
@@ -1221,10 +1243,13 @@ export async function changePassword({ context, currentPw, newPw, targetUrl, dry
 }
 
 // ---- Telegram ----
-const SESSION_DIR = path.join(__dirname, "sessions");
+// Everything that is not code lives in ./data - the sheets, the Telegram
+// sessions, the credentials and the docs. One place to look, and one rule for
+// gitignore.
+const SESSION_DIR = path.join(DATA_DIR, "sessions");
 function bridgeEnv() {
   const out = {};
-  for (const f of [path.join(__dirname, "..", "Backend", ".env"), path.join(__dirname, ".env")]) {
+  for (const f of [path.join(__dirname, "..", "Backend", ".env"), path.join(DATA_DIR, ".env")]) {
     if (!fs.existsSync(f)) continue;
     for (const line of fs.readFileSync(f, "utf8").split(/\r?\n/)) {
       const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
@@ -1460,22 +1485,19 @@ export function parseCreds(replies) {
   return { firstName: field("first name"), lastName: field("last name"), password: field("password") };
 }
 async function changeFacebook(currentPw, newPw, url, cookieString, dryRun = false) {
-  clearStaleCrashFlag();
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
-    ...DEVICES_PHONE,
-    locale: "en-US",
-    headless: false,
-    channel: "chrome",
-    args: LAUNCH_ARGS,
-  });
+  const browser = await chromium.launch({ headless: false, channel: "chrome", args: LAUNCH_ARGS });
+  const context = await browser.newContext({ ...DEVICES_PHONE, locale: "en-US" });
   try {
     await context.addInitScript(STEALTH_INIT);
-    await context.clearCookies();
+    // No clearCookies(): a fresh context is already empty. Keeping it would
+    // suggest the context carries state, which is the bug this replaced.
     await context.addCookies(parseCookies(cookieString.trim(), process.env.COOKIE_DOMAIN ?? new URL(url).hostname));
     log.success("Cookies loaded");
     return await changePassword({ context, currentPw, newPw, targetUrl: url, dryRun });
   } finally {
-    await context.close();
+    // A non-persistent context does not own the browser: close both.
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
   }
 }
 
@@ -1537,35 +1559,35 @@ async function openRowBrowser(args, cookieOverride) {
   const pick = resolveRow(sheets[0], Number(argValue(args, ["--row"]) ?? "1"));
   const url = resolveUrl();
   const cookie = (cookieOverride ?? pick.cookie).trim();
-  clearStaleCrashFlag();
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
-    ...DEVICES_PHONE,
-    locale: "en-US",
-    headless: false,
-    channel: "chrome",
-    args: LAUNCH_ARGS,
-  });
+  const browser = await chromium.launch({ headless: false, channel: "chrome", args: LAUNCH_ARGS });
+  const context = await browser.newContext({ ...DEVICES_PHONE, locale: "en-US" });
   try {
     await context.addInitScript(STEALTH_INIT);
-    await context.clearCookies();
     await context.addCookies(parseCookies(cookie, process.env.COOKIE_DOMAIN ?? new URL(url).hostname));
     log.success(`${path.basename(sheets[0])}: row ${pick.row} (fp ${fingerprint(pick.cookie)})`);
-    const page = context.pages()[0] ?? (await context.newPage());
+    const page = await context.newPage();
     await page.goto("https://www.facebook.com/", { waitUntil: "load" });
     await page.goto(url, { waitUntil: "load" });
-    return { context, page, url };
+    return { context, page, url, browser };
   } catch (e) {
-    await context.close();
+    await closeAll(browser, context);
     throw e;
   }
 }
+// A non-persistent context does not own the browser, so both must be closed.
+// Getting this wrong leaks a Chrome process, which then holds the old profile
+// lock and breaks the next run.
+async function closeAll(browser, context) {
+  await context?.close().catch(() => {});
+  await browser?.close().catch(() => {});
+}
 async function runCodegen(args) {
-  const { context, page, url } = await openRowBrowser(args);
+  const { context, page, url, browser } = await openRowBrowser(args);
   try {
     log.success(`Opened ${url} - inspect, then close the window`);
     await page.pause();
   } finally {
-    await context.close();
+    await closeAll(browser, context);
   }
 }
 
@@ -1573,9 +1595,12 @@ async function runCodegen(args) {
 // identifies. It clicks navigation tiles only - nothing is typed, nothing is
 // submitted, so the account is untouched. Exit 0 = the form was found.
 async function runDetect(args) {
-  const { context, page } = await openRowBrowser(args);
+  const { context, page, browser } = await openRowBrowser(args);
   const S = screens(page);
   const currentPw = argValue(args, ["--current-password", "-o"]) ?? SHARED_PASSWORD;
+  // Without this the account row is clicked twice: the sheet stays detectable
+  // while it closes, and pickAccount waits long enough to click a stale row.
+  let picked = false;
   try {
     for (let step = 1; step <= 10; step++) {
       if (await codePromptVisible(page)) await bailCodePrompt((await codePromptText(page)) ?? "confirmation code");
@@ -1602,13 +1627,13 @@ async function runDetect(args) {
       if (here === S.continueGate) { await clickScreenAway(mButton(page, /^Continue$/), S.continueGate, "Continue"); continue; }
       if (here === S.reauth) { await resumeSession(page, currentPw); continue; }
       if (here === S.saveLogin) { await clickScreenAway(mButton(page, /^Save$/), S.saveLogin, "Save"); continue; }
-      if (here === S.accountChooser) { await pickAccount(page); continue; }
+      if (here === S.accountChooser) { if (!picked) { await pickAccount(page); picked = true; } continue; }
       await here.loc.first().click();
     }
     log.error("UNKNOWN: 10 steps and no password form");
     return 1;
   } finally {
-    await context.close();
+    await closeAll(browser, context);
   }
 }
 
@@ -1630,7 +1655,7 @@ async function runCheckPw(args) {
   // letters and digits only; the trailing ! supplies the special character.
   const newPw = argValue(args, ["--password", "-P"]) ?? throwawayPassword();
   if (newPw === currentPw) throw new Bail("--check-pw: the throwaway password equals the current one - Facebook disables the button");
-  const { context, page, url } = await openRowBrowser(args);
+  const { context, page, url, browser } = await openRowBrowser(args);
   try {
     const pick = resolveRow(argValues(args, "--xlsx")[0], Number(argValue(args, ["--row"]) ?? "1"));
     log.info(`Filling the form with a throwaway password (${newPw.length} chars). Nothing will be submitted.`);
@@ -1638,7 +1663,7 @@ async function runCheckPw(args) {
     log.info(`row ${pick.row} / fp ${fingerprint(pick.cookie)}`);
     return r.ok ? 0 : 1;
   } finally {
-    await context.close();
+    await closeAll(browser, context);
   }
 }
 
@@ -1684,7 +1709,7 @@ async function runRefreshCookie(args) {
   const oldCookie = pick.cookie.trim();
 
   log.info(`Row ${pick.row}: logging in once to get a trusted cookie (nothing is submitted to Facebook)`);
-  const { context, page } = await openRowBrowser(args);
+  const { context, page, browser } = await openRowBrowser(args);
   let newCookie;
   try {
     // dryRun stops at the enabled button, which is past Save login and on the
@@ -1697,7 +1722,7 @@ async function runRefreshCookie(args) {
     newCookie = jar.map((c) => `${c.name}=${c.value}`).join("; ");
     if (!newCookie) throw new Bail("no .facebook.com cookies came back - nothing to compare");
   } finally {
-    await context.close();
+    await closeAll(browser, context);
   }
 
   const before = cookieNames(oldCookie), after = cookieNames(newCookie);
@@ -1766,7 +1791,7 @@ async function runRefreshCookie(args) {
     log.info(`the sheet is unchanged; old fp ${cookieDigest(oldCookie)} still in use`);
     return 1;
   } finally {
-    await probe.context.close();
+    await closeAll(probe.browser, probe.context);
   }
 }
 
@@ -1933,6 +1958,28 @@ async function runGroup(group, args, phone) {
   if (!runnable.length) { log.success("every row in this group is already sent or gated - nothing to do"); return 0; }
   log.info(`Running ${runnable.length} account(s) on one Telegram session`);
   const tg = await Taskly.open({ phone });
+  // Guard: if the job is not listed there is nothing to sell, so stop before
+  // walking - not three presses into a walk that cannot finish. Reuses the
+  // session we already opened, so it costs one /start and two button presses.
+  //
+  // "Could not tell" is deliberately NOT a stop. A flaky network is not
+  // evidence that the provider delisted anything, and stopping on a guess
+  // would refuse to run on a day the job is perfectly available.
+  if (!args.includes("--skip-task-check")) {
+    const avail = await taskAvailability(tg);
+    if (avail.on === false) {
+      log.error(`The job "${JOB}" is not listed under ${GROUP} right now, so there is nothing to sell.`);
+      log.error("Nothing was spent. Re-check any time with: bun index.js --check-task");
+      const others = (avail.all ?? []).filter((l) => /\$[\d.]+/.test(l) && !l.toLowerCase().includes(GROUP.toLowerCase()));
+      if (others.length) log.info(`listed instead: ${others.join(" | ")}`);
+      await tg.close();
+      return 1;
+    }
+    if (avail.on === null) log.warn(`Could not confirm the job is listed (${avail.why}) - carrying on anyway`);
+    else log.success(`Job is listed: ${avail.listed.join(" | ")}`);
+    // The check leaves us sitting on the job list; the walk expects the menu.
+    await tg.ensureMainMenu();
+  }
   let ok = 0;
   const failed = [];
   // One bot password covers up to MAX_REUSE cookies; a success retires it.
@@ -2110,7 +2157,7 @@ Flags: --xlsx (repeatable/comma/space), --row, --rows f#r,.. (internal), --all,
   -p/--phone, -o/--current-password, -P/--password, --fa2, --per-session N,
   --plan, --force, --dry-run/--probe, --codegen, --detect, --check-pw,
   --refresh-cookie, --write-back, --hold, --selftest, --check-verdicts, --check-task,
-  --no-uid-check, --login, --help
+  --no-uid-check, --skip-task-check, --login, --help
 Rule: one bot password covers max ${MAX_REUSE} cookies and retires after 1 success.`);
 }
 

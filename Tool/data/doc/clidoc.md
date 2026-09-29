@@ -68,6 +68,7 @@ Sheet layout: **column A = cookie, column B = 2FA key.** Row 1 is data, not a he
 | `--force` | Retry rows already in `sent.jsonl` / `skipped.jsonl` |
 | `--dry-run`, `--probe` | Walk to Start, print the credentials, stop before Facebook |
 | `--no-uid-check` | Skip the account-liveness filter |
+| `--skip-task-check` | Don't stop the run when the job is not listed |
 | `--write-back` | With `--refresh-cookie`: save the new cookie into the sheet (makes a `.bak`) |
 | `--hold` | On any unrecognised screen: dump the page and **keep the browser open** |
 
@@ -100,15 +101,15 @@ bun index.js --check-verdicts
 | Path | What |
 | --- | --- |
 | `data/*.xlsx` | The accounts. **Gitignored.** A `.bak` appears beside any sheet written to |
-| `sessions/*.session` | Telegram auth keys. **Gitignored.** A live credential |
-| `profile/` | Chrome profile. **Gitignored** |
-| `out/sent.jsonl` | Rows we submitted and got a receipt for |
-| `out/skipped.jsonl` | Rows never to retry: SMS-gated, dead account, dead cookie |
-| `out/pending.json` | Submitted, verdict not back yet |
-| `out/verdicts.jsonl` | Every verdict, paired to a row by order |
-| `out/audit-<date>.jsonl` | Full four-leg interaction log |
-| `out/used-passwords.json` | Hashed, so a bot password is never reused |
-| `.env` | **Gitignored** |
+| `data/sessions/*.session` | Telegram auth keys. **Gitignored.** A live credential |
+| ~~`profile/`~~ | **Gone.** An ephemeral browser context leaves no profile folder — see `profile-reuse.md` |
+| `data/out/sent.jsonl` | Rows we submitted and got a receipt for |
+| `data/out/skipped.jsonl` | Rows never to retry: SMS-gated, dead account, dead cookie |
+| `data/out/pending.json` | Submitted, verdict not back yet |
+| `data/out/verdicts.jsonl` | Every verdict, paired to a row by order |
+| `data/out/audit-<date>.jsonl` | Full four-leg interaction log |
+| `data/out/used-passwords.json` | Hashed, so a bot password is never reused |
+| `data/.env` | **Gitignored** |
 
 ---
 
@@ -221,7 +222,7 @@ Importable from `index.js`. Exported so they can be tested directly.
 
 | Variable | Meaning |
 | --- | --- |
-| `TG_API_ID`, `TG_API_HASH` | Telegram app credentials. Read from `Backend/.env` or `.env` |
+| `TG_API_ID`, `TG_API_HASH` | Telegram app credentials. Read from `Backend/.env` or `data/.env` |
 | `TG_TARGET` | The provider. Default `tasklyBux_bot` |
 | `TG_PHONE` | Default session to use |
 | `TARGET_URL` | The Facebook page |

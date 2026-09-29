@@ -14,7 +14,7 @@ Four provider replies that used to look like failures, all real (see
 - `Action cancelled.` -> OURS. Confirmation that pressing Cancel cleared a
   modal state. Expected, never a failure.
 - `Report approved, +$0.05` / `Report rejected...` -> the real verdict, up to
-  64 min later and out of band. Recorded to `out/verdicts.jsonl` and matched to
+  64 min later and out of band. Recorded to `data/out/verdicts.jsonl` and matched to
   its row by order. `--check-verdicts` reports it.
 
 1. `/start` raw -> welcome. Buttons must include Balance or Cancel-clear and retry (3x).

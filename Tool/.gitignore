@@ -1,9 +1,50 @@
+# Everything that is not code lives in ./data: the sheets, the Telegram
+# sessions, the credentials and the docs. See index.js DATA_DIR.
+
+# --- Credentials and secrets. Never commit these. ---
 .env
+*.env
+!.env.example
+*.session
+*.key
+*.pem
+secrets/
+
+# --- Live Telegram sessions (MTProto auth keys). A committed session is a
+#     permanent account compromise, so these are ignored by name and by dir.
+Test/sessions/
 sessions/
+data/sessions/
+*.session
+
+# --- Runtime output: audit logs contain real user ids, phone numbers and the
+#     provider's prices. state.json holds who is in which job.
+Backend/out/
+Test/out/
 out/
-profile/
-node_modules/
-*.har
+data/out/
+*.log
+*.jsonl
+
+# --- The account sheets. These are the product; they never go in git. ---
 *.xlsx
 data/*.xlsx
 *.bak
+
+# --- No longer used: an ephemeral browser context leaves no profile folder.
+#     Kept so a stale one can never be re-added by accident.
+profile/
+data/profile/
+
+# --- Build output and dependencies ---
+node_modules/
+dist/
+*.exe
+*.test
+
+# --- Editor noise ---
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store

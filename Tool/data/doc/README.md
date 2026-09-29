@@ -1,6 +1,8 @@
 # Taskly Tool
 
-Single-file submitter: takes accounts from xlsx, checks cookies, gets a bot password, changes the Facebook password, submits key + cookie. Why one file: the old 15-script split is archived in `archive/` and is not maintained.
+Single-file submitter: takes accounts from xlsx, checks cookies, gets a bot password, changes the Facebook password, submits key + cookie. Why one file: the old 15-script split is archived in `data/archive/` and is not maintained.
+
+Everything that is not code lives in `data/`: the sheets, the Telegram sessions, `.env`, the docs and the archive.
 
 ## Setup
 
@@ -8,7 +10,7 @@ Single-file submitter: takes accounts from xlsx, checks cookies, gets a bot pass
 cd Tool
 bun install
 npx playwright install chromium
-copy .env.example .env   # then fill in values
+copy data\.env.example data\.env   # then fill in values
 ```
 
 Put sheets in `data/` (gitignored, never committed).
@@ -39,7 +41,7 @@ Nothing waits a fixed number of seconds for the UI. `waitForAny` polls for the e
 
 ## Two screens that are not the same
 
-A checkpoint is not one thing. Facebook uses `/checkpoint/` both for a **ban** and for an ordinary identity challenge, and guessing wrong is expensive in both directions — waiting ten minutes on a dead account, or discarding a live one. The page text decides: disabled / blocked / violates-our-terms means banned, and the row goes to `out/skipped.jsonl` so it is never retried. Everything else is treated as a challenge, which is the recoverable side.
+A checkpoint is not one thing. Facebook uses `/checkpoint/` both for a **ban** and for an ordinary identity challenge, and guessing wrong is expensive in both directions — waiting ten minutes on a dead account, or discarding a live one. The page text decides: disabled / blocked / violates-our-terms means banned, and the row goes to `data/out/skipped.jsonl` so it is never retried. Everything else is treated as a challenge, which is the recoverable side.
 
 ## The automated-behaviour screen
 
@@ -103,7 +105,7 @@ Four messages that used to be unexplained failures, all captured from 1000 messa
 
 ## The verdict — the receipt is not the result
 
-`Your report has been received! Please wait` is a receipt. The decision arrives unprompted, sometimes in the middle of an unrelated action (7 of 153 Start presses in the captured history). So a permanent listener watches every inbound message and writes each verdict to `out/verdicts.jsonl`, matched to its row through `out/pending.json`.
+`Your report has been received! Please wait` is a receipt. The decision arrives unprompted, sometimes in the middle of an unrelated action (7 of 153 Start presses in the captured history). So a permanent listener watches every inbound message and writes each verdict to `data/out/verdicts.jsonl`, matched to its row through `data/out/pending.json`.
 
 ```
 bun index.js --check-verdicts
@@ -120,9 +122,9 @@ For that reason a rejection saying *account blocked* is **reported but not auto-
 
 ## Password reuse rule
 
-One bot password covers max 3 cookies and retires after 1 success. A gated/dead cookie is recorded in `out/skipped.jsonl` and the same password carries to the next cookie with no new Start. Used passwords are hashed in `out/used-passwords.json`.
+One bot password covers max 3 cookies and retires after 1 success. A gated/dead cookie is recorded in `data/out/skipped.jsonl` and the same password carries to the next cookie with no new Start. Used passwords are hashed in `data/out/used-passwords.json`.
 
-## Ledgers (`out/`)
+## Ledgers (`data/out/`)
 
 `sent.jsonl` = done, `skipped.jsonl` = never retry, `audit-*.jsonl` = replay log. Only cookie fingerprints are stored, never cookies.
 
