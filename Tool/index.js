@@ -25,7 +25,11 @@ config({ path: path.join(DATA_DIR, ".env") });
 // ---- Config ----
 const GROUP = process.env.TASK_GROUP ?? "Cookies";
 const JOB = process.env.TASK_NAME ?? "2FA:Create FB (No mail)";
-const SHARED_PASSWORD = process.env.FB_CURRENT_PASSWORD ?? "dgddigital";
+// Read from .env only. This was once a hardcoded literal fallback, which put a
+// live Facebook password into 15 commits of source. An empty value is not a
+// problem here: the only consumer is the password-change step, which already
+// refuses to run without it (see requirePassword).
+const SHARED_PASSWORD = process.env.FB_CURRENT_PASSWORD ?? "";
 const CRED_WAIT_MS = 5_000;
 const STEP_MS = 1_000;
 const PER_SESSION = 3;
@@ -99,20 +103,75 @@ const STEALTH_INIT = () => {
 };
 
 // ---- Log ----
+//
+// Every line goes to the console AND to a file. The console is what you watch;
+// the file is what you still have tomorrow.
+//
+// That matters more than it sounds for this tool. A run is ~16 hours and dies in
+// a terminal scrollback: the evidence of what a verdict actually said, what a
+// rate limit demanded, or which account was half-used is gone the moment the
+// window closes, and the one thing that cannot be reconstructed afterwards is
+// what the provider said.
+//
+// One file per process, named for the command and the pid, because runBatch
+// spawns a child per group and 47 children writing one shared file interleave
+// into something unreadable - the same shape of bug as the old shared
+// pending.json. Separate files cannot interleave.
+//
+// Appended, never truncated: a file from this morning is still valid evidence.
+// NEVER any credential - cookies and 2FA keys are the reason this file is safe
+// to keep at all, and audit() already refuses to record them.
+const LOG_DIR = path.join(DATA_DIR, "out", "logs");
+const logStream = (() => {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    // A short name, so the file is identifiable: what was run, on which session.
+    const cmd = (process.argv.slice(2).find((a) => !a.startsWith("-")) ?? "run").replace(/[^\w.-]/g, "");
+    const sess = process.env.TG_PHONE ? `-${process.env.TG_PHONE.slice(-4)}` : "";
+    const file = path.join(LOG_DIR, `${stamp}-${cmd}${sess}-${process.pid}.log`);
+    // 'a' so an existing file is never emptied, which is what a crash mid-write
+    // followed by a restart would otherwise cause.
+    const fd = fs.openSync(file, "a");
+    return { file, fd };
+  } catch {
+    // A log that cannot be opened must NEVER stop a run. Console still works.
+    return null;
+  }
+})();
+
+// Anything that could be a credential is refused here, not at each call site.
+// A cookie is name=value pairs; a 2FA key is a block of base32. Both are
+// already kept out of audit(), and this is the belt to that braces.
+const SECRETISH = /\b(c_user=|datr=|xs=|sb=|fr=|pas=|wd=|ps_l=)|(^|\s)([A-Z2-7]{4}\s){4,}[A-Z2-7]{4}\b/i;
+function toFile(level, m) {
+  if (!logStream) return;
+  try {
+    const text = String(m ?? "").replace(/\s+/g, " ").trim();
+    // The label is kept, the message is dropped, so a leak can never land in the
+    // file even if a caller passes something it should not have.
+    fs.writeSync(logStream.fd, `${new Date().toISOString()} ${level} ${SECRETISH.test(text) ? "[redacted: looked like a credential]" : text}\n`);
+  } catch { /* never fail a run over a log line */ }
+}
+
+const emit = (label, level, m) => {
+  console.log(chalk.blue(label), chalk.white(m));
+  toFile(level, m);
+};
 export const log = {
-  info: (m) => console.log(chalk.blue("INFO"), chalk.white(m)),
-  success: (m) => console.log(chalk.green("SUCCESS"), chalk.white(m)),
-  error: (m) => console.log(chalk.red("ERROR"), chalk.white(m)),
-  warn: (m) => console.log(chalk.yellow("WARN"), chalk.white(m)),
+  info: (m) => emit("INFO", "INFO", m),
+  success: (m) => emit("SUCCESS", "OK", m),
+  error: (m) => emit("ERROR", "ERROR", m),
+  warn: (m) => emit("WARN", "WARN", m),
   // Off unless TOOL_DEBUG is set, so the per-tick wait tracing does not drown
   // the run by default.
-  debug: (m) => { if (process.env.TOOL_DEBUG) console.log(chalk.gray("DEBUG"), chalk.gray(m)); },
+  debug: (m) => { if (process.env.TOOL_DEBUG) { console.log(chalk.gray("DEBUG"), chalk.gray(m)); toFile("DEBUG", m); } },
 };
 const tlog = {
-  info: (m) => console.log(chalk.blue("TG"), chalk.white(m)),
-  ok: (m) => console.log(chalk.green("TG"), chalk.white(m)),
-  err: (m) => console.log(chalk.red("TG"), chalk.white(m)),
-  raw: (m) => { if (process.env.TOOL_DEBUG) console.log(chalk.gray("TG"), chalk.gray(m)); },
+  info: (m) => emit("TG", "INFO", m),
+  ok: (m) => emit("TG", "OK", m),
+  err: (m) => emit("TG", "ERROR", m),
+  raw: (m) => { if (process.env.TOOL_DEBUG) { console.log(chalk.gray("TG"), chalk.gray(m)); toFile("DEBUG", m); } },
 };
 const T0 = Date.now();
 const elapsed = () => `${((Date.now() - T0) / 1000).toFixed(1)}s`;
@@ -160,43 +219,97 @@ export function parseRows(raw) {
 export function fingerprint(cookie) {
   return createHash("sha256").update(cookie.trim()).digest("hex").slice(0, 12);
 }
+// ---- The ledger: Postgres, not files ----
+//
+// These were JSON files (sent.jsonl, skipped.jsonl, used-passwords.json,
+// pending.json) and that is precisely what stopped several processes running at
+// once. pending.json in particular was read-modify-write: two processes each
+// read the queue, each appended a row, and the second write erased the first
+// one's row. That is the 38-vs-37 verdict bug one level down, except it loses
+// submissions rather than mis-filing them.
+//
+// The same names are kept on purpose: the call sites are unchanged, so the diff
+// is the storage and not a rewrite. Reads stay SYNCHRONOUS off a set loaded once
+// at startup, because they sit inside a .filter() and a per-row loop; a database
+// round trip per row would be slower and no safer. Writes go to Postgres
+// immediately, because that is where the correctness is.
+const ledgerDb = { sent: new Set(), skipped: new Set(), ready: false };
+
+// Called once before any row is touched. Also ADOPTS the old JSON ledgers, so
+// the accounts already sent and the ones already known dead carry over instead
+// of being offered for sale a second time.
+export async function ledgerLoad({ adopt = true } = {}) {
+  const db = await import("./db.js");
+  await db.migrate();
+  const known = await db.sheetKnown();
+  ledgerDb.sent = known.sent;
+  ledgerDb.skipped = known.skipped;
+
+  // The legacy jsonl files are UNIONED into the in-memory sets, always.
+  //
+  // This is not belt-and-braces, it is the thing that stops accounts being sold
+  // twice. markSheetSent is an UPDATE by fingerprint, so for the ~67 accounts
+  // sent BEFORE this table existed it matches nothing and silently records
+  // nothing - the row is simply not there. Relying on the database alone would
+  // therefore report every one of those accounts as never sent, and the very
+  // next run would submit all of them again.
+  const legacySent = readJsonl(SENT_FILE);
+  const legacySkip = readJsonl(SKIP_FILE);
+  let fromDb = ledgerDb.sent.size;
+  for (const r of legacySent) ledgerDb.sent.add(r.fp);
+  for (const r of legacySkip) ledgerDb.skipped.add(r.fp);
+
+  // Best-effort copy into the database for a future run's benefit. Never fatal:
+  // the in-memory union above is already correct on its own, and a failure here
+  // must not stop accounts being submitted.
+  if (adopt) {
+    for (const r of legacySent) {
+      await db.markSheetSent(r.fp, r.phone ?? "", r.source, r.row).catch(() => {});
+    }
+    for (const r of legacySkip) {
+      await db.markSheetSkipped(r.fp, r.reason ?? "adopted from skipped.jsonl", r.source, r.row).catch(() => {});
+    }
+  }
+  ledgerDb.ready = true;
+  return { sent: ledgerDb.sent.size, skipped: ledgerDb.skipped.size, fromDb, legacy: legacySent.length + legacySkip.length };
+}
+
+const isSent = (fp) => ledgerDb.sent.has(fp);
+const isSkipped = (fp) => ledgerDb.skipped.has(fp);
+
+// Await these. Fire-and-forget would reintroduce exactly the bug the database
+// removed: the process could exit with the write still in flight.
+async function markSent(rec) {
+  ledgerDb.sent.add(rec.fp);
+  const db = await import("./db.js");
+  await db.markSheetSent(rec.fp, rec.phone ?? "", rec.source, rec.row);
+}
+async function markSkipped(rec) {
+  if (ledgerDb.skipped.has(rec.fp)) return;
+  ledgerDb.skipped.add(rec.fp);
+  const db = await import("./db.js");
+  await db.markSheetSkipped(rec.fp, rec.reason ?? "", rec.source, rec.row);
+}
+
+// The old JSON ledgers. Still read, never written: ledgerLoad() adopts them into
+// Postgres once so nothing already sent or already dead is offered for sale
+// again. Delete them only after a run has completed with the database ledger.
 const SENT_FILE = path.join(OUT_DIR, "sent.jsonl");
 const SKIP_FILE = path.join(OUT_DIR, "skipped.jsonl");
-const USEDPW_FILE = path.join(OUT_DIR, "used-passwords.json");
 function readJsonl(file) {
   if (!fs.existsSync(file)) return [];
   return fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean).map((l) => {
     try { return JSON.parse(l); } catch { return null; }
   }).filter((r) => !!r?.fp);
 }
-const listSent = () => readJsonl(SENT_FILE);
-const isSent = (fp) => listSent().some((r) => r.fp === fp);
-function markSent(rec) {
-  fs.mkdirSync(path.dirname(SENT_FILE), { recursive: true });
-  fs.appendFileSync(SENT_FILE, JSON.stringify({ at: new Date().toISOString(), ...rec }) + "\n", "utf8");
-}
-const listSkipped = () => readJsonl(SKIP_FILE);
-const isSkipped = (fp) => listSkipped().some((r) => r.fp === fp);
-function markSkipped(rec) {
-  if (isSkipped(rec.fp)) return;
-  fs.mkdirSync(path.dirname(SKIP_FILE), { recursive: true });
-  fs.appendFileSync(SKIP_FILE, JSON.stringify({ at: new Date().toISOString(), ...rec }) + "\n", "utf8");
-}
 const hashPw = (pw) => createHash("sha256").update(String(pw)).digest("hex");
-function listUsedPw() {
-  try {
-    const a = JSON.parse(fs.readFileSync(USEDPW_FILE, "utf8"));
-    return Array.isArray(a) ? a : [];
-  } catch { return []; }
-}
-const isPasswordUsed = (pw) => listUsedPw().includes(hashPw(pw));
-function markPasswordUsed(pw) {
-  const h = hashPw(pw);
-  const l = listUsedPw();
-  if (l.includes(h)) return;
-  l.push(h);
-  fs.mkdirSync(path.dirname(USEDPW_FILE), { recursive: true });
-  fs.writeFileSync(USEDPW_FILE, JSON.stringify(l, null, 1), "utf8");
+// A CLAIM, not a check. isPasswordUsed() followed by markPasswordUsed() was a
+// race: two processes could both see a password as free and both apply it to a
+// Facebook account. The primary key on used_passwords decides it instead.
+const isPasswordUsed = async (pw) => (await import("./db.js")).passwordClaimed(hashPw(pw));
+async function markPasswordUsed(pw) {
+  const db = await import("./db.js");
+  if (!(await db.claimPassword(hashPw(pw)))) throw new Error("that password is already in use on another account");
 }
 
 // ---- Audit (./out/audit-YYYY-MM-DD.jsonl) ----
@@ -218,6 +331,21 @@ const preview = (t, n = 300) => String(t ?? "").replace(/\s+/g, " ").slice(0, n)
 // It REPLACES the reply we were waiting for, so the account was still there and
 // we gave up on it for nothing. It states the wait, so there is nothing to guess.
 const RATE_LIMIT = /too often\.?\s*please wait\s*(\d+)\s*sec/i;
+
+// Telegram's OWN flood limit, which is a completely different message thrown by
+// the library rather than sent by the provider:
+//   "A wait of 705 seconds is required (caused by messages.SendMessage)"
+// It arrives as an exception from sendMessage, so it was never seen by
+// rateLimitSeconds() and every call site treated it as an ordinary failure. The
+// run that hit this burned 66 accounts: the provider's polite "please wait" was
+// caught, Telegram's hard flood was not. Both are a stop.
+const TG_FLOOD = /a wait of (\d+) seconds is required/i;
+
+// Exit codes. 75 is EX_TEMPFAIL, and it means exactly that: the work is fine,
+// the provider is not ready, come back later. The batch parent keys on it to
+// stop spawning instead of feeding the rest of the queue into the same wall.
+const EXIT_RATE_LIMITED = 75;
+const floodWaitSeconds = (e) => Number(String(e?.message ?? e ?? "").match(TG_FLOOD)?.[1] ?? 0) || 0;
 
 // "Time's up! Task cancelled."  (seen 4 times)
 // The PROVIDER's own timer, not ours, and how long it allows has been observed
@@ -298,10 +426,19 @@ export function parseVerdict(text) {
 // So every entry records the session it went out on, and a verdict only ever
 // claims an entry from its OWN session. If that session has nothing waiting, the
 // verdict is recorded unmatched rather than consuming somebody else's row.
+// The verdict pairing now lives in Postgres (db.js bindSheetVerdict), which is
+// where it can be made safe for several processes at once. savePending() wrote
+// the WHOLE queue back on every single change, so two processes each read the
+// queue and each appended one row, and the second write erased the first one's
+// submission. That is this file's whole remaining purpose: kept only so
+// --selftest can drive the pure pairing logic against a temp dir, and as the
+// one-time source for adopting pending.json into the database.
+//
+// Nothing on the live path calls it. The verdict watcher goes through the db sink
+// (Taskly.open({verdictSink: "db"})), which calls bindVerdict/bindSheetVerdict -
+// both single-statement, both SKIP LOCKED, both scoped to their own session.
 const PENDING_FILE = path.join(OUT_DIR, "pending.json");
 const VERDICTS_FILE = path.join(OUT_DIR, "verdicts.jsonl");
-// The file arguments exist so --selftest can drive this against a temp dir
-// instead of the real ledgers.
 function loadPending(file = PENDING_FILE) {
   try {
     const a = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -312,23 +449,29 @@ function savePending(list, file = PENDING_FILE) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(list, null, 1), "utf8");
 }
-// Called the moment the provider acknowledges a report.
-function noteSubmission({ fp, source, row, phone = null }, file = PENDING_FILE) {
-  const list = loadPending(file);
-  list.push({ at: new Date().toISOString(), fp, source, row, phone });
-  savePending(list, file);
-  return list.length;
+// The moment the provider acknowledges a report. Now a single INSERT ... ON
+// CONFLICT DO NOTHING against sheet_rows: same "called exactly once per report"
+// contract, but the duplicate check is the primary key rather than a hopeful read.
+async function noteSubmission({ fp, source, row, phone = null }, file = null) {
+  // A file argument means --selftest, which drives the pairing logic in a temp
+  // dir and must not touch the real database. No argument means the live path.
+  if (file) {
+    const list = loadPending(file);
+    list.push({ at: new Date().toISOString(), fp, source, row, phone });
+    savePending(list, file);
+    return list.length;
+  }
+  const db = await import("./db.js");
+  await db.markSheetSent(fp, phone ?? "", source, row);
+  return fp;
 }
-// phone is the session the verdict arrived on. Without it this shifts the
-// globally-oldest entry, which is how a verdict got filed against the wrong
-// sheet. Entries with no phone (written before this change) are only claimable
-// when there is nothing else, and never by a different session's verdict.
+// phone is the session the verdict arrived on, and the pairing is db.js's
+// problem now - see the note above. This function survives for the legacy jsonl
+// sink and for the selftest; the db sink never comes through here.
 function recordVerdict(v, phone = null, pendingFile = PENDING_FILE, verdictsFile = VERDICTS_FILE) {
   const list = loadPending(pendingFile);
   let idx = -1;
   if (phone) idx = list.findIndex((e) => e.phone === phone);
-  // No entry for this session. Do NOT fall back to another session's row -
-  // consuming it would silently reassign a real submission. Record and move on.
   const claim = idx === -1 ? null : list.splice(idx, 1)[0];
   if (idx !== -1) savePending(list, pendingFile);
   const rec = { at: new Date().toISOString(), ...v, session: phone, claim, matched: !!claim };
@@ -344,9 +487,18 @@ function listVerdicts() {
 }
 
 // Is the job listed right now? Reuses an already-open connection.
-// Returns {on: true|false|null, ...}. null means "could not tell" and MUST NOT
-// stop a run - only a definitive absence of the job is a reason to stop, because
-// a flaky network is not evidence that the provider delisted anything.
+// Returns {on: true|false|null, rateLimited, waitSec, ...}.
+//
+// null means "could not tell" and MUST NOT stop a run - only a definitive
+// absence of the job is a reason to stop, because a flaky network is not
+// evidence that the provider delisted anything.
+//
+// A RATE LIMIT is a different animal entirely and used to be filed as `on: null`
+// with the same "carrying on anyway" treatment. That cost 66 accounts in one
+// minute: the provider said "wait 705 seconds", the child carried on into it,
+// died on its very next send, and the parent spawned the next 22 groups into
+// the same wall. `rateLimited` is now its own field so it can never again be
+// mistaken for uncertainty - it is a definite STOP, carrying the exact wait.
 async function taskAvailability(tg) {
   try {
     await tg.obeyRateLimit(await tg.ensureMainMenu());
@@ -354,7 +506,7 @@ async function taskAvailability(tg) {
     await tg.obeyRateLimit(await tg.press("open Tasks", "Tasks"));
     await sleep(STEP_MS);
     const opened = await tg.obeyRateLimit(await tg.press(`open ${GROUP}`, GROUP));
-    if (opened.waited) return { on: null, listed: [], why: "rate limited opening the group" };
+    if (opened.waited) return { on: null, rateLimited: true, waitSec: opened.waited, listed: [], why: "rate limited opening the group" };
     await sleep(STEP_MS);
     const all = tg.labels();
     const listed = all.filter((l) => l.toLowerCase().includes(JOB.toLowerCase()));
@@ -415,17 +567,28 @@ function readSellPrice() {
 }
 
 // --check-verdicts: what actually happened to everything we sent.
-function checkVerdicts() {
+//
+// The counts here come from verdicts.jsonl and sent.jsonl, and BOTH are frozen:
+// the live writes go to postgres, so these files stopped moving at 07:17 and
+// reported 67 sent when the ledger already held 69. Printing a stale number as
+// though it were current is worse than printing nothing - it looks authoritative.
+//
+// So the ledger is asked instead, and the file is only used for the per-report
+// rejection detail it uniquely holds. Anything countable is counted in one place.
+//
+// For the count that actually decides whether this business works, use
+// --count-from-chat: it reads the provider's own words and needs no pairing at
+// all. It is what proved 2fa43 was 38 approved, not 37.
+async function checkVerdicts() {
   const v = listVerdicts();
-  const pending = loadPending();
   const approved = v.filter((r) => r.verdict === "approved");
   const rejected = v.filter((r) => r.verdict === "rejected");
   const unmatched = v.filter((r) => !r.matched);
+  log.warn("verdicts.jsonl has been frozen since the ledger moved to postgres - these counts are HISTORICAL.");
   log.info(`verdicts recorded : ${v.length}`);
   log.info(`  approved        : ${approved.length}  ${approved.reduce((s, r) => s + Number(r.amount ?? 0), 0).toFixed(4)}`);
   log.info(`  rejected        : ${rejected.length}`);
   log.info(`  unmatched       : ${unmatched.length}${unmatched.length ? " - more verdicts than submissions, the queue was empty" : ""}`);
-  log.info(`  awaiting verdict: ${pending.length}`);
   for (const r of rejected) {
     const who = r.claim ? `${path.basename(r.claim.source ?? "")}:${r.claim.row ?? "?"} (fp ${r.claim.fp})` : "UNMATCHED";
     log.warn(`rejected: ${who}  ${r.accountBlocked ? "[says ACCOUNT BLOCKED] " : ""}${(r.reason ?? "").slice(0, 90)}`);
@@ -436,8 +599,17 @@ function checkVerdicts() {
     log.info("They are NOT auto-skipped: the pairing is FIFO, and a wrong pairing would skip a good account.");
     log.info("Fingerprints: " + blocked.map((r) => r.claim.fp).join(", "));
   }
-  const sent = fs.existsSync(SENT_FILE) ? readJsonl(SENT_FILE).length : 0;
-  log.info(`sent.jsonl says ${sent} sent. ${sent - rejected.length} of those are not known to be rejected.`);
+  // The live numbers, from the one place that is still being written.
+  const dbm = await import("./db.js");
+  try {
+    const c = await dbm.sheetCounts();
+    log.success(`LIVE ledger: ${c.inflight} awaiting a verdict, ${c.approved} approved, ${c.rejected} rejected, ${c.queued} queued`);
+  } catch {
+    log.warn("Could not reach the ledger - the live counts above are unavailable.");
+  } finally {
+    await dbm.closeDb();
+  }
+  log.info("For the count you should trust: bun index.js --count-from-chat");
   return 0;
 }
 
@@ -1014,46 +1186,62 @@ async function selftest() {
     const got = classifyCheckpointText(t);
     if (got !== "challenge") { log.error(`selftest: should be a challenge, got ${got}: "${t}"`); bad++; }
   }
-  // The user-facing bot's own rules, exercised without Telegram. Pinned because
-  // the message style is a requirement, not a preference: inline keyboards only,
-  // no emoji beyond the two that carry meaning, and nothing that runs long.
-  const { parseSubmission: parseSub, text: botText, kb: botKb } = await import("./bot.js");
-  // Must clear the 200-char floor the parser enforces, or every case below would
-  // fail as "not-a-cookie" and the real rules would go untested. Real cookies run
-  // 900+; this is just long enough to be realistic.
-  const C = ("datr=SYNTHETICabc123456; sb=SYNTHETICdef456789; c_user=100000000000001; fr=SYNTHETICghi789012; " +
-    "xs=SYNTHETICjkl012mno345678; pas=100000000000001%3AABCDEFGHIJKLMNOP; ps_l=1; ps_n=1; wd=491x675; dpr=2.2; " +
-    "x-referer=eyJyIjoiL21yZWN0IiwicmMiOiJodHRwczovL2wuZmFjZWJvb2suY29tL3dyaXRlLzEiLCJkIjoiaGFrZXIifQ%3D%3D");
-  const K = "LO4E WXSP MGT4 MJMU PMGM NBIL QLR6 E332";
-  for (const [got, want, what] of [
-    [parseSub(C + "\n" + K).ok, true, "two-line submission"],
-    [parseSub(C + "\t" + K).ok, true, "tab-pasted submission"],
-    [parseSub(K + "\n" + C).why, "not-a-cookie", "key sent first"],
-    [parseSub(C).why, "format", "cookie only"],
-    [parseSub("").why, "empty", "empty message"],
-    [parseSub("datr=x\n" + K).why, "not-a-cookie", "truncated cookie"],
-    [parseSub(C + "\nshort").why, "bad-key", "bad 2FA key"],
+  // The user-facing Telegram bot is ARCHIVED, not deleted: data/archive/bot/bot.js,
+  // with data/archive/bot/WHY-archived.md explaining the decision.
+  //
+  // The checks that used to live here - its message style, its inline keyboards and
+  // its submission parser - are GONE WITH IT, deliberately. They guarded a surface
+  // that no longer exists, and keeping them would mean importing a file out of an
+  // archive, so a routine `bun index.js --selftest` would depend on code nobody runs
+  // and that a well-meaning cleanup would delete as dead.
+  //
+  // What replaced them is the opposite check: that the bot really is unreachable
+  // from the live path. A bot that comes back by accident - wired to a token and a
+  // database - is a far worse failure than one that is merely absent.
+  if (!fs.existsSync(path.join(DATA_DIR, "archive", "bot", "bot.js"))) {
+    log.error("selftest: the archived bot is gone from data/archive/bot/ - it was deleted rather than archived"); bad++;
+  }
+  if (fs.existsSync(path.join(__dirname, "bot.js"))) {
+    log.error("selftest: bot.js is back at the project root - it was archived deliberately (see data/archive/bot/WHY-archived.md)"); bad++;
+  }
+  // Nothing on the live path may import it. One stray import is how an archived
+  // component comes back to life. Comments are stripped first, because every
+  // explanation of this decision quotes the file name.
+  const liveSrc = fs.readFileSync(path.join(__dirname, "index.js"), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  if (/(?:from|import)\s*\(?\s*["'][^"']*\bbot\.js\b/.test(liveSrc)) {
+    log.error("selftest: index.js still imports the archived bot - the live path must not depend on it"); bad++;
+  }
+  log.info("selftest: the user-facing bot is archived under data/archive/bot/ and nothing on the live path imports it");
+  // The payout rule, pinned. This is money, so every branch is asserted rather
+  // than assumed: the cap binds above 0.050, the 19% holds below it, and a
+  // missing price or rate must yield nothing rather than an invented number.
+  for (const [price, wantUser, wantUs] of [
+    [0.050, 5.00, 1.15],   // the headline: 5 tk, we keep 19%
+    [0.070, 5.00, 3.61],   // price ROSE - the cap holds, the extra is ours
+    [0.048, 4.80, 1.10],   // price DROPPED - our cut stays 19%
+    [0.040, 4.00, 0.92],
+    [0.020, 2.00, 0.46],
   ]) {
-    if (got !== want) { log.error(`selftest: bot parse - ${what} gave ${got}, wanted ${want}`); bad++; }
+    const r = payoutBkt(price, 123.0);
+    if (r.user !== wantUser || Math.abs(r.us - wantUs) > 0.01) {
+      log.error("selftest: payout at " + price + " gave user " + r.user + " us " + r.us + ", wanted " + wantUser + "/" + wantUs);
+      bad++;
+    }
   }
-  const botMsgs = [botText.start(), botText.prompt(), botText.badFormat(), botText.notACookie(), botText.badKey(),
-    botText.accepted(1), botText.duplicate(), botText.cancelled(), botText.idle(),
-    botText.status({ queued: 1, inflight: 1, approved: 1, rejected: 1 })];
-  const strayEmoji = [...new Set(botMsgs.join("\n").match(/\p{Extended_Pictographic}/gu) ?? [])]
-    .filter((e) => !["✅", "❌", "▸"].includes(e));
-  if (strayEmoji.length) { log.error(`selftest: bot uses emoji it should not: ${strayEmoji.join(" ")}`); bad++; }
-  const longest = Math.max(...botMsgs.map((m) => m.length));
-  if (longest > 90) { log.error(`selftest: a bot message runs to ${longest} chars - too long`); bad++; }
-  if (!Object.values(botKb).every((f) => f().rows?.length)) { log.error("selftest: a bot keyboard has no rows"); bad++; }
-  // /start is the only command. If a user never types anything they must still be
-  // able to reach submit and status, so both have to be buttons.
-  const { BUTTONS: botButtons } = await import("./bot.js");
-  const targets = new Set(Object.values(botButtons).flat().map(([, d]) => d));
-  for (const need of ["submit", "status", "menu"]) {
-    if (!targets.has(need)) { log.error(`selftest: no inline button reaches "${need}" - the user would have to type a command`); bad++; }
+  // Never negative, whatever the price. A payout larger than the revenue is the
+  // one arithmetic error that actually costs money.
+  for (const price of [0.001, 0.01, 0.05, 1, 100]) {
+    const r = payoutBkt(price, 123.0);
+    if (r.us < 0 || r.user < 0) { log.error("selftest: payout at " + price + " went negative"); bad++; }
+    if (r.user > MAX_USER_BKT + 1e-9) { log.error("selftest: payout exceeded the cap at " + price); bad++; }
   }
-  if (botText.start().includes("/")) { log.error("selftest: the /start reply advertises a command"); bad++; }
-  log.info(`selftest: bot parse, style and keyboards checked (longest ${longest} chars, no stray emoji, buttons reach submit/status/menu)`);
+  // A missing rate or price must STOP a payout, never guess one.
+  for (const [p, rate] of [[0.05, 0], [0.05, null], [0, 123], [null, 123]]) {
+    if (payoutBkt(p, rate).user !== 0) { log.error("selftest: payout(" + p + ", " + rate + ") invented a number instead of refusing"); bad++; }
+  }
+  if (OUR_CUT !== 0.19) { log.error("selftest: our cut is " + OUR_CUT + ", wanted 0.19"); bad++; }
+  log.info("selftest: payout rule pinned (cap " + MAX_USER_BKT + " BKT, our cut " + (OUR_CUT * 100) + "%, never negative, refuses a missing rate)");
   log.info(`selftest: ${banned.length + challenge.length} checkpoint wordings checked`);
   // loggedOut has to fire on the wording m.facebook.com really serves, and must
   // NOT fire on a re-auth form. Both real wordings, pinned.
@@ -1096,6 +1284,192 @@ async function selftest() {
     const got = rateLimitSeconds([text]);
     if (got !== want) { log.error(`selftest: rate limit "${text}" gave ${got}, wanted ${want}`); bad++; }
   }
+  // THE BUG THAT LOST AN ACCOUNT. obeyRateLimit returns {replies, waited}, and
+  // an object is always truthy, so `if (await obey(...)) continue;` fired on
+  // every row: the Facebook password was changed, the 2FA key sent, the
+  // cookie never sent, and the row reported as "0 passed, 0 failed". No error,
+  // no record, no way to tell it had happened.
+  //
+  // A browser-free test is the only kind that can catch this, so the check is
+  // static: every branch on obeyRateLimit's result must read .waited. It fails
+  // on the old source, which is the point - the parser tests below all passed
+  // while the tool was losing accounts.
+  // The bad shape is `if (await f(x))` - the if's closing paren sits IMMEDIATELY
+  // after the call's, with nothing in between. A correct branch always has
+  // `.waited` there, so requiring the two parens to be adjacent is what
+  // separates them without a parser.
+  const obeyBranches = [...fs.readFileSync(path.join(__dirname, "index.js"), "utf8")
+    .matchAll(/if\s*\(\s*await\s+[\w.]+\.obeyRateLimit\([^()]*\)\s*\)/g)]
+    .map((m) => m[0]);
+  if (obeyBranches.length) {
+    for (const src of obeyBranches) log.error(`selftest: branches on the object, not .waited - the cookie is skipped: ${src}`);
+    bad += obeyBranches.length;
+  }
+  // The trap itself, so the reason is on the record and not just the symptom.
+  // The predicate the call sites now consume must be truthy ONLY when the
+  // provider really did say to wait - a clean reply has to fall through, or the
+  // row is skipped and the cookie is never sent.
+  for (const [text, want] of [["Bot gave: Deborah Hopkins / password 10 chars", false], ["You are making requests too often. Please wait 9 sec.", true]]) {
+    const got = !!({ replies: [text], waited: rateLimitSeconds([text]) }).waited;
+    if (got !== want) { log.error(`selftest: obeyRateLimit branch for "${text}" was ${got}, wanted ${want}`); bad++; }
+  }
+  log.info("selftest: every obeyRateLimit branch reads .waited, so the cookie is no longer skipped");
+
+  // THE BUG THAT COST 66 ACCOUNTS IN ONE MINUTE. The provider said "wait 705
+  // seconds", it was filed as `on: null` - the same value as "could not tell" -
+  // and the child carried on into it. Telegram's OWN flood limit
+  // ("A wait of 705 seconds is required") was a thrown error that no call site
+  // recognised at all. The parent had no circuit breaker, so it spawned the next
+  // 22 groups into the same wall. Three separate holes, so three checks.
+  // STATIC-CHECKS-BEGIN
+  for (const [text, want] of [
+    ["A wait of 705 seconds is required (caused by messages.SendMessage)", 705],
+    ["A wait of 9 seconds is required (caused by messages.SendMessage)", 9],
+    ["FLOOD_WAIT_705", 0],
+    ["Your report has been received! Please wait.", 0],
+  ]) {
+    const got = floodWaitSeconds(new Error(text));
+    if (got !== want) { log.error(`selftest: telegram flood "${text}" gave ${got}s, wanted ${want}`); bad++; }
+  }
+  // The provider's own polite limit and Telegram's hard flood are different
+  // messages from different layers. Neither may be read as the other, or one of
+  // them keeps being invisible.
+  if (rateLimitSeconds(["A wait of 705 seconds is required (caused by messages.SendMessage)"]) !== 0) {
+    log.error("selftest: telegram's flood wait was read as the provider's rate limit"); bad++;
+  }
+  if (floodWaitSeconds(new Error("You are making requests too often. Please wait 9 sec.")) !== 0) {
+    log.error("selftest: the provider's rate limit was read as a telegram flood wait"); bad++;
+  }
+  // The batch parent MUST branch on the rate-limit exit code. A parent that only
+  // records the failure is what turned one rate limit into 22 dead groups.
+  //
+  // These greps run against the file with THIS BLOCK REMOVED. Without that they
+  // are vacuous: each pattern is written literally in this function, so
+  // `src.includes(needle)` finds the test itself and passes for ever. Two of
+  // these three did exactly that and were caught only because the fix was
+  // reverted and the selftest still reported "passed".
+  //
+  // The markers are assembled from parts for the same reason one level down: any
+  // line that merely TALKS ABOUT the closing marker - a comment, a log line -
+  // still contains it, and a plain indexOf finds that first and slices the region
+  // in the wrong place. That happened twice here, and it failed silently both
+  // times: the selftest reported "passed" while checking nothing. So nothing
+  // above this line may spell either marker out in full.
+  const MARK_A = ["STATIC", "CHECKS", "BEGIN"].join("-");
+  const MARK_B = ["STATIC", "CHECKS", "END"].join("-");
+  const srcAll = fs.readFileSync(path.join(__dirname, "index.js"), "utf8");
+  const b = srcAll.indexOf(MARK_A), e = srcAll.indexOf(MARK_B);
+  if (b === -1 || e === -1 || e < b) { log.error("selftest: the static-check block is not delimited, so its greps would match this function"); bad++; }
+  const prod = b === -1 || e === -1 ? "" : srcAll.slice(0, b) + srcAll.slice(e);
+  if (!prod) { log.error("selftest: the static-check region came out empty, so the greps below prove nothing"); bad++; }
+  if (!/r\.status === EXIT_RATE_LIMITED/.test(prod)) {
+    log.error("selftest: the batch parent has no circuit breaker - one rate limit would spawn every remaining group into it"); bad++;
+  }
+  // The batch parent SPAWNS children, so it must NOT hold the session lock
+  // itself - only the child that actually talks to Telegram may. A parent that
+  // locks would make every child refuse to start, and the run would do nothing
+  // with a perfectly clear error nobody reads.
+  if (/runBatch[\s\S]{0,900}holdSessionLock/.test(prod)) {
+    log.error("selftest: runBatch takes the session lock, so every child it spawns will refuse to start"); bad++;
+  }
+  // And the lock must be taken BEFORE the session opens, and released on every
+  // exit path - a lock never released is a session nobody else can ever use.
+  if (!/holdSessionLock/.test(prod)) {
+    log.error("selftest: nothing takes the telegram session lock - two processes on one session will eat each other's replies"); bad++;
+  }
+  // Order matters and a plain "both exist" test cannot see it: the lock must be
+  // taken BEFORE Taskly.open, or there is a window in which a second process
+  // opens the same session and both are live at once. So the check is positional -
+  // the LAST take of the lock must come before the FIRST open in the guarded path.
+  const lockAt = prod.lastIndexOf("holdSessionLock");
+  const openAfter = prod.indexOf("Taskly.open", lockAt);
+  if (lockAt === -1 || openAfter === -1) {
+    log.error("selftest: cannot find the session lock and the session open, so their order is unchecked"); bad++;
+  } else {
+    const between = prod.slice(lockAt, openAfter);
+    if (!/holdSessionLock\(/.test(between)) {
+      log.error("selftest: the session lock is taken AFTER the session opens - there is a window with two processes on one session"); bad++;
+    }
+  }
+  // ...and released on the way out, or a crashed run locks the session for ever.
+  if (!/finally \{[\s\S]{0,160}lock\.release/.test(prod)) {
+    log.error("selftest: the session lock is not released in a finally block, so a crashed run locks the session permanently"); bad++;
+  }
+  // The submission queue must be Postgres. A JSON read-modify-write is what
+  // stopped parallel runs in the first place.
+  //
+  // savePending is deliberately still here for the selftest, which drives the
+  // pure pairing logic against a temp dir. So the check is not "savePending
+  // appears nowhere" - that would fail on the very tests that prove the pairing
+  // works, and get deleted to make it pass. The check is that it has exactly one
+  // caller, and that the live "the provider took it" path is the database.
+  // The name is taken from the line, not from a 60-character window: the window approach reported "?" and "function" and then compared them to a hardcoded list, which is a test that can only ever fail.
+  // Comments are stripped FIRST. The explanation above this check names savePending
+  // twice, and the original version counted those as call sites - so it reported
+  // callers "?" and "function" and then failed against its own hardcoded list.
+  const code = prod.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  // Which ENCLOSING function writes it. Slicing a fixed character window behind
+  // the call was wrong three times over: the window cut names in half, a
+  // trailing \r defeated the anchor, and the explanation comment above this very
+  // check counted as a call site. Each is fixed here by taking the nearest
+  // preceding `function name` and ignoring the definition itself.
+  // Every `function X (` in the file, then each savePending call is attributed to
+  // the nearest one before it. The definition is skipped by advancing past its
+  // own opening paren first - matching the definition and then also letting it
+  // appear in the enclosing-function list made it its own "caller", which is
+  // what the previous attempt reported.
+  // The DEFINITION and its own body, both skipped. Matching only the declaration
+  // left the definition's enclosing name (loadPending) attached to calls that sit
+  // in a later function - so the check reported a writer that does not exist.
+  const savePendingDef = code.search(/(?:export )?(?:async )?function savePending\s*\(/);
+  const defEnd = (() => {
+    if (savePendingDef === -1) return -1;
+    let i = code.indexOf("{", savePendingDef), depth = 0;
+    for (; i < code.length; i++) { if (code[i] === "{") depth++; else if (code[i] === "}" && --depth === 0) return i; }
+    return code.length;
+  })();
+  const enclosingAt = [...code.matchAll(/(?:export )?(?:async )?function (\w+)\s*\(/g)].filter((f) => f.index < savePendingDef || f.index > defEnd);
+  const callers = [...code.matchAll(/(?<![\w.])savePending\(/g)]
+    .filter((m) => m.index < savePendingDef || m.index > defEnd)
+    .map((m) => [...enclosingAt].reverse().find((f) => f.index < m.index)?.[1] ?? "top-level");
+  const unique = [...new Set(callers)];
+  const allowed = new Set(["recordVerdict", "noteSubmission"]);
+  const rogue = unique.filter((f) => !allowed.has(f));
+  if (rogue.length) {
+    log.error(`selftest: the whole-file json queue is written from ${rogue.join(", ")} - two processes will lose rows (all writers: ${unique.join(", ") || "none"})`);
+    bad++;
+  }
+  if (!/markSheetSent/.test(prod)) {
+    log.error("selftest: nothing writes the sheet ledger to postgres, so two processes would still share one queue"); bad++;
+  }
+  // Every ledger write on the LIVE path must be awaited: fire-and-forget lets
+  // the process exit with the record still in flight, which is the bug the
+  // database removed.
+  //
+  // Definitions are excluded by inspecting the text IMMEDIATELY before the call
+  // and anchoring at its END. The first version anchored to the start of a
+  // 60-character slice, which begins mid-preamble, so it flagged all three
+  // definitions as un-awaited and could never have passed.
+  const isDef = (i) => /(?:export )?(?:async )?function \w*$/.test(code.slice(Math.max(0, i - 40), i));
+  const unawaited = [...code.matchAll(/(?<!await )\b(markSent|markSkipped|markPasswordUsed)\(/g)].filter((m) => !isDef(m.index));
+  if (unawaited.length) {
+    for (const m of unawaited.slice(0, 3)) log.error(`selftest: ledger write is not awaited: ${m[0]} - the process can exit with the record in flight`);
+    bad += unawaited.length;
+  }
+  // A rate limit is a stop; "could not tell" is not. They shared a branch, which
+  // is the original mistake, so the two must be separate fields.
+  if (!/rateLimited: true/.test(prod)) {
+    log.error("selftest: a rate limit is still reported as 'could not tell' - it must be its own field"); bad++;
+  }
+  // THE ORPHAN RULE. Once the password is changed the account can never be
+  // retried, so the row has to be recorded or it sits in neither ledger and
+  // fails forever on every run. 2fa43:1 and 2fa49:23 are both in that state.
+  if (!/passwordChanged && curFp/.test(prod)) {
+    log.error("selftest: a row whose password was already changed is not recorded - it will be retried forever and fail every time"); bad++;
+  }
+  if (EXIT_RATE_LIMITED === 1) { log.error("selftest: the rate-limit exit code collides with the ordinary failure code"); bad++; }
+  log.info("selftest: a rate limit stops the run (both provider and telegram), and a half-used row can never be retried");
+  // STATIC-CHECKS-END
   for (const [text, want] of [["Time's up! Task cancelled.", true], ["Action cancelled.", false], ["Report approved, +$0.05", false]]) {
     const got = [text].some((t) => TASK_CANCELLED.test(t));
     if (got !== want) { log.error(`selftest: task-cancelled "${text}" gave ${got}, wanted ${want}`); bad++; }
@@ -1124,9 +1498,9 @@ async function selftest() {
   const dir = path.join(os.tmpdir(), "opencode", `verdict-selftest-${Date.now()}`);
   fs.mkdirSync(dir, { recursive: true });
   const pf = path.join(dir, "pending.json"), vf = path.join(dir, "verdicts.jsonl");
-  noteSubmission({ fp: "aaa", source: "a.xlsx", row: 1, phone: "111" }, pf);
-  noteSubmission({ fp: "bbb", source: "b.xlsx", row: 2, phone: "111" }, pf);
-  noteSubmission({ fp: "ccc", source: "c.xlsx", row: 3, phone: "111" }, pf);
+  await noteSubmission({ fp: "aaa", source: "a.xlsx", row: 1, phone: "111" }, pf);
+  await noteSubmission({ fp: "bbb", source: "b.xlsx", row: 2, phone: "111" }, pf);
+  await noteSubmission({ fp: "ccc", source: "c.xlsx", row: 3, phone: "111" }, pf);
   const v1 = recordVerdict({ verdict: "approved", amount: "0.05" }, "111", pf, vf);
   const v2 = recordVerdict({ verdict: "rejected", accountBlocked: true, reason: "x" }, "111", pf, vf);
   const v3 = recordVerdict({ verdict: "approved", amount: "0.05" }, "111", pf, vf);
@@ -1143,14 +1517,14 @@ async function selftest() {
   // and a session with nothing waiting must come back UNMATCHED rather than
   // consuming the other session's row.
   const pf2 = path.join(dir, "pending2.json"), vf2 = path.join(dir, "verdicts2.jsonl");
-  noteSubmission({ fp: "AAA", source: "2fa43.xlsx", row: 6, phone: "111" }, pf2);
-  noteSubmission({ fp: "BBB", source: "2fa100.xlsx", row: 99, phone: "222" }, pf2);
+  await noteSubmission({ fp: "AAA", source: "2fa43.xlsx", row: 6, phone: "111" }, pf2);
+  await noteSubmission({ fp: "BBB", source: "2fa100.xlsx", row: 99, phone: "222" }, pf2);
   const b1 = recordVerdict({ verdict: "approved", amount: "0.05" }, "222", pf2, vf2);
   if (b1.claim?.fp !== "BBB") { log.error(`selftest: session 222's verdict claimed fp ${b1.claim?.fp}, wanted BBB (its own row)`); bad++; }
   const b2 = recordVerdict({ verdict: "approved", amount: "0.05" }, "111", pf2, vf2);
   if (b2.claim?.fp !== "AAA") { log.error(`selftest: session 111's verdict claimed fp ${b2.claim?.fp}, wanted AAA (its own row)`); bad++; }
   // 222 has nothing left. It must NOT eat 111's next row.
-  noteSubmission({ fp: "CCC", source: "2fa49.xlsx", row: 1, phone: "111" }, pf2);
+  await noteSubmission({ fp: "CCC", source: "2fa49.xlsx", row: 1, phone: "111" }, pf2);
   const b3 = recordVerdict({ verdict: "approved", amount: "0.05" }, "222", pf2, vf2);
   if (b3.matched !== false) { log.error(`selftest: session 222 with nothing pending claimed ${b3.claim?.fp} - it stole another session's row`); bad++; }
   const left = loadPending(pf2);
@@ -1158,6 +1532,30 @@ async function selftest() {
   log.info("selftest: verdict FIFO pairing checked, and two sessions no longer share a queue");
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* temp only */ }
   log.info(`selftest: ${bad === 0 ? "all provider-message cases passed" : bad + " provider-message case(s) wrong"}`);
+
+  // The hardcoded Facebook password. SHARED_PASSWORD used to fall back to a
+  // literal, which put a live credential in every commit. Two things must hold:
+  // the value is never baked in, and an empty one is refused BEFORE the browser
+  // opens rather than ten screen-walks later as a confusing form error.
+  {
+    const src = fs.readFileSync(fileURLToPath(import.meta.url), "utf8");
+    const decl = src.match(/const SHARED_PASSWORD\s*=\s*([^;]+);/)?.[1] ?? "";
+    // strip the env read, then complain about any string literal left over
+    const literal = decl.replace(/process\.env\.[A-Z_0-9]+/g, "").match(/["'][^"']+["']/);
+    if (literal) { log.error(`selftest: SHARED_PASSWORD has a literal fallback (${literal[0]}) - a secret is baked into source`); bad++; }
+    // the real value must not appear anywhere in the file either
+    const fbPw = process.env.FB_CURRENT_PASSWORD;
+    if (fbPw && src.includes(fbPw)) { log.error("selftest: the real FB password appears in index.js source"); bad++; }
+    // And the refusal itself, with no browser at all. If this throws something
+    // other than Bail, or touches context, the guard is not where it claims to be.
+    let refused = null;
+    try { await changePassword({ context: null, currentPw: "", newPw: "x", targetUrl: "https://example.invalid" }); }
+    catch (e) { refused = e; }
+    if (!(refused instanceof Bail)) { log.error("selftest: an empty current password was NOT refused up front"); bad++; }
+    else if (refused.message.includes("example.invalid")) { log.error("selftest: the guard ran after the browser opened"); bad++; }
+    else log.info("selftest: no literal password fallback, and an empty one is refused before the browser opens");
+  }
+
   if (!bad) log.success("selftest passed");
   return bad;
 }
@@ -1170,10 +1568,10 @@ async function awaitCheckpoint(page, minutes = 10, targetUrl = null) {
     // ban gets escalated.
     const fp = curFp;
     if (fp) {
-      markSkipped({ fp, reason: "banned: facebook served a checkpoint saying the account is disabled", source: curXlsx, row: curRow });
+      await markSkipped({ fp, reason: "banned: facebook served a checkpoint saying the account is disabled", source: curXlsx, row: curRow });
       audit({ leg: "internal", what: "account", status: "banned", fp });
     }
-    log.error("BANNED: Facebook says this account is disabled. Recorded in skipped.jsonl - it will not be retried.");
+    log.error("BANNED: Facebook says this account is disabled. Recorded in the ledger - it will not be retried.");
     return await bail(page, "account is banned");
   }
   // "We suspect automated..." / "To prevent your account from being hacked",
@@ -1320,6 +1718,13 @@ async function typeClean(page, loc, value, label) {
 }
 
 export async function changePassword({ context, currentPw, newPw, targetUrl, dryRun = false }) {
+  // Refused before the browser opens, and before anything is typed. This is the
+  // one choke point every caller goes through, so it is the only place that can
+  // be certain. Typing "" into the current-password field does not error - it
+  // just fails the form, ten screen-walks later, with a message about the NEW
+  // password being wrong.
+  if (!currentPw) throw new Bail("Current Facebook password is empty. Pass -o <password> or set FB_CURRENT_PASSWORD in data/.env.");
+  if (dryRun && !newPw) throw new Bail("A dry run needs a throwaway new password to validate against; refusing to type an empty one.");
   const page = context.pages()[0] ?? (await context.newPage());
   await page.goto("https://www.facebook.com/", { waitUntil: "load" });
   log.success("Established session on https://www.facebook.com/");
@@ -1447,29 +1852,44 @@ export async function changePassword({ context, currentPw, newPw, targetUrl, dry
     return { ok: true, verdict: "dry run: form validated, submit not clicked" };
   }
   await submit.click();
-  log.success("Clicked Change password — watching the screen for 10s");
-  const watchUntil = Date.now() + 10_000;
+  log.success("Clicked Change password — watching for the banner");
+  const watchUntil = Date.now() + 15_000;
   const clean = (s) => s.replace(/\s+/g, " ").trim();
-  let lastNotices = "";
+  // FIRST non-blank banner, kept for ever. The old code kept the LAST, so when
+  // Facebook's banner vanished - which it does within a second or two - the empty
+  // string overwrote the evidence and the change was reported as unconfirmed. The
+  // log showed "banner: Your password is shown" and then "banner: |" two seconds
+  // later, and it was that blank that decided the account was lost.
+  let seenBanner = "";
   let verdict = "";
+  const CONFIRMED = /your password is shown|you changed your facebook password|password (has been|was) (changed|updated)/i;
   while (Date.now() < watchUntil) {
     if (page.isClosed()) { log.warn("Page closed during watch — stopping early"); break; }
     if (await codePromptVisible(page)) await bailCodePrompt((await codePromptText(page)) ?? "confirmation code");
     const notices = await page.locator('[role="alert"], [role="status"], [aria-live]:not([aria-live="off"])')
       .allInnerTexts().then((list) => clean(list.join(" | "))).catch(() => "");
-    if (notices && notices !== lastNotices) { lastNotices = notices; log.info(`[${elapsed()}] banner: ${notices}`); }
+    if (notices) {
+      if (notices !== seenBanner) { seenBanner = notices; log.info(`[${elapsed()}] banner: ${notices}`); }
+      // The banner ITSELF is the confirmation - testing only the page body meant
+      // reading it after the banner had already gone.
+      if (CONFIRMED.test(notices) && !verdict) { verdict = notices; break; }
+    }
     const body = await page.locator("body").innerText({ timeout: 2000 }).then(clean).catch(() => "");
     if (body) {
-      const hit = body.match(/.{0,40}(you changed your facebook password[^.]{0,60}|password (has been|was) (changed|updated)[^.]{0,40}|(incorrect|wrong|does not|do not) match|incorrect password|try again|unable to (change|update)[^.]{0,40}).{0,40}/i);
+      const hit = body.match(/.{0,40}(your password is shown|you changed your facebook password[^.]{0,60}|password (has been|was) (changed|updated)[^.]{0,40}|(incorrect|wrong|does not|do not) match|incorrect password|try again|unable to (change|update)[^.]{0,40}).{0,40}/i);
       if (hit && !verdict) { verdict = clean(hit[0]); break; }
     }
-    await sleep(POLL_MS);
+    // 100ms, not POLL_MS. The banner is gone almost instantly, so a 500ms tick
+    // can walk straight past it; this loop missed one that had definitely shown.
+    await sleep(100);
   }
-  if (!verdict && lastNotices) verdict = lastNotices;
-  const ok = /you changed|password (has been|was) (changed|updated)/i.test(verdict);
+  if (!verdict && seenBanner) verdict = seenBanner;
+  // "Your password is shown" IS the confirmation - Facebook is displaying the new
+  // password BECAUSE it changed it.
+  const ok = CONFIRMED.test(verdict);
   if (ok) log.success(`RESULT: ${verdict}`);
   else if (verdict) log.error(`RESULT: ${verdict}`);
-  else log.warn("RESULT: no confirmation banner seen within 10s — check the browser");
+  else log.warn("RESULT: no confirmation banner seen — sending anyway, flagged unconfirmed");
   return { ok, verdict };
 }
 
@@ -2298,6 +2718,333 @@ async function runDrain(args) {
   return sent ? 0 : 1;
 }
 
+// ---- Pricing: what a user is owed per approved account, derived ----
+//
+// Moved here from pricing.js. That file was imported dynamically at three
+// call sites, and every one of them only wanted two or three functions out of it, so
+// the cost of the module boundary was three `await import(...)`s in the middle of
+// money code and a second place for the 19% rule to be edited. It is one file now.
+//
+// The rule in one line: the provider pays us a price, we keep a fixed 19% and the
+// user takes the rest, but never more than 5.00 BKT. So a price RISE is all ours, and
+// a price DROP moves both sides down together and we cannot go negative.
+//
+//   user_payout = min(MAX_USER_BKT, (1 - OUR_CUT) * price_usd * bdt_rate)
+//
+// Why the round to 0.05: 0.81 * 6.15 = 4.98, so a flat 19% would pay 4.98 on the
+// very day the headline number is meant to be 5.00. Rounding to the nearest 0.05
+// makes 4.98 -> 5.00, so "5 tk" is what actually gets paid and the cap still
+// binds above it. Measured at $0.050 and BDT 123: total 6.15, user 5.00, us 1.15.
+export const OUR_CUT = 0.19;        // our share when the price falls
+export const MAX_USER_BKT = 5.00;  // the user never gets more than this
+export const ROUND_TO = 0.05;      // payment granularity
+
+const round2 = (n) => Math.round(n * 100) / 100;
+
+// Pure. No network, no database, so --selftest can pin every case.
+export function payoutBkt(priceUsd, bdtRate) {
+  const p = Number(priceUsd), r = Number(bdtRate);
+  if (!Number.isFinite(p) || p <= 0) return { total: 0, user: 0, us: 0, cut: 0, why: "no price" };
+  if (!Number.isFinite(r) || r <= 0) return { total: 0, user: 0, us: 0, cut: 0, why: "no rate" };
+  const total = p * r;
+  const rounded = Math.round((total * (1 - OUR_CUT)) / ROUND_TO) * ROUND_TO;
+  const user = Math.min(MAX_USER_BKT, round2(rounded));
+  return { total: round2(total), user, us: round2(total - user), cut: round2((total - user) / total) };
+}
+
+// ---- Live rate, cached ----
+// Polled every 5 minutes. If a fetch fails we keep the last good value and NEVER
+// fall back to 0: a zero rate makes every downstream check silently useless,
+// which is exactly the trap the old bdt_rate guard fell into. A missing rate must
+// fail loudly and stop a payout, not invent a number.
+const RATE_FILE = path.join(__dirname, "data", "out", "rate.json");
+const RATE_URLS = [
+  "https://open.er-api.com/v6/latest/USD",
+  "https://api.exchangerate-api.com/v4/latest/USD",
+];
+export const CACHE_MS = 5 * 60 * 1000;
+
+export function cachedRate() {
+  try {
+    const c = JSON.parse(fs.readFileSync(RATE_FILE, "utf8"));
+    const ageMs = Date.now() - new Date(c.at).getTime();
+    return { ...c, ageMs, stale: ageMs > CACHE_MS };
+  } catch { return null; }
+}
+
+export async function fetchRate(opts) {
+  const force = !!(opts && opts.force);
+  const cached = cachedRate();
+  if (!force && cached && !cached.stale) return Object.assign({}, cached, { source: "cache" });
+  for (const url of RATE_URLS) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+      if (!res.ok) continue;
+      const j = await res.json();
+      const bdt = Number(j && j.rates && j.rates.BDT);
+      if (!Number.isFinite(bdt) || bdt <= 0) continue;
+      const rec = {
+        rate: bdt,
+        at: new Date().toISOString(),
+        source: url,
+        fetched: (j && (j.time_last_update_utc || j.date)) || null,
+      };
+      fs.mkdirSync(path.dirname(RATE_FILE), { recursive: true });
+      fs.writeFileSync(RATE_FILE, JSON.stringify(rec, null, 1), "utf8");
+      return Object.assign({}, rec, { ageMs: 0, stale: false, source: "live" });
+    } catch { /* try the next source */ }
+  }
+  // Every source failed. Keep what we had and say so - never invent a number.
+  if (cached) return Object.assign({}, cached, { stale: true, source: "stale-cache", error: "all rate sources failed" });
+  return null;
+}
+
+// The price the provider is paying us right now for the job we sell. Read from
+// the job list rather than hardcoded: it has already moved once ($0.0500 ->
+// $0.0480) and the job is currently delisted entirely.
+export function priceFromLabels(labels) {
+  const job = String(process.env.TASK_NAME ?? "2FA:Create FB (No mail)").toLowerCase();
+  for (const l of labels ?? []) {
+    if (String(l).toLowerCase().includes(job)) {
+      const m = String(l).match(/\$([\d.]+)/);
+      if (m) return Number(m[1]);
+    }
+  }
+  return null;
+}
+// The price the provider ACTUALLY paid us, read off the real verdicts rather
+// than a constant. The verdicts are a JSONL file, not a table, and every
+// approval has carried +$0.05 - a measured fact. The job list moves (it has
+// already gone 0.0480 -> 0.0500) and the job is sometimes delisted entirely, so a
+// hardcoded price is a standing invitation to quote a number that stopped being
+// true days ago.
+export function settledPriceUsd(file) {
+  const f = file ?? path.join(__dirname, "data", "out", "verdicts.jsonl");
+  try {
+    const tally = new Map();
+    for (const line of fs.readFileSync(f, "utf8").split(/\r?\n/)) {
+      if (!line) continue;
+      let r; try { r = JSON.parse(line); } catch { continue; }
+      if (r.verdict !== "approved" || r.amount == null) continue;
+      tally.set(Number(r.amount), (tally.get(Number(r.amount)) ?? 0) + 1);
+    }
+    if (!tally.size) return null;
+    return [...tally.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  } catch { return null; }
+}
+// ---- Money: balance and withdrawal ----
+//
+// SAFE BY CONSTRUCTION. A withdrawal is the only irreversible thing in this tool,
+// so --withdraw PREVIEWS by default and only moves money when --confirm is
+// passed. Nothing here is ever called by the drain or the bot: this is a command
+// a person runs deliberately, not a step in a loop. That distinction is the
+// whole point - automating this would mean a bug could empty the balance with
+// nobody watching.
+//
+// The sequence is the bridge's (Backend/withdrawapi.go), because the provider
+// only speaks in button presses:
+//   Withdraw -> USDT -> <address> -> <amount>
+// and the provider states its own fee and minimum on the method screen. Those
+// are read live, never hardcoded - the fee has already moved once.
+const money = {
+  FEE: 0.025,
+  MINIMUM: 0.20,
+  fmt: (v) => Number(v).toFixed(4),
+};
+
+async function readProviderBalance(tg) {
+  await tg.ensureMainMenu();
+  const before = tg.latestId();
+  const fresh = await tg.freshSince(before, 10);
+  const replies = fresh.length ? fresh : await tg.press("read balance", "Balance");
+  for (const r of replies) {
+    const m = String(r).match(/\$([0-9]+(?:\.[0-9]+)?)/);
+    if (m) return Number(m[1]);
+  }
+  return null; // unknown, never 0 - a zero balance would look like a real reading
+}
+
+// The provider's own terms, read from the method screen. A miss is an error, not
+// a default: a guessed fee is a guessed fee charged against real money.
+function parseTerms(text) {
+  const fee = text.match(/Fee:\s*\$([0-9]+(?:\.[0-9]+)?)/i);
+  const min = text.match(/min(?:imum)?[^0-9]*([0-9]+(?:\.[0-9]+)?)/i);
+  if (!fee && !min) return null;
+  return { fee: fee ? Number(fee[1]) : null, minimum: min ? Number(min[1]) : null };
+}
+
+async function runMoney(args) {
+  const db = await import("./db.js");
+  await db.migrate();
+  const phone = argValue(args, ["--phone", "-p"]) ?? process.env.TG_PHONE;
+  const tg = await Taskly.open({ phone });
+  try {
+    // --balance is read-only and spends nothing.
+    if (args.includes("--balance")) {
+      const bal = await readProviderBalance(tg);
+      if (bal == null) { log.error("the provider did not state a balance - treating it as UNKNOWN, not zero"); await db.closeDb(); return 1; }
+      const rate = await fetchRate();
+      const paidBkt = await db.paidTotalBkt();
+      log.info(`provider balance : $${bal.toFixed(4)}` + (rate ? `   (${(bal * rate.rate).toFixed(2)} BKT at ${rate.rate})` : "   (no rate available)"));
+      log.info(`minimum withdraw : $${money.MINIMUM} (fee $${money.FEE})`);
+      const netIfAll = bal - money.FEE;
+      if (netIfAll >= money.MINIMUM) log.info(`withdrawable now: $${bal.toFixed(4)} gross -> $${netIfAll.toFixed(4)} after the fee`);
+      else log.warn(`below the $${money.MINIMUM} minimum - nothing can be withdrawn yet`);
+      log.info(`already paid out : ${paidBkt.toFixed(2)} BKT recorded in the ledger`);
+      log.info("");
+      log.info("Owed to users comes from: bun index.js --report");
+      await db.closeDb();
+      return 0;
+    }
+
+    if (args.includes("--withdraw")) {
+      // the amount is the value straight after --withdraw; --amount also accepted
+      const amount = Number(argValue(args, ["--withdraw", "--amount"]));
+      const wallet = argValue(args, ["--wallet"]);
+      const go = args.includes("--confirm");
+      if (!Number.isFinite(amount) || amount <= 0) { log.error("usage: --withdraw <amount> --wallet <address> [--confirm]"); await db.closeDb(); return 1; }
+      if (!wallet) { log.error("--wallet is required. The provider pays out to an address, so there is no default."); await db.closeDb(); return 1; }
+
+      const bal = await readProviderBalance(tg);
+      if (bal == null) { log.error("could not read the balance - refusing to guess"); await db.closeDb(); return 1; }
+      if (!go) {
+        log.info(`--withdraw without --confirm: PREVIEW ONLY, nothing will be sent.`);
+        log.info(`  balance      $${bal.toFixed(4)}`);
+        log.info(`  amount       $${amount.toFixed(4)}`);
+        log.info(`  to           ${wallet}`);
+        if (amount > bal) log.error(`  REFUSED: the amount is more than the balance.`);
+        else if (amount < money.MINIMUM) log.error(`  REFUSED: below the $${money.MINIMUM} minimum.`);
+        else log.info(`  looks payable. Add --confirm to actually send it.`);
+        await db.closeDb();
+        return 0;
+      }
+      // Past this point money moves. Everything above was a dry run.
+      if (amount > bal) { log.error(`REFUSED: $${amount} is more than the $${bal.toFixed(4)} balance`); await db.closeDb(); return 1; }
+      if (amount < money.MINIMUM) { log.error(`REFUSED: $${amount} is below the $${money.MINIMUM} minimum`); await db.closeDb(); return 1; }
+      log.warn(`Sending $${amount.toFixed(4)} to ${wallet}. This cannot be undone.`);
+      await tg.ensureMainMenu();
+      await tg.press("withdraw", "Withdraw");
+      const methodReplies = await tg.press("method", "USDT");
+      const terms = parseTerms((methodReplies ?? []).join("\n"));
+      if (!terms || terms.fee == null) { log.error("the provider did not state its fee - stopping before anything is sent"); await db.closeDb(); return 1; }
+      log.info(`provider terms: fee $${terms.fee}` + (terms.minimum != null ? `, minimum $${terms.minimum}` : ""));
+      log.info(`net after the fee: $${(amount - terms.fee).toFixed(4)}`);
+      if (amount - terms.fee <= 0) { log.error("the fee eats the whole amount - stopping"); await db.closeDb(); return 1; }
+      await tg.press("address", wallet);
+      const done = await tg.press("amount", money.fmt(amount));
+      const said = (done ?? []).join(" ");
+      // The provider says "created". It never says "received". Do not upgrade it.
+      if (!/created|Withdrawal/i.test(said)) { log.error("the provider did not confirm the withdrawal - do not assume it went through"); await db.closeDb(); return 1; }
+      log.success("The provider accepted the request.");
+      log.warn("\"created\" is not \"paid\" - the provider confirms a request, never that money arrived. Check your wallet.");
+      audit({ leg: "internal", what: "withdraw", amount, fee: terms.fee, net: amount - terms.fee });
+      await db.closeDb();
+      return 0;
+    }
+
+    log.error("pass --balance or --withdraw <amount> --wallet <address> [--confirm]");
+    await db.closeDb();
+    return 1;
+  } finally { await tg.close().catch(() => {}); }
+}
+// ---- Admin: report and pay ----
+// Payments are made by hand, so the system's job is to RECORD them and to tell
+// the user afterwards. Nothing here decides an amount - the admin does. What the
+// system provides is the number that should drive the decision: approved minus
+// already paid, derived from the ledger rather than stored as a balance.
+async function runAdmin(args) {
+  const db = await import("./db.js");
+  await db.migrate();
+  const t = await db.totals();
+  const pad = (s, n) => String(s).padEnd(n);
+  const rgt = (s, n) => String(s).padStart(n);
+
+  if (args.includes("--report")) {
+    const days = Number(argValue(args, ["--days"]) ?? 7) || 7;
+    log.info("── queue ──");
+    log.info(`  ${t.queued} queued, ${t.inflight} in review, ${t.approved} approved, ${t.rejected} rejected, ${t.dead} dead`);
+    const byDay = await db.dailyStats(days);
+    log.info("");
+    log.info(`── daily submissions (last ${days}d) ──`);
+    if (!byDay.length) log.info("  (none)");
+    for (const d of byDay) {
+      log.info(`  ${String(d.day).slice(0, 10)}  submitted ${rgt(d.submitted, 3)}   approved ${rgt(d.approved, 3)}   rejected ${rgt(d.rejected, 3)}   pending ${rgt(d.pending, 3)}`);
+    }
+    const pays = await db.dailyPayments(days);
+    if (pays.length) {
+      log.info("");
+      log.info(`── daily payments (last ${days}d) ──`);
+      for (const p of pays) log.info(`  ${String(p.day).slice(0, 10)}  ${rgt(p.n, 2)} payment(s)   total ${p.total}`);
+    }
+    const unpaid = await db.unpaidUsers();
+    if (unpaid.length) {
+      log.info("");
+      log.info("── approved but never paid ──");
+      for (const u of unpaid) log.info(`  ${pad(u.handle, 14)} tg=${u.tg_id}  ${rgt(u.approved, 3)} approved`);
+    }
+    await db.closeDb();
+    return 0;
+  }
+
+  if (args.includes("--price")) {
+    // What one approval is worth, right now: the live rate, the provider's
+    // current price for OUR job, and the split between us and the user.
+    const rate = await fetchRate();
+    if (!rate) { log.error("no USD/BDT rate available - refusing to quote. A missing rate must never become 0."); await db.closeDb(); return 1; }
+    const tg2 = await Taskly.open({ phone: argValue(args, ["--phone", "-p"]) ?? process.env.TG_PHONE });
+    let price = null, labels = [];
+    try { const a = await taskAvailability(tg2); labels = a.all ?? []; price = priceFromLabels(labels); }
+    finally { await tg2.close(); }
+    const settled = settledPriceUsd();
+    const use = price ?? settled;
+    log.info(`rate ${rate.rate} BKT/USD (${rate.source}, ${new Date(rate.at).toISOString()})`);
+    log.info(`provider lists ${JOB}: ` + (price ? `$${price}` : "NOT LISTED"));
+    log.info(`last settled price from real verdicts: ` + (settled ? `$${settled}` : "none recorded"));
+    if (use == null) { log.error("no price available from either source - cannot quote a payout"); await db.closeDb(); return 1; }
+    const p = payoutBkt(use, rate.rate);
+    log.info(`one approval = ${p.total} BKT  ->  user ${p.user}, us ${p.us}  (our cut ${(p.cut * 100).toFixed(1)}%)`);
+    await db.closeDb();
+    return 0;
+  }
+
+  if (args.includes("--pay")) {
+    const tg = Number(argValue(args, ["--pay"]) ?? argValue(args, ["--pay-to"]));
+    const amount = argValue(args, ["--amount"]);
+    const method = argValue(args, ["--method"]) ?? null;
+    const reference = argValue(args, ["--ref"]) ?? null;
+    const note = argValue(args, ["--note"]) ?? null;
+    if (!Number.isFinite(tg) || !amount) throw new Bail("usage: --pay <tgId> --amount <n> [--method m] [--ref r] [--note text]");
+    const u = await db.findUser(tg);
+    if (!u) { log.error(`no user with telegram id ${tg}`); await db.closeDb(); return 1; }
+    const rec = await db.recordPayment({ userId: u.id, amount, method, reference, note, adminTgId: Number(process.env.ADMIN_TG_ID) || null });
+    log.success(`Recorded payment #${rec.id}: ${u.handle ?? "user"} (tg ${u.tg_id}) ${rec.amount}${method ? " via " + method : ""}`);
+    log.info("  The user has not been told yet - the bot sends it on its next poll.");
+    log.info("  Recorded, never edited. A mistake is corrected by recording the difference as another row.");
+    await db.closeDb();
+    return 0;
+  }
+
+  if (args.includes("--clear")) {
+    const n = await db.clearExpiredExpect(Number(argValue(args, ["--older-than"]) ?? 30) || 30);
+    log.success(`Cleared ${n} expired /submit wait(s).`);
+    log.info("This is the only thing in the system that deletes anything.");
+    await db.closeDb();
+    return 0;
+  }
+
+  if (args.includes("--requeue")) {
+    const n = await db.requeueStale(Number(argValue(args, ["--older-than"]) ?? 120) || 120);
+    log.success(`Requeued ${n} row(s) claimed but never confirmed sent.`);
+    log.warn("Only safe after a crash. A row taskly actually received must stay inflight - a verdict may still be coming for it.");
+    await db.closeDb();
+    return 0;
+  }
+
+  log.error("nothing to do - pass --report, --pay, --clear or --requeue");
+  await db.closeDb();
+  return 1;
+}
+
 // ---- Batch / group ----
 let curFp = "", curXlsx, curRow = 0;
 function resolveRow(file, row) {
@@ -2308,6 +3055,20 @@ function resolveRow(file, row) {
 }
 async function runBatch(files, args) {
   const pass = args.filter((a) => !a.startsWith("--xlsx") && a !== "--all" && !files.includes(a));
+  // THE LEDGER MUST BE LOADED HERE, IN THE PARENT, before the filter below.
+  //
+  // It used to be loaded only in runGroup - the CHILD. So this parent filtered
+  // against an empty set, queued every row in the sheets, and each child then had
+  // to discover for itself that its rows were already sold. On the 2026-09-30 run
+  // that put 12 of 47 groups on rows that were sent weeks earlier, and the log
+  // read as though accounts were being worked that had long since been paid for.
+  //
+  // One call here and the plan shrinks to the rows that can actually be run: the
+  // same 47 groups became 35, with no Telegram round-trip spent on the rest.
+  if (!ledgerDb.ready) {
+    const l = await ledgerLoad();
+    log.info(`Ledger: ${l.sent} already sent, ${l.skipped} already skipped`);
+  }
   const queue = [];
   let readErrors = 0;
   for (const file of files) {
@@ -2332,13 +3093,21 @@ async function runBatch(files, args) {
   if (!args.includes("--no-uid-check")) {
     const live = await checkUids(queue.map((j) => uidOf(j.cookie)));
     if (live.size) {
+      // Collected first, then recorded. A .filter() callback cannot await, and
+      // the temptation to leave the write un-awaited is exactly the fire-and-
+      // forget that lets a process exit with the record still in flight.
+      const deadOnes = [];
       const alive = queue.filter((j) => {
         const hit = live.get(uidOf(j.cookie));
         if (!hit || hit.status === "valid") return true; // unknown -> keep it, never discard on a guess
-        markSkipped({ fp: j.fp, reason: `account dead (uid check: ${hit.message ?? "not valid"})`, source: j.file, row: j.row });
-        log.error(`${path.basename(j.file)}:${j.row} - account ${maskUid(uidOf(j.cookie))} is dead (${hit.message ?? "not valid"}), never retried`);
+        deadOnes.push(j);
         return false;
       });
+      for (const j of deadOnes) {
+        const hit = live.get(uidOf(j.cookie));
+        await markSkipped({ fp: j.fp, reason: `account dead (uid check: ${hit.message ?? "not valid"})`, source: j.file, row: j.row });
+        log.error(`${path.basename(j.file)}:${j.row} - account ${maskUid(uidOf(j.cookie))} is dead (${hit.message ?? "not valid"}), never retried`);
+      }
       log.info(`UID check: ${queue.length - alive.length} of ${queue.length} account(s) are dead and were dropped`);
       queue.length = 0;
       queue.push(...alive);
@@ -2362,6 +3131,21 @@ async function runBatch(files, args) {
   for (const [gi, group] of groups.entries()) {
     log.info(`── session ${gi + 1}/${groups.length}: ${group.map((j) => `${path.basename(j.file)}:${j.row}`).join(", ")}`);
     const r = spawnSync(process.execPath, [self, ...pass, "--rows", group.map((j) => `${j.file}#${j.row}`).join(",")], { stdio: "inherit" });
+    // THE CIRCUIT BREAKER. A child that exits 75 was told by the provider to
+    // stop, not that its three accounts were bad. The old loop recorded that as
+    // three more failures and immediately spawned the next group into the same
+    // rate limit - so one bad minute became 22 dead groups and 66 accounts that
+    // were never attempted. A rate limit is a property of the WHOLE run, so it
+    // ends the whole run.
+    if (r.status === EXIT_RATE_LIMITED) {
+      const left = groups.slice(gi).reduce((n, g) => n + g.length, 0);
+      log.error("");
+      log.error(`STOPPED: the provider rate-limited us. ${left} account(s) were not attempted.`);
+      log.error("This is not a failure of those accounts - re-run the SAME command after the wait");
+      log.error("and it resumes exactly where it stopped (completed rows are skipped automatically).");
+      log.error("");
+      return EXIT_RATE_LIMITED;
+    }
     if (r.status === 0) ok += group.length;
     else failed.push(...group.map((j) => `${path.basename(j.file)}:${j.row}`));
   }
@@ -2428,7 +3212,7 @@ async function walkForPassword(tg, fp) {
       audit({ leg: "internal", what: "creds", status: "missing-at-start", attempt, fp });
       continue;
     }
-    if (isPasswordUsed(creds.password)) {
+    if (await isPasswordUsed(creds.password)) {
       log.warn("Bot re-issued an already-used password - walking again");
       audit({ leg: "internal", what: "creds", status: "already-used", attempt, fp });
       continue;
@@ -2440,12 +3224,172 @@ async function walkForPassword(tg, fp) {
   return null;
 }
 
+// ---- Counting from the conversation itself ----
+//
+// WHY THIS EXISTS. Every count we have ever trusted came out of the ledger, and
+// the ledger pairs a verdict to a row by position. That pairing is where the
+// 38-vs-37 disaster came from, and it stays wrong in a new way every time the
+// tool is restarted or a verdict arrives while nothing is listening.
+//
+// Counting the provider's OWN words needs no pairing at all:
+//
+//   approved  = how many "Report approved" messages exist
+//   rejected  = how many "Report rejected" messages exist
+//   submitted = how many "your report has been received" messages exist
+//
+// There is no FIFO, no claimed_by, no pending queue and nothing to reconcile. It
+// cannot drift, because it is recomputed from the source every time.
+//
+// AGENTS.md says "getHistory returns 0 messages, always". THAT IS NO LONGER
+// TRUE - measured 2026-09-30: 1000 messages per session came back, 40 verdicts
+// in a single page. So this is not a fallback, it is the better source, and it
+// also catches verdicts that arrived while the tool was shut.
+//
+// The ledger is still the only thing that knows WHICH cookie an approval belongs
+// to. This counts; it does not identify. That split is the point.
+//
+//   bun index.js --count-from-chat                 # every session on this machine
+//   bun index.js --count-from-chat -p <phone>      # just one
+//   bun index.js --count-from-chat --pages 20      # walk deeper (100 msgs/page)
+const CHAT_PAGE = 100;
+async function mineChat(tg, maxPages = 50) {
+  const tally = { submitted: 0, approved: 0, rejected: 0, usd: 0, blocked: 0, oldestId: null, newestId: null, messages: 0 };
+  // offsetId, NOT minId. Measured on this provider:
+  //   offsetId=<oldest seen>  ->  returns the next 100 OLDER messages. Correct.
+  //   minId=<oldest seen>     ->  returns the SAME newest messages again, so the
+  //                              walk never advanced and the count came back as
+  //                              one page no matter how many pages were asked for.
+  let offsetId = 0;
+  for (let page = 0; page < maxPages; page++) {
+    const res = await tg.client.getMessages(tg.peer, offsetId ? { limit: CHAT_PAGE, offsetId } : { limit: CHAT_PAGE });
+    const all = Array.isArray(res) ? res : [...res];
+    if (!all.length) break;
+    // Inbound only - our own presses are not evidence of anything.
+    const rows = all.filter((m) => !m.out);
+    for (const m of rows) {
+      const t = String(m.message ?? "").replace(/\s+/g, " ");
+      tally.messages++;
+      if (/report has been received/i.test(t)) tally.submitted++;
+      if (/report approved/i.test(t)) {
+        tally.approved++;
+        const usd = t.match(/\$([\d.]+)/)?.[1];
+        if (usd) tally.usd += Number(usd);
+      }
+      if (/report rejected/i.test(t)) {
+        tally.rejected++;
+        if (/account blocked|either blocked/i.test(t)) tally.blocked++;
+      }
+    }
+    const ids = all.map((m) => Number(m.id));
+    const oldest = Math.min(...ids), newest = Math.max(...ids);
+    // Both ends are tracked across EVERY page, not just the first. Setting the
+    // oldest only on page one printed a 100-id range for a 600-message walk, which
+    // reads as "we only looked at the last 100" when we had read all 600.
+    tally.oldestId = tally.oldestId == null ? oldest : Math.min(tally.oldestId, oldest);
+    tally.newestId = tally.newestId == null ? newest : Math.max(tally.newestId, newest);
+    // A short page means the start of the chat. Without this the walk asks for
+    // another page and gets nothing, one wasted call per run.
+    if (all.length < CHAT_PAGE) break;
+    offsetId = oldest;
+  }
+  return tally;
+}
+
+async function runCountFromChat(args) {
+  const phones = argValue(args, ["--phone", "-p"]) ? [normalizePhone(argValue(args, ["--phone", "-p"]))] : listSessions().map(normalizePhone);
+  const maxPages = Number(argValue(args, ["--pages"]) ?? 50) || 50;
+  const total = { submitted: 0, approved: 0, rejected: 0, usd: 0 };
+  for (const phone of phones) {
+    const tg = await Taskly.open({ phone, verdictSink: "none" });
+    let t;
+    try {
+      t = await mineChat(tg, maxPages);
+    } finally {
+      await tg.close();
+    }
+    log.success(`session ...${phone.slice(-4)}: ${t.submitted} submitted, ${t.approved} approved, ${t.rejected} rejected (${t.blocked} "account blocked")`);
+    log.info(`  ${t.messages} messages scanned, ids ${t.oldestId}-${t.newestId}, approved worth $${t.usd.toFixed(2)}`);
+    // The one number that cannot be argued with: the provider paid out this much
+    // for these approvals. If it disagrees with the balance, the balance is wrong.
+    if (t.usd > 0) log.info(`  money the provider says it paid: $${t.usd.toFixed(4)}`);
+    for (const k of ["submitted", "approved", "rejected"]) total[k] += t[k];
+    total.usd += t.usd;
+  }
+  if (phones.length > 1) {
+    log.success(`TOTAL across ${phones.length} sessions: ${total.submitted} submitted, ${total.approved} approved, ${total.rejected} rejected, $${total.usd.toFixed(4)} paid`);
+    log.info("These are the provider's own numbers. The ledger is only trusted for WHICH account, never for how many.");
+  }
+  // The database is not touched by this command at all - that is the point of
+  // it - so there is no pool to close here. closeDb lives in db.js and is only
+  // reachable through the other commands' own dynamic import.
+  return 0;
+}
+
 // One UID check per fingerprint per group, not one per row: the same cookie
 // can appear twice in a sheet and the answer will not have changed.
 const uidChecked = new Set();
-async function runGroup(group, args, phone) {
+
+// ---- The queue worker: one process, one session, as many rows as it can get ----
+//
+// Deliberately a THIN wrapper. It claims a row and hands it to the very same
+// runGroup machinery that has always done the work, so there is exactly one
+// implementation of "walk taskly, change the facebook password, send the key,
+// send the cookie" - not a second copy that drifts from the first.
+//
+//   bun index.js --work -p <phone> [--limit N] [--idle-exit SECONDS]
+async function runQueueWorker(args, phone) {
+  const db = await import("./db.js");
+  await db.migrate();
+  const limit = Number(argValue(args, ["--limit"]) ?? 0) || 0;
+  const idleExit = Number(argValue(args, ["--idle-exit"]) ?? 0) || 0;   // 0 = keep going
+  let sent = 0, released = 0, idle = 0;
+
+  for (;;) {
+    const row = await db.claimSheetRow(phone);
+    if (!row) {
+      // Nothing claimable. Either the queue is empty or every remaining row is
+      // held by another worker - which is a healthy state, not an error.
+      const { rows: busy } = await db.db().query(
+        "SELECT count(*)::int n FROM sheet_rows WHERE status IN ('claimed','inflight')",
+      );
+      idle += 2;
+      if (limit && sent >= limit) break;
+      if (busy[0].n === 0) { log.info("Queue empty - nothing left to claim."); break; }
+      if (idleExit && idle * 2 >= idleExit) { log.info(`No free row for ${idleExit}s and ${busy[0].n} are in progress elsewhere - stopping.`); break; }
+      await sleep(2000);
+      continue;
+    }
+    idle = 0;
+    // The queue row carries its own cookie, so the sheet is not re-read here -
+    // but runGroup resolves rows from files, so it is given a synthetic group
+    // and the already-claimed fingerprint is honoured by the ledger.
+    log.info(`── claimed ${row.source}:${row.row_no} (fp ${row.fp})`);
+    const rc = await runGroup([{ file: row.source, row: row.row_no }], args, phone, { claimedFp: row.fp });
+    if (rc === EXIT_RATE_LIMITED) {
+      // Give the claim back BEFORE stopping: this worker is leaving, and a claim
+      // held by a dead process is an account nobody will ever sell.
+      await db.releaseSheetRow(row.fp, "worker stopped: rate limited");
+      return EXIT_RATE_LIMITED;
+    }
+    if (rc === 0) sent++; else released++;
+    if (limit && sent >= limit) break;
+  }
+  const c = await db.sheetCounts();
+  log.info(`worker on ...${String(phone).slice(-4)}: ${sent} sent, ${released} not sent`);
+  log.info(`queue: ${c.queued} queued, ${c.claimed} claimed, ${c.inflight} in review, ${c.approved} approved`);
+  return 0;
+}
+async function runGroup(group, args, phone, pre = {}) {
   if (!group.length) { log.error("nothing to run - no rows given"); return 1; }
   const force = args.includes("--force");
+  // --work: take rows from the shared queue instead of a hand-listed group.
+  //
+  // The claim is one UPDATE ... FOR UPDATE SKIP LOCKED, so N workers on N
+  // sessions each get a DIFFERENT row and none of them can ever pick up the same
+  // account. That is the entire difference between this working with several
+  // processes and the old hand-listed groups, which only ever worked because
+  // there was exactly one process.
+  if (args.includes("--work")) return await runQueueWorker(args, phone);
   const dryRun = args.includes("--probe") || args.includes("--dry-run");
   const resumePw = argValue(args, ["--password", "-P"]);
   const url = resolveUrl();
@@ -2460,6 +3404,24 @@ async function runGroup(group, args, phone) {
   });
   if (!runnable.length) { log.success("every row in this group is already sent or gated - nothing to do"); return 0; }
   log.info(`Running ${runnable.length} account(s) on one Telegram session`);
+  // The ledger, before anything can be sent. Also adopts the old JSON files.
+  if (!ledgerDb.ready) {
+    const l = await ledgerLoad();
+    log.info(`Ledger: ${l.sent} already sent, ${l.skipped} already skipped (adopted from the json ledgers on first run)`);
+  }
+  // ONE TELEGRAM SESSION, ONE PROCESS. Telegram delivers updates to exactly one
+  // consumer of a session: two processes on the same MTProto session do not share
+  // the work, they fight over it, and the loser reads the winner's messages as
+  // its own replies. A Postgres advisory lock says "stop" here, with no lock file
+  // to go stale and no manual cleanup after a crash.
+  const lock = args.includes("--no-session-lock") ? { session: phone, release: async () => {} } : await (await import("./db.js")).holdSessionLock(phone);
+  if (!lock) {
+    log.error(`Session ${phone} is already in use by another process.`);
+    log.error("Two processes on one Telegram session fight over its messages and each loses replies.");
+    log.error("Give this one its own session with -p <phone>, or wait for the other to finish.");
+    return 1;
+  }
+  log.info(`Session ${phone} locked for this process only.`);
   const tg = await Taskly.open({ phone });
   // Guard: if the job is not listed there is nothing to sell, so stop before
   // walking - not three presses into a walk that cannot finish. Reuses the
@@ -2468,14 +3430,29 @@ async function runGroup(group, args, phone) {
   // "Could not tell" is deliberately NOT a stop. A flaky network is not
   // evidence that the provider delisted anything, and stopping on a guess
   // would refuse to run on a day the job is perfectly available.
+  //
+  // A RATE LIMIT is not "could not tell" and gets the opposite treatment: it is
+  // a definite stop, with its own exit code, so the parent batch can halt
+  // instead of spawning every remaining group into the same wall. Carrying on
+  // "anyway" here meant sending into a provider that had just asked for 705
+  // seconds, 22 times over.
   if (!args.includes("--skip-task-check")) {
     const avail = await taskAvailability(tg);
+    if (avail.rateLimited) {
+      log.error(`Provider rate limit: it asked for ${avail.waitSec}s before the next message.`);
+      log.error(`Nothing was spent and no row was started. Wait ${avail.waitSec}s, then re-run the same command.`);
+      log.error("This is NOT 'could not tell' - the provider answered, and the answer was 'stop'.");
+      await tg.close();
+      await lock.release();
+      return EXIT_RATE_LIMITED;
+    }
     if (avail.on === false) {
       log.error(`The job "${JOB}" is not listed under ${GROUP} right now, so there is nothing to sell.`);
       log.error("Nothing was spent. Re-check any time with: bun index.js --check-task");
       const others = (avail.all ?? []).filter((l) => /\$[\d.]+/.test(l) && !l.toLowerCase().includes(GROUP.toLowerCase()));
       if (others.length) log.info(`listed instead: ${others.join(" | ")}`);
       await tg.close();
+      await lock.release();
       return 1;
     }
     if (avail.on === null) log.warn(`Could not confirm the job is listed (${avail.why}) - carrying on anyway`);
@@ -2491,14 +3468,24 @@ async function runGroup(group, args, phone) {
     for (const [i, job] of runnable.entries()) {
       const tag = `${path.basename(job.file)}:${job.row}`;
       log.info(`── [${i + 1}/${runnable.length}] ${tag}`);
+      // Per-row, and reset every row: once the password has been changed this
+      // account cannot be re-attempted, which is what the orphan rule keys on.
+      let passwordChanged = false;
+      let limited = false;
       try {
         tg.resetWindow();
         const pick = resolveRow(job.file, job.row);
         const fp = fingerprint(pick.cookie);
         curFp = fp; curXlsx = job.file; curRow = pick.row;
         log.success(`${path.basename(job.file)}: row ${pick.row} (fp ${fp})`);
-        if (isSent(fp) && !force) throw new Bail(`row ${pick.row} already in sent.jsonl. Use --force.`);
-        if (isSkipped(fp) && !force) throw new Bail(`row ${pick.row} SMS-gated. Use --force.`);
+        // A queue row was CLAIMED for this worker, so its own fingerprint must
+        // not be treated as "already done" by the ledger check below - that
+        // check exists to stop a hand-listed row being submitted twice, and the
+        // claim is the stronger guarantee. Guarding on pre.claimedFp keeps the
+        // skip for hand-listed runs and steps aside for claimed ones.
+        const mine = pre.claimedFp === fp;
+        if (!mine && isSent(fp) && !force) throw new Bail(`row ${pick.row} already sent. Use --force.`);
+        if (!mine && isSkipped(fp) && !force) throw new Bail(`row ${pick.row} SMS-gated. Use --force.`);
         // Account liveness first, then the cookie. A dead account is skipped
         // outright; only a live one is worth spending a cookie probe on.
         if (!dryRun && !force && !uidChecked.has(fp)) {
@@ -2506,14 +3493,14 @@ async function runGroup(group, args, phone) {
           const acc = await checkUid(pick.cookie);
           audit({ leg: "internal", what: "uid", status: acc.status, fp });
           if (acc.status === "dead") {
-            markSkipped({ fp, reason: `account dead (uid check: ${acc.message ?? "not valid"})`, source: job.file, row: pick.row });
-            log.error(`Row ${pick.row}: account ${maskUid(acc.uid)} is dead - recorded in skipped.jsonl, never retried.`);
+            await markSkipped({ fp, reason: `account dead (uid check: ${acc.message ?? "not valid"})`, source: job.file, row: pick.row });
+            log.error(`Row ${pick.row}: account ${maskUid(acc.uid)} is dead - recorded in the ledger, never retried.`);
             throw new BailLogged(`row ${pick.row} account is dead.`);
           }
           log.info(`Row ${pick.row}: account ${maskUid(acc.uid)} is ${acc.status} - checking the cookie`);
         }
         if (!dryRun && !resumePw && !force && (await isCookieDead(pick.cookie))) {
-          markSkipped({ fp, reason: "cookie confirmed dead at accountscenter", source: job.file, row: pick.row });
+          await markSkipped({ fp, reason: "cookie confirmed dead at accountscenter", source: job.file, row: pick.row });
           audit({ leg: "internal", what: "cookie", status: "dead-confirmed", fp });
           throw new Bail(`row ${pick.row} cookie is dead (confirmed twice).`);
         }
@@ -2525,20 +3512,24 @@ async function runGroup(group, args, phone) {
           log.info("RESUME: changing Facebook first, then sending key");
           const result = await changeFacebook(currentPw, resumePw, url, pick.cookie);
           if (!result.ok) throw new Bail(`Facebook did not confirm the change: ${result.verdict}`);
+          passwordChanged = true;
           const keyReplies = await tg.sendRaw("send 2FA key", fa2Key);
-          if (await tg.obeyRateLimit(keyReplies)) continue;
+          // Branch on .waited, never on the returned object. See the note in the
+          // main path below - the object is always truthy and this silently ate
+          // the cookie send on every single row.
+          if ((await tg.obeyRateLimit(keyReplies)).waited) throw new Bail("rate limited after the 2FA key - the cookie was NOT sent");
           if (tg.isTaskCancelled(keyReplies)) throw new Bail("the provider's timer ran out after the 2FA key");
           if (!keyReplies.some((r) => /cookie/i.test(r))) throw new Bail("expected a cookie prompt after the 2FA key");
           const cookieReplies = await tg.sendRaw("send cookie", pick.cookie.trim());
-          if (await tg.obeyRateLimit(cookieReplies)) continue;
+          if ((await tg.obeyRateLimit(cookieReplies)).waited) throw new Bail("rate limited after the cookie - the registration was NOT confirmed");
           if (!cookieReplies.some((r) => /confirm registration/i.test(r))) throw new Bail("no confirmation prompt after the cookie");
           const final = await tg.press("confirm registration", "Account registered");
           if (final.some((r) => /report has been received/i.test(r))) {
-            markSent({ fp, source: job.file, row: pick.row, job: JOB });
+            await markSent({ fp, source: job.file, row: pick.row, job: JOB });
             // The receipt is not the outcome. Queue the row so the verdict that
             // arrives up to 64 minutes later can be matched to it.
-            noteSubmission({ fp, source: job.file, row: pick.row, phone: tg.phone });
-            markPasswordUsed(resumePw);
+            await noteSubmission({ fp, source: job.file, row: pick.row, phone: tg.phone });
+            await markPasswordUsed(resumePw);
             ok++;
           } else failed.push(tag);
           continue;
@@ -2574,36 +3565,60 @@ async function runGroup(group, args, phone) {
           changed = await changeFacebook(currentPw, pending.password, url, pick.cookie);
         } catch (e) {
           if (e instanceof BailGated) {
-            markSkipped({ fp, reason: String(e.message).slice(0, 200), source: job.file, row: pick.row });
+            await markSkipped({ fp, reason: String(e.message).slice(0, 200), source: job.file, row: pick.row });
             audit({ leg: "internal", what: "gated", status: "sms-required", fp });
-            log.warn(`Gated - recorded in skipped.jsonl. Same password carries to next cookie (${pending.uses}/${MAX_REUSE})`);
+            log.warn(`Gated - recorded in the ledger. Same password carries to next cookie (${pending.uses}/${MAX_REUSE})`);
             continue; // keep pending for the next cookie
           }
           throw e;
         }
-        if (!changed.ok) throw new Bail(`Facebook did not confirm the change: ${changed.verdict}`);
-        log.success("Facebook password changed to the bot's password");
-        markPasswordUsed(pending.password);
+        if (!changed.ok) {
+          // SENT ANYWAY, on purpose. A blank banner is AMBIGUOUS, and blocking on
+          // ambiguity throws the account away in exchange for certainty about
+          // nothing. The only cost of sending is the provider's verdict on this one
+          // account, which arrives in ~64 minutes either way - and a rejection is
+          // information, not waste.
+          //
+          // It is recorded as unconfirmed so the question stays measurable: if
+          // these verdicts come back approved the banner was noise, if they come
+          // back rejected it was telling the truth.
+          log.warn(`Facebook did NOT confirm the change ("${String(changed.verdict ?? "").slice(0, 120)}") - sending anyway, flagged unconfirmed`);
+          audit({ leg: "internal", what: "pwchange", status: "unconfirmed-sent", fp });
+        } else log.success("Facebook password changed to the bot's password");
+        passwordChanged = true;
+        await markPasswordUsed(pending.password);
 
         if (!fa2Key) throw new Bail("Bot wants a 2FA key but none was given (--fa2 / sheet col B)");
         const keyReplies = await tg.sendRaw("send 2FA key", fa2Key);
         // These three can each be replaced by a rate limit or the provider's
         // own timeout, both of which used to look like "no reply came back".
-        if (await tg.obeyRateLimit(keyReplies)) continue;
+        //
+        // Branch on .waited, never on the returned object. An object is ALWAYS
+        // truthy, so `if (await obey(...)) continue;` fired on every row, the
+        // cookie was never sent, and the row vanished as "0 passed, 0 failed"
+        // with the Facebook password already changed. That is what lost
+        // 2fa43.xlsx:1. A real rate limit now stops the row with a reason
+        // instead of quietly moving on: the account is half-consumed at this
+        // point, so there is no safe retry - the operator has to finish it.
+        if ((await tg.obeyRateLimit(keyReplies)).waited) throw new Bail("rate limited after the 2FA key - the cookie was NOT sent");
         if (tg.isTaskCancelled(keyReplies)) throw new Bail("the provider's timer ran out after the 2FA key");
         if (!keyReplies.some((r) => /cookie/i.test(r))) throw new Bail("expected a cookie prompt after the 2FA key, got something else");
         const cookieReplies = await tg.sendRaw("send cookie", pick.cookie.trim());
-        if (await tg.obeyRateLimit(cookieReplies)) continue;
+        if ((await tg.obeyRateLimit(cookieReplies)).waited) throw new Bail("rate limited after the cookie - the registration was NOT confirmed");
         if (tg.isTaskCancelled(cookieReplies)) throw new Bail("the provider's timer ran out after the cookie");
         if (!cookieReplies.some((r) => /confirm registration/i.test(r))) throw new Bail("no confirmation prompt after the cookie");
         const final = await tg.press("confirm registration", "Account registered");
         if (final.some((r) => /report has been received/i.test(r))) {
-          markSent({ fp, source: job.file, row: pick.row, job: JOB });
+          await markSent({ fp, source: job.file, row: pick.row, job: JOB });
           // The receipt is not the outcome - queue it so the verdict that
           // arrives up to 64 minutes later can be matched to this row.
-          noteSubmission({ fp, source: job.file, row: pick.row, phone: tg.phone });
+          await noteSubmission({ fp, source: job.file, row: pick.row, phone: tg.phone });
           audit({ leg: "internal", what: "job", status: "received", fp });
-          log.success(`Recorded in sent.jsonl (fp ${fp}) - awaiting the provider's verdict`);
+          // NOT sent.jsonl. The write went to postgres hours ago and the message
+          // kept naming the file, so the file stayed frozen at 67 while the ledger
+          // said 69 - and a file that looks authoritative and is not will be
+          // trusted over the database that is. Named where it actually lands.
+          log.success(`Recorded in the ledger (fp ${fp}) - awaiting the provider's verdict`);
           ok++;
         } else {
           log.warn("Confirmation sent, but no 'report received' in the reply");
@@ -2613,10 +3628,32 @@ async function runGroup(group, args, phone) {
         pending = null; // a success retires the password
       } catch (err) {
         const message = String(err?.message ?? err);
+        // A flood wait is not this row's failure, it is the run's. Recorded as a
+        // failed row it would be retried immediately into the same wall, and the
+        // "/start" reset below would throw it again - which is precisely how one
+        // rate limit turned into 22 groups and 66 accounts that were never tried.
+        const flood = floodWaitSeconds(err);
+        if (flood) {
+          log.error(`Telegram flood limit: ${flood}s. Stopping this group and the whole run.`);
+          log.error("No further row is attempted. Re-run the same command after the wait.");
+          return EXIT_RATE_LIMITED;
+        }
         if (err instanceof BailGated && curFp) {
-          markSkipped({ fp: curFp, reason: message.slice(0, 200), source: curXlsx, row: curRow });
+          await markSkipped({ fp: curFp, reason: message.slice(0, 200), source: curXlsx, row: curRow });
           audit({ leg: "internal", what: "gated", status: "sms-required", fp: curFp });
           ok++;
+        } else if (passwordChanged && curFp) {
+          // THE ORPHAN RULE. The password is already the bot's, so this account
+          // can never be submitted by retrying it - the next attempt would fail
+          // on the password change, forever, and the account would sit in
+          // neither sent nor skipped. That is 2fa43:1 and 2fa49:23 right now:
+          // password changed, 2FA key sent, cookie never delivered, and no
+          // record anywhere. Recorded as skipped so it is never retried
+          // blindly and never looks like a healthy row.
+          await markSkipped({ fp: curFp, reason: `half-used: password changed, not delivered (${message.slice(0, 160)})`, source: curXlsx, row: curRow });
+          audit({ leg: "internal", what: "job", status: "half-used", fp: curFp });
+          log.error(`Recorded in the ledger as HALF-USED - the password is already changed, so this row cannot be retried. Finish it by hand or accept the loss.`);
+          failed.push(tag);
         } else {
           if (!(err instanceof BailLogged)) log.error(message);
           failed.push(tag);
@@ -2628,14 +3665,33 @@ async function runGroup(group, args, phone) {
         }
         await tg.sendRaw("reset after failure", "/start")
           .then(() => sleep(ACCOUNT_GAP_MS))
-          .catch((e) => log.warn(`could not reset provider state: ${e?.message ?? e}`));
+          .catch((e) => {
+            if (floodWaitSeconds(e)) { log.error(`Telegram flood limit while resetting - stopping the run.`); limited = true; return; }
+            log.warn(`could not reset provider state: ${e?.message ?? e}`);
+          });
+        if (limited) return EXIT_RATE_LIMITED;
         pending = null; // failures of unknown kind retire the password too
       }
     }
   } finally {
     await tg.close();
+    await lock.release();
   }
   log.info(`group done: ${ok} passed, ${failed.length} failed`);
+  // A claimed row that ends the group half-used is recorded by the orphan rule;
+  // one that fails BEFORE taskly saw it goes back on the queue, because the
+  // account is still perfectly sellable and nobody else is going to try it.
+  if (pre.claimedFp) {
+    const dbm = await import("./db.js");
+    const { rows: st } = await dbm.db().query("SELECT status FROM sheet_rows WHERE fp = $1", [pre.claimedFp]);
+    const status = st[0]?.status;
+    if (status === "claimed") {
+      await dbm.releaseSheetRow(pre.claimedFp, "attempt failed before taskly saw it");
+      log.warn("Released the claim - that account is still sellable and is back on the queue.");
+    } else {
+      log.info(`Row recorded as '${status}'.`);
+    }
+  }
   return failed.length ? 1 : 0;
 }
 
@@ -2658,6 +3714,9 @@ Usage:
   bun index.js --refresh-cookie --xlsx a.xlsx --row 5 -o <curPw> --write-back   # ...and save it if it is trusted
   bun index.js --codegen --check-gate --xlsx a.xlsx --row 5 -o <curPw>   # report which gate this row hits. Clicks no gate button.
   bun index.js --codegen --check-gate --dismiss --hold --xlsx a.xlsx --row 5   # ...click Dismiss, show what follows, leave the browser open
+  bun index.js --balance                                  # what the provider actually holds. Read-only, spends nothing
+  bun index.js --withdraw 0.4 --wallet <addr>            # PREVIEW only. Adds --confirm to actually send it
+  bun index.js --price                                    # one approval: live rate, provider price, and the user/our split
   bun index.js --drain                                     # send queued user submissions, spend nothing
   bun index.js --drain --watch                             # ...and stay up to receive the verdicts (~64m)
   bun index.js --drain --list-queued                       # queue depth only, send nothing
@@ -2665,7 +3724,7 @@ Usage:
 Flags: --xlsx (repeatable/comma/space), --row, --rows f#r,.. (internal), --all,
   -p/--phone, -o/--current-password, -P/--password, --fa2, --per-session N,
   --plan, --force, --dry-run/--probe, --codegen, --detect, --check-pw,
-  --check-gate, --dismiss, --refresh-cookie, --write-back, --hold, --selftest,
+  --check-gate, --dismiss, --refresh-cookie, --write-back, --hold, --selftest, --balance, --withdraw, --price,
   --check-verdicts, --check-task, --drain, --watch, --limit N, --list-queued,
   --no-uid-check, --skip-task-check, --login, --help
 Rule: one bot password covers max ${MAX_REUSE} cookies and retires after 1 success.`);
@@ -2675,8 +3734,13 @@ async function main() {
   const args = process.argv.slice(2);
   if (args.includes("--help") || args.includes("-h")) { printHelp(); return; }
   if (args.includes("--selftest")) { process.exit((await selftest()) ? 1 : 0); }
-  if (args.includes("--check-verdicts")) { process.exit(checkVerdicts()); }
+  if (args.includes("--check-verdicts")) { process.exit(await checkVerdicts()); }
+  if (args.includes("--count-from-chat")) { process.exit(await runCountFromChat(args)); }
+  if (args.includes("--balance") || args.includes("--withdraw")) { process.exit(await runMoney(args)); }
   if (args.includes("--drain")) { process.exit(await runDrain(args)); }
+  if (args.includes("--report") || args.includes("--pay") || args.includes("--price") || args.includes("--clear") || args.includes("--requeue")) {
+    process.exit(await runAdmin(args));
+  }
   if (args.includes("--check-task")) { process.exit(await runCheckTask()); }
   if (args.includes("--login")) {
     const p = argValue(args, ["--login"]) ?? argValue(args, ["--phone", "-p"]);
@@ -2698,6 +3762,11 @@ async function main() {
     }
     catch (e) { if (!(e instanceof BailLogged)) log.error(e?.message ?? e); process.exit(1); }
   }
+  // --work needs no sheet and no row list: it claims from the shared queue.
+  // Routed here, before the sheet handling, because without it the code below
+  // would find no --xlsx, print the help text and exit - which looks like a
+  // silent no-op rather than a mistake.
+  if (args.includes("--work")) { process.exit(await runQueueWorker(args, phone)); }
   const group = parseRows(argValue(args, ["--rows"]));
   if (group.length) { process.exit(await runGroup(group, args, phone)); }
   const sheets = argValues(args, "--xlsx");
@@ -2709,14 +3778,24 @@ async function main() {
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
-  main().then((code) => { if (typeof code === "number") process.exit(code); }).catch((err) => {
+  main().then((code) => { if (typeof code === "number") process.exit(code); }).catch(async (err) => {
     const gated = err instanceof BailGated || /sms confirmation code|never left 'Loading/i.test(err?.message ?? "");
     if (gated && curFp) {
-      markSkipped({ fp: curFp, reason: (err.message ?? "gated").slice(0, 200), source: curXlsx, row: curRow });
+      // Awaited even here, on the way out. This handler is the last thing that
+      // runs before the process dies, so an un-awaited write is the one most
+      // likely to be lost - and a gate that was never recorded is a row that
+      // gets retried and fails again for ever.
+      await markSkipped({ fp: curFp, reason: (err.message ?? "gated").slice(0, 200), source: curXlsx, row: curRow }).catch(() => {});
       audit({ leg: "internal", what: "gated", status: "sms-required", fp: curFp });
-      log.warn("Recorded in skipped.jsonl - this account will not be retried");
+      log.warn("Recorded in the ledger - this account will not be retried");
     } else if (!curFp) {
-      log.error("Could not record the skip: no fingerprint for this row. It will be retried next run.");
+      // Not a lost row. No row was ever started, so there is nothing to record -
+      // and saying "it will be retried next run" about a row that does not exist
+      // is what made a rate-limited run look like it was dropping accounts.
+      const flood = floodWaitSeconds(err);
+      log.error(flood
+        ? `Telegram flood limit: ${flood}s. No row was started, so nothing was lost.`
+        : "Failed before any row was started - nothing was spent and nothing to record.");
     }
     if (!(err instanceof BailLogged)) log.error(err.message);
     process.exit(1);

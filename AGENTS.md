@@ -274,14 +274,42 @@ in the codebase that sends a withdrawal amount.
 
 ## Secrets
 
-Nothing sensitive is committed. `Backend/.env` and the Telegram session are
-gitignored, and a scan of every staged file runs before each commit against the
-live bot token, `api_hash`, the Neon password, the phone number, the Railway
-token and the withdrawal wallet.
+Nothing sensitive is committed. `Backend/.env`, `Tool/data/.env` and the
+Telegram session are gitignored.
 
-**That scan has caught four real leaks** — a phone number in a test file, a
-wallet address in a test constant, and two others. It is not ceremony; it earns
-its place. Test fixtures use synthetic values (`+15550100`, `0x1111…`).
+`Tool/scan-secrets.mjs` runs as a **real pre-commit hook**, installed with
+`git config core.hooksPath Tool/hooks` so it is version-controlled rather than
+living in `.git/`. It scans the **index**, not the worktree, because the index
+is exactly what the commit will contain. Two layers:
+
+1. **Known values** — the live `FB_CURRENT_PASSWORD`, `DATABASE_URL`,
+   `BOT_TOKEN`, `TG_API_HASH`, `TG_SESSION`, `WITHDRAW_WALLET`,
+   `WEBHOOK_SECRET` and `TG_PHONE` are read from the `.env` files and matched
+   literally, so a new value is covered the day it changes.
+2. **Shapes** — any 40-hex wallet, `8801…` phone, bot token or 32-hex
+   `api_hash` is caught **even under a key the list has never heard of**. This
+   is the layer that matters: a secret in a brand-new variable still gets caught.
+
+**It prints how many files it actually read.** A scan that silently reads
+nothing and reports "0 leaks" is worse than no scan, because it is believed —
+the first version of this did exactly that, on a doubled path, and looked
+clean.
+
+**It is not ceremony.** It has caught four real leaks — a phone number in a
+test file, a wallet address in a test constant, and two others. It also caught
+a hardcoded Facebook password in `index.js` on its first real run, which had
+been sitting in 15 commits. Test fixtures use synthetic values (`+15550100`,
+`0x1111…`), and the scanner knows those ranges so they do not trip it.
+
+`--no-verify` skips it. It has caught real leaks, so read what it found first.
+
+### The public remote is a different question
+
+The GitHub repo `Cryptoistaken/TasklyBridge` is **public**, and `Tool/` has
+**never been pushed** — the remote holds 95 files and zero from `Tool/`. The
+audit of the pushed history found only synthetic fixtures (`0x1111…`,
+`15550100`) and no live credential. Keep it that way: **`Tool/` stays local
+unless that is a deliberate decision.**
 
 ---
 
@@ -363,6 +391,14 @@ web/             the dashboard - React 19 + Vite + Tailwind v4 + shadcn/ui
   src/pages/     one component per route
   src/lib/       api client, formatters, cn()
 docs/            api.md is the contract, design.md is the visual system
+Tool/            the Facebook submission tool. LOCAL ONLY - never pushed.
+  index.js         engine, batch planner, ledger, --count-from-chat, logging
+  db.js            Postgres schema and every ledger query
+  scan-secrets.mjs pre-commit secret scan (see Secrets above)
+  hooks/           the pre-commit hook itself
+  plancli.md       the cli/ implementation plan, 11 tasks
+  data/            sheets, .session files, credentials, out/ logs - all ignored
+  data/archive/    retired code, kept not deleted
 context.md       provider facts, decisions, open questions
 ```
 

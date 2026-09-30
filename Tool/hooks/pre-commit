@@ -1,0 +1,11 @@
+#!/bin/sh
+# Pre-commit secret scan. Installed via `git config core.hooksPath Tool/hooks`,
+# so it is version-controlled instead of living in .git/ where it is invisible
+# to review and lost on re-clone.
+#
+# Scans the INDEX, not the worktree, because that is exactly what the commit
+# will contain. A dirty worktree that is not being committed cannot leak
+# anything, and scanning it produced false failures on unrelated edits.
+#
+# Bypass with --no-verify only when you have already looked at what it found.
+exec bun "$(dirname "$0")/../scan-secrets.mjs" --staged
