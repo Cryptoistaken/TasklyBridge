@@ -2033,7 +2033,10 @@ export class Taskly {
     fs.writeFileSync(file, client.session.save(), "utf8");
     tlog.ok(`Session ready for ${digits}`);
     t.peer = await client.getEntity(process.env.TG_TARGET ?? env.TG_TARGET ?? "tasklyBux_bot");
-    t.installVerdictWatcher();
+    // The CLI drives its own verdict binding against SQLite (see cli/submit.js),
+    // so it opens with verdictSink "none" and the legacy jsonl/leader sinks stay
+    // off. Never both: one verdict written twice would be counted twice.
+    if (t.verdictSink !== "none") t.installVerdictWatcher();
     return t;
   }
   async close() { await this.client.disconnect().catch(() => {}); }

@@ -1,6 +1,6 @@
 // cli/store.test.ts
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import * as store from "./store.js";
+import * as store from "../store.js";
 
 let s;
 beforeEach(() => { s = store.open(":memory:"); store.migrate(s); });

@@ -3,9 +3,9 @@ import { test, expect, beforeEach, afterEach } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import * as store from "./store.js";
-import { seed, pick } from "./sessions.js";
-import { acquire } from "./lock.js";
+import * as store from "../store.js";
+import { seed, pick } from "../sessions.js";
+import { acquire } from "../lock.js";
 
 const A = "15550101", B = "15550102";
 let s, lockTmp, savedEnv;

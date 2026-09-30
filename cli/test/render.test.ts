@@ -1,6 +1,6 @@
 // cli/render.test.ts
 import { test, expect } from "bun:test";
-import { table, bkt, usd, mask, stripAnsi, steps, summary, STEP_LABELS, RIGHT } from "./render.js";
+import { table, bkt, usd, mask, stripAnsi, steps, summary, STEP_LABELS, RIGHT } from "../render.js";
 
 test("table columns line up", () => {
   const lines = stripAnsi(table(["a", "bb"], [["1", "22"], ["333", "4"]])).split("\n");

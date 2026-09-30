@@ -214,6 +214,14 @@ export function markHalfUsed(s, uid, reason) {
   return Number(r?.changes ?? 0);
 }
 
+// Direct status move for terminal screenings (dead, gated). Never used for
+// queued-claimed-inflight flow — that path goes through claimRow/markSent.
+export function markStatus(s, uid, status, note = null) {
+  const r = s.query("UPDATE rows SET status=?, note=COALESCE(?, note) WHERE uid=?")
+    .run(String(status), note, String(uid));
+  return Number(r?.changes ?? 0);
+}
+
 // Oldest inflight for THIS session only. Null when the session has nothing
 // outstanding, so a verdict never steals another session's row.
 export function bindVerdict(s, session, verdict) {

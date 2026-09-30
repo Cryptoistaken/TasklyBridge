@@ -4,8 +4,8 @@ import * as XLSX from "xlsx";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import * as store from "./store.js";
-import { writeFor } from "./output.js";
+import * as store from "../store.js";
+import { writeFor } from "../output.js";
 
 let s, tmp;
 beforeEach(() => {

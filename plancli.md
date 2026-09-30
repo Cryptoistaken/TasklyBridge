@@ -38,7 +38,10 @@ cli/
   submit.js       the worker: claim a row, drive the engine, report steps
   output.js       writes each user's new xlsx after every successful row
   balance.js      the --balance report
-  *.test.ts       one test file per module
+  lock.js         the shared file lock honoured by both tools
+  reconcile.js    verdict catch-up from the provider chat
+  exit.js         the exit-code contract, the only place that owns it
+  test/           one .test.ts per module, mirroring the names above
 
 data/cli/
   .env            the CLI's own env (own path, never the root .env)

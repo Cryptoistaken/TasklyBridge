@@ -1,7 +1,7 @@
 // cli/lock.test.ts
 import { test, expect } from "bun:test";
 import fs from "node:fs";
-import { acquire, holder, lockDir, lockPath } from "./lock.js";
+import { acquire, holder, lockDir, lockPath } from "../lock.js";
 
 // Synthetic numbers, on purpose. The real ones are in data/.env and must never
 // reach a test file or a commit; Backend uses the same 1555 convention.
