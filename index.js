@@ -499,7 +499,7 @@ function listVerdicts() {
 // died on its very next send, and the parent spawned the next 22 groups into
 // the same wall. `rateLimited` is now its own field so it can never again be
 // mistaken for uncertainty - it is a definite STOP, carrying the exact wait.
-async function taskAvailability(tg) {
+export async function taskAvailability(tg) {
   try {
     await tg.obeyRateLimit(await tg.ensureMainMenu());
     await sleep(STEP_MS);
@@ -660,7 +660,7 @@ export function resolveUrl() {
 // question that actually matters: is the ACCOUNT still there. A dead UID is
 // permanent, so the row is skipped outright instead of being retried forever.
 const UID_CHECK_URL = process.env.CHECK_URL ?? "https://check.fb.tools/api/check/facebook";
-const uidOf = (cookie) => cookie.match(/c_user=(\d+)/)?.[1] ?? null;
+export const uidOf = (cookie) => cookie.match(/c_user=(\d+)/)?.[1] ?? null;
 // The UID identifies an account, so it is masked in logs the same way a cookie
 // is - only ever shown in full to the checker itself.
 const maskUid = (uid) => (uid ? `***${uid.slice(-4)}` : "(none)");
@@ -2237,7 +2237,7 @@ export function parseCreds(replies) {
     text.match(new RegExp(`\\b${name}\\s*[:=]\\s*(\\S+)`, "i"))?.[1]?.trim() ?? null;
   return { firstName: field("first name"), lastName: field("last name"), password: field("password") };
 }
-async function changeFacebook(currentPw, newPw, url, cookieString, dryRun = false) {
+export async function changeFacebook(currentPw, newPw, url, cookieString, dryRun = false) {
   const browser = await launchBrowser();
   const context = await browser.newContext({ ...DEVICES_PHONE, locale: "en-US" });
   try {
@@ -2930,7 +2930,7 @@ const money = {
   fmt: (v) => Number(v).toFixed(4),
 };
 
-async function readProviderBalance(tg) {
+export async function readProviderBalance(tg) {
   await tg.ensureMainMenu();
   const before = tg.latestId();
   const fresh = await tg.freshSince(before, 10);
@@ -3232,7 +3232,7 @@ async function runBatch(files, args) {
   return failed.length ? 1 : 0;
 }
 
-async function walkForPassword(tg, fp) {
+export async function walkForPassword(tg, fp) {
   for (let attempt = 1; attempt <= MAX_START_ATTEMPTS; attempt++) {
     if (attempt > 1) {
       log.warn(`No password within ${CRED_WAIT_MS}ms of Start - restarting (attempt ${attempt}/${MAX_START_ATTEMPTS})`);
@@ -3330,7 +3330,7 @@ async function walkForPassword(tg, fp) {
 //   bun index.js --count-from-chat -p <phone>      # just one
 //   bun index.js --count-from-chat --pages 20      # walk deeper (100 msgs/page)
 const CHAT_PAGE = 100;
-async function mineChat(tg, maxPages = 50) {
+export async function mineChat(tg, maxPages = 50) {
   const tally = { submitted: 0, approved: 0, rejected: 0, usd: 0, blocked: 0, oldestId: null, newestId: null, messages: 0 };
   // offsetId, NOT minId. Measured on this provider:
   //   offsetId=<oldest seen>  ->  returns the next 100 OLDER messages. Correct.
