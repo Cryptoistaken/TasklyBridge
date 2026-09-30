@@ -1,5 +1,5 @@
-# Everything that is not code lives in ./data: the sheets, the Telegram
-# sessions, the credentials and the docs. See index.js DATA_DIR.
+# Everything that is not code lives in ./data: the account sheets, the Telegram
+# sessions, the credentials and the runtime output. See index.js DATA_DIR.
 
 # --- Credentials and secrets. Never commit these. ---
 .env
@@ -11,16 +11,14 @@
 secrets/
 
 # --- Live Telegram sessions (MTProto auth keys). A committed session is a
-#     permanent account compromise, so these are ignored by name and by dir.
-Test/sessions/
+#     permanent account compromise, so these are ignored by name and by dir. ---
 sessions/
 data/sessions/
+data/cli/sessions/
 *.session
 
-# --- Runtime output: audit logs contain real user ids, phone numbers and the
-#     provider's prices. state.json holds who is in which job.
-Backend/out/
-Test/out/
+# --- Runtime output. Audit logs carry real user ids, phone numbers and the
+#     provider's price, which is our margin. ---
 out/
 data/out/
 *.log
@@ -31,8 +29,24 @@ data/out/
 data/*.xlsx
 *.bak
 
+# --- The cli/ store and its output. data/cli/output/ holds the new passwords
+#     for accounts the user submitted, so it is exactly as sensitive as a
+#     sheet. data/cli/sessions/ are the CLI's own live session copies. ---
+data/cli/output/
+data/cli/cli.sqlite
+data/cli/cli.sqlite-journal
+data/cli/cli.sqlite-wal
+data/cli/cli.sqlite-shm
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# --- The shared session lock, held per Telegram phone. ---
+data/locks/
+
 # --- No longer used: an ephemeral browser context leaves no profile folder.
-#     Kept so a stale one can never be re-added by accident.
+#     Kept so a stale one can never be re-added by accident. ---
 profile/
 data/profile/
 
