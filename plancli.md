@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- **Location:** everything lives in `Tool/cli/`. All state under `Tool/data/cli/`.
+- **Location:** everything lives in `cli/`. All state under `data/cli/`.
 - **SQLite only.** `data/cli/cli.sqlite`. No Postgres anywhere in the CLI.
 - **Zero new npm dependencies.**
 - **The engine is imported, not reimplemented.** `cli/` must not contain a copy of `changePassword`, `walkForPassword`, or any screen-matching regex.
@@ -29,7 +29,7 @@
 ## Folder layout
 
 ```
-Tool/cli/
+cli/
   index.js        entry: arg parsing, dispatch, one error handler
   store.js        SQLite schema + every query. The only file that touches the DB.
   render.js       chalk tables, money formatting, the 7-step display
@@ -39,14 +39,14 @@ Tool/cli/
   balance.js      the --balance report
   *.test.ts       one test file per module
 
-Tool/data/cli/
+data/cli/
   .env            the CLI's own env (own path, never the root .env)
   cli.sqlite      the store
   sessions/       the CLI's OWN copies of the .session files
   output/users/<user>/<YYYY-MM-DD>/<source>-<HHMMSS>.xlsx
   storage/        OPERATOR'S. The CLI never creates, reads or writes it.
 
-Tool/data/locks/<phone>.lock     shared by index.js and cli/ — see Task 4
+data/locks/<phone>.lock     shared by index.js and cli/ — see Task 4
 ```
 
 `.gitignore` must exclude `data/cli/output/`, `data/cli/cli.sqlite` and `data/cli/sessions/` — the output files contain live passwords and the sessions are live credentials.
@@ -63,9 +63,23 @@ This is **stronger** than the fingerprint for the one thing that matters. Two di
 
 What is given up: you can no longer distinguish two cookie *strings* for the same uid. That only mattered for pairing a verdict to an exact cookie, and with uid-keyed rows there is only ever one row per account, so nothing depends on it.
 
-The uid comes from `c_user=(\d+)` in the cookie. `index.js` already exports the parser used for this.
+The uid comes from `c_user=(\d+)` in the cookie via `uidOf` in `index.js` (currently private — Task 1 exports it).
 
-**Consequence for the sold-guard (Task 8):** `sent.jsonl` stores `fp`, not `uid`, so the guard cannot be read straight out of it. It is derived instead — see Task 8, which re-reads the sheets and joins on `(source, row)`.
+**Consequence for the sold-guard (Task 11):** `sent.jsonl` stores `fp`, not `uid`, so the guard cannot be read straight out of it. It is derived instead — see Task 11, which re-reads the sheets and joins on `(source, row)`.
+
+## Duplicate resistance: strong, simple, uid-only
+
+Decided, not open:
+
+1. **No `c_user` = invalid, rejected at enqueue.** The row is never inserted, counted as `invalid`, listed as `source:row (no c_user)`. No fingerprint fallback — a fallback would key the same account two ways and defeat the point.
+2. **Same uid, any cookie string = same account = blocked always.** A refreshed session cookie does not create a new row. No update-in-place, no `--force` bypass — a duplicate is never queueable, period.
+3. **Same uid, different user = loud reject.** Second enqueue is dropped, prints owner handle + `source:row` + status, exit code 2 when any duplicate/invalid exists. Never silent (`added=0` alone hides whose account it was). Clean rows are still enqueued (partial, not all-or-nothing).
+4. **Scope = SQLite `rows` + `sold_guard` only.** No live Postgres read, no jsonl read at runtime. Cross-cutover coverage comes from the one-time Task 11 seed, not from checking three stores on every run.
+5. **Sold is permanent, surplus pays nobody.** `sold_guard` is never deleted for any reason (refund, bad sale, operator error). A surplus verdict (chat has more approvals than ledger `inflight`) is reported, never attached, never paid.
+6. **Wrong-user fix = `--transfer`, not force.** `bun cli/index.js --transfer <uid> --to <handle>` moves the row + its owed to the correct user, audit-logged. There is no bypass path around the duplicate rule.
+7. **No credentials in SQLite by design.** `rows` stores `uid, source, row_no` — never cookie/fa2. Every worker re-reads `cookie + fa2_key` from the sheet via `readAccounts` at step 2. Source is matched by basename against `data/` + given paths (CLI-runner-friendly); a missing sheet fails the row loudly at step 2 instead of running on a stale cookie.
+
+Enforcement is two lines, not a subsystem: `enqueue` rejects up front (loud), `claimRow` joins `sold_guard` (Task 3) so a sold uid can never be handed out even for one second.
 
 ---
 
@@ -77,6 +91,7 @@ The uid comes from `c_user=(\d+)` in the cookie. `index.js` already exports the 
 | `--users` | Users, their counts, what they are owed. |
 | `--user <handle> --file <path>` | Submit that user's file. **Repeatable** — several files in one run. Session chosen automatically. |
 | `--user <handle> --file <path> --row <n>` | Submit one specific row. |
+| `--transfer <uid> --to <handle>` | Move a row to the correct user, audit-logged. The only fix for wrong-user. |
 | `--thread max \| <n>` | Workers to run. Default 1. `max` = every free session. |
 | `--balance` | Money from cache. Three tables. |
 | `--balance --refresh` | Read live balances, then report. |
@@ -138,7 +153,8 @@ CREATE TABLE rows (
   source          TEXT NOT NULL,           -- '2fa44.xlsx'
   row_no          INTEGER NOT NULL,
   status          TEXT NOT NULL DEFAULT 'queued',
-                  -- queued | claimed | inflight | approved | rejected | dead | gated
+                  -- queued | claimed | inflight | approved | rejected | dead | gated | half-used
+                  -- half-used = password changed but never delivered. Terminal, never retried.
   note            TEXT,
   new_password    TEXT,                    -- the password the provider issued. NEVER logged.
   claimed_by      TEXT,                    -- which session's worker
@@ -149,6 +165,9 @@ CREATE TABLE rows (
   verdict_at      TEXT,
   UNIQUE (source, row_no)
 );
+-- No cookie / fa2_key columns by design (decided): workers re-read them from
+-- the sheet via readAccounts at step 2. A row whose sheet moved fails loudly
+-- at step 2 instead of running on a stale cookie.
 CREATE INDEX rows_claim    ON rows(status, created_at) WHERE status = 'queued';
 CREATE INDEX rows_inflight ON rows(taskly_session, sent_at) WHERE status = 'inflight';
 CREATE INDEX rows_user     ON rows(user_id, status);
@@ -277,11 +296,11 @@ That warning is the point of the command. Owed is a liability; the balance is ca
 
 ### Task 1 — Export the engine functions the CLI needs
 
-`index.js` exports 33 symbols. Three it needs are not among them, so the CLI cannot drive a submit today.
+`index.js` exports 33 symbols. Six it needs are not among them, so the CLI cannot drive a submit today.
 
-**Files:** Modify `index.js` (three keywords) · Test `cli/engine.test.ts`
+**Files:** Modify `index.js` (six keywords) · Test `cli/engine.test.ts`
 
-**Produces:** `changeFacebook`, `walkForPassword` exported from `index.js`.
+**Produces:** `changeFacebook`, `walkForPassword`, `taskAvailability`, `mineChat`, `uidOf`, `readProviderBalance` exported from `index.js`.
 (`changePassword`, `Taskly`, `readAccounts`, `parseCookies`, `resolveUrl`, `checkUid`, `checkUids`, `isCookieDead`, `fingerprint`, `normalizePhone`, `listSessions`, `payoutBkt`, `OUR_CUT`, `MAX_USER_BKT`, `cachedRate`, `fetchRate` are already exported.)
 
 - [ ] **Step 1: Failing test**
@@ -293,6 +312,7 @@ import * as engine from "../index.js";
 
 test("the submission engine is importable", () => {
   for (const fn of ["changeFacebook", "walkForPassword", "taskAvailability",
+                    "mineChat", "uidOf", "readProviderBalance",
                     "changePassword", "readAccounts", "checkUid", "resolveUrl"]) {
     expect(typeof (engine as any)[fn]).toBe("function");
   }
@@ -301,7 +321,7 @@ test("the submission engine is importable", () => {
 ```
 
 - [ ] **Step 2: Run** `bun test cli/engine.test.ts` → FAIL, `changeFacebook` undefined.
-- [ ] **Step 3: Add `export `** to `changeFacebook`, `walkForPassword` and `taskAvailability` in `index.js`. Change nothing else.
+- [ ] **Step 3: Add `export `** to `changeFacebook`, `walkForPassword`, `taskAvailability`, `mineChat`, `uidOf`, `readProviderBalance` in `index.js`. Change nothing else.
 - [ ] **Step 4: Run** → PASS.
 - [ ] **Step 5: No regression:** `bun index.js --selftest` still passes; `bun test` green.
 - [ ] **Step 6: Commit** `git add index.js cli/engine.test.ts && git commit -m "feat: export the submission engine for the cli"`
@@ -358,7 +378,7 @@ test("exactly one step is marked FAIL when one fails", () => {
 ### Task 3 — `cli/store.js` — schema and queries
 
 **Files:** Create `cli/store.js`, `cli/store.test.ts`
-**Produces:** `open(file?)`, `migrate(s)`, `registerUser`, `listUsers`, `enqueue(s, rows, userId)`, `claimRow(s, session)`, `releaseRow`, `markSent(s, uid, session)`, `bindVerdict(s, session, verdict)`, `tryLock`, `unlock`, `holdLocks`, `claimPassword`, `recordPayment`, `owedFor`, `totals`, `sessionState`, `setSession`, `soldUids`, `userRows(s, userId, statuses)`
+**Produces:** `open(file?)`, `migrate(s)`, `registerUser`, `listUsers`, `enqueue(s, rows, userId) → { added, duplicates[], invalid[] }`, `transferRow(s, uid, toUserId)`, `claimRow(s, session)`, `releaseRow(s, uid, note?)`, `requeueStaleClaims(s, olderThanMinutes = 90)`, `markSent(s, uid, session)`, `markHalfUsed(s, uid, reason)`, `bindVerdict(s, session, verdict)`, `tryLock`, `unlock`, `holdLocks`, `claimPassword`, `recordPayment`, `owedFor`, `totals`, `sessionState`, `setSession`, `soldUids`, `userRows(s, userId, statuses)`
 
 - [ ] **Step 1: Failing tests**
 
@@ -372,24 +392,79 @@ test("a user registers once, case-insensitively", () => {
   expect(() => store.registerUser(s, "RAKIB")).toThrow(/already/i);
 });
 
-test("two cookies for one uid are one account, queued once", () => {
+test("two cookies for one uid are one account, blocked always, reported loudly", () => {
   const u = store.registerUser(s, "rakib");
-  const a = { uid: "1001", source: "x.xlsx", row_no: 1, cookie: "c_user=1001; a=1" };
-  const b = { uid: "1001", source: "y.xlsx", row_no: 5, cookie: "c_user=1001; a=2" };
+  const v = store.registerUser(s, "karim");
+  const a = { uid: "1001", source: "x.xlsx", row_no: 1 };
+  const b = { uid: "1001", source: "y.xlsx", row_no: 5 };
   expect(store.enqueue(s, [a], u.id).added).toBe(1);
-  expect(store.enqueue(s, [b], u.id).added).toBe(0);   // same ACCOUNT
+  const r = store.enqueue(s, [b], v.id);
+  expect(r.added).toBe(0);   // same ACCOUNT, even with a different cookie string
+  expect(r.duplicates).toHaveLength(1);
+  expect(r.duplicates[0].owner).toBe("rakib");   // loud: who owns it, where, what status
+});
+
+test("a cookie with no c_user is invalid, never queued", () => {
+  const u = store.registerUser(s, "rakib");
+  const r = store.enqueue(s, [{ uid: null, source: "x.xlsx", row_no: 9 }], u.id);
+  expect(r.added).toBe(0);
+  expect(r.invalid).toHaveLength(1);
+});
+
+test("sold_guard is permanent — no path around it", () => {
+  const u = store.registerUser(s, "rakib");
+  s.run("INSERT INTO sold_guard (uid) VALUES ('888')");
+  const r = store.enqueue(s, [{ uid: "888", source: "x", row_no: 1 }], u.id);
+  expect(r.added).toBe(0);   // no force flag exists; sold is never queueable
+});
+
+test("a wrong-user row moves only via transfer", () => {
+  const a = store.registerUser(s, "rakib");
+  const b = store.registerUser(s, "karim");
+  store.enqueue(s, [{ uid: "1001", source: "x.xlsx", row_no: 1 }], a.id);
+  store.transferRow(s, "1001", b.id);
+  expect(store.userRows(s, b.id, ["queued"])).toHaveLength(1);
+  expect(store.userRows(s, a.id, ["queued"])).toHaveLength(0);
+});
+
+test("a claim that failed before Telegram goes back on the queue", () => {
+  const u = store.registerUser(s, "rakib");
+  store.enqueue(s, [{ uid: "1001", source: "x.xlsx", row_no: 1 }], u.id);
+  store.claimRow(s, "A");
+  expect(store.releaseRow(s, "1001", "attempt failed before taskly saw it")).toBe(1);
+  expect(store.claimRow(s, "B").uid).toBe("1001");
+});
+
+test("a half-used row is terminal and never re-queued", () => {
+  const u = store.registerUser(s, "rakib");
+  store.enqueue(s, [{ uid: "1001", source: "x.xlsx", row_no: 1 }], u.id);
+  store.claimRow(s, "A");
+  store.markHalfUsed(s, "1001", "password changed, cookie never delivered");
+  expect(store.releaseRow(s, "1001")).toBe(0);
+  s.run("UPDATE rows SET claimed_at=datetime('now', '-3 hours') WHERE uid='1001'");
+  expect(store.requeueStaleClaims(s, 90)).toBe(0);
+  expect(store.claimRow(s, "B")).toBeNull();
+});
+
+test("a stale claim (dead worker, password untouched) goes back on the queue", () => {
+  const u = store.registerUser(s, "rakib");
+  store.enqueue(s, [{ uid: "1001", source: "x.xlsx", row_no: 1 }], u.id);
+  store.claimRow(s, "A");
+  s.run("UPDATE rows SET claimed_at=datetime('now', '-3 hours') WHERE uid='1001'");
+  expect(store.requeueStaleClaims(s, 90)).toBe(1);
+  expect(store.claimRow(s, "B").uid).toBe("1001");
 });
 
 test("two claims never return the same row", () => {
   const u = store.registerUser(s, "rakib");
-  store.enqueue(s, [1,2,3].map((n) => ({ uid: String(n), source: "x.xlsx", row_no: n, cookie: "c" })), u.id);
+  store.enqueue(s, [1,2,3].map((n) => ({ uid: String(n), source: "x.xlsx", row_no: n })), u.id);
   expect(store.claimRow(s, "A").uid).not.toBe(store.claimRow(s, "B").uid);
 });
 
 test("a verdict binds only to its own session's row", () => {
   const u = store.registerUser(s, "rakib");
-  store.enqueue(s, [{ uid: "1", source: "x", row_no: 1, cookie: "c" },
-                    { uid: "2", source: "x", row_no: 2, cookie: "c" }], u.id);
+  store.enqueue(s, [{ uid: "1", source: "x", row_no: 1 },
+                    { uid: "2", source: "x", row_no: 2 }], u.id);
   store.markSent(s, store.claimRow(s, "A").uid, "A");
   store.markSent(s, store.claimRow(s, "B").uid, "B");
   expect(store.bindVerdict(s, "B", "approved").uid).toBe("2");
@@ -409,16 +484,18 @@ test("one session is locked to one live pid; a dead pid releases", () => {
   expect(store.tryLock(s, "880", 2222)).toBe(true);
 });
 
-test("a sold uid is never claimable", () => {
+test("a sold uid is never claimable and never enqueued", () => {
   const u = store.registerUser(s, "rakib");
   s.run("INSERT INTO sold_guard (uid) VALUES ('777')");
-  store.enqueue(s, [{ uid: "777", source: "x", row_no: 1, cookie: "c" }], u.id);
+  const r = store.enqueue(s, [{ uid: "777", source: "x", row_no: 1 }], u.id);
+  expect(r.added).toBe(0);
+  expect(r.duplicates[0].where).toBe("sold_guard");
   expect(store.claimRow(s, "A")).toBeNull();
 });
 
 test("owed is derived, never stored", () => {
   const u = store.registerUser(s, "rakib");
-  store.enqueue(s, [{ uid: "1", source: "x", row_no: 1, cookie: "c" }], u.id);
+  store.enqueue(s, [{ uid: "1", source: "x", row_no: 1 }], u.id);
   store.markSent(s, "1", "A");
   store.bindVerdict(s, "A", "approved");
   expect(store.owedFor(s, u.id, 6.15).owed).toBeCloseTo(5);
@@ -428,9 +505,15 @@ test("owed is derived, never stored", () => {
 ```
 
 - [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement** the schema above. Two functions matter most, and both are **one statement**:
+- [ ] **Step 3: Implement** the schema above. Four functions matter most. `claimRow` and `bindVerdict` are **one statement** each; `enqueue` is loud by design; `releaseRow` + `requeueStaleClaims` + orphan rule close the kill gaps (see Task 7):
 
 ```js
+// enqueue returns { added, duplicates, invalid } — never silent.
+// duplicates[] = { uid, source, row_no, owner, ownerSource, ownerRow, status, where: 'rows'|'sold_guard' }.
+// invalid[] = rows with no uid (no c_user). No force flag: duplicates are never queueable.
+// Wrong-user fix is transferRow, the only move path.
+export function enqueue(s, rows, userId) { /* ... */ }
+
 export function claimRow(s, session) {
   // sold_guard is joined here, not filtered afterwards: a row that is already
   // sold must never be handed out even for one second.
@@ -450,6 +533,15 @@ export function bindVerdict(s, session, verdict) {
                       ORDER BY sent_at LIMIT 1)
     RETURNING uid, source, row_no, user_id`).get(verdict, session) ?? null;
 }
+
+// Gives a claim back when the row failed BEFORE Telegram ever saw it.
+// A row whose password was already changed NEVER comes back here —
+// it goes to 'half-used' via the orphan rule (Task 7), terminal.
+export function releaseRow(s, uid, note = null) { /* status='claimed' → 'queued' only */ }
+
+// Crash recovery: 'claimed' older than 90 min → 'queued'. Same threshold as
+// db.js requeueStaleClaims. 'half-used' and 'inflight' are never touched here.
+export function requeueStaleClaims(s, olderThanMinutes = 90) { /* ... */ }
 ```
 
 Single-process SQLite serialises writes, so no `SKIP LOCKED` is needed — an advantage over the Postgres version, not a compromise.
@@ -550,7 +642,7 @@ test("re-running the same sheet the same minute does not clobber", () => {
 ```
 
 - [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement.** Directory `data/cli/output/users/<handle>/<YYYY-MM-DD>/`. Filename `<source>-<HHMMSS>.xlsx` — **the timestamp is required**, because two runs of the same sheet on the same day must not overwrite each other.
+- [ ] **Step 3: Implement.** Directory `data/cli/output/users/<handle>/<YYYY-MM-DD>/`. Filename `<source>-<HHMMSS>.xlsx` — **the timestamp is required**, because two runs of the same sheet on the same day must not overwrite each other. Credentials (`cookie`, `2fa_key`) are re-read from the sheet via `readAccounts(source)` and joined on `row_no` — they are never in SQLite, so a moved sheet fails loudly here instead of writing a stale cookie.
 - [ ] **Step 4: Run** → PASS.
 - [ ] **Step 5: Confirm `.gitignore` covers `data/cli/output/` and `data/cli/cli.sqlite`** — these files contain live passwords.
 - [ ] **Step 6: Commit.**
@@ -572,9 +664,9 @@ test("re-running the same sheet the same minute does not clobber", () => {
 | 6 | key + cookie sent | `tg.sendRaw` ×2 + `press("confirm registration")` |
 | 7 | recorded | `store.markSent` |
 
-- [ ] **Step 1: Failing test** — a successful row renders seven `ok` steps; a failure marks exactly one and names it.
+- [ ] **Step 1: Failing test** — a successful row renders seven `ok` steps; a failure marks exactly one and names it. A row whose sheet moved fails at step 2 (`reading the sheet`), never further.
 - [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement.** **Reuse the engine. Copy no screen-matching logic.** On step 6 success: store `new_password`, then call `output.writeFor` before moving to the next row — so the password is on disk within seconds of being applied.
+- [ ] **Step 3: Implement.** **Reuse the engine. Copy no screen-matching logic.** Step 2 re-reads `cookie + fa2_key` from the sheet via `readAccounts(source)` joined on `row_no` (nothing credential-like lives in SQLite). Keep the live path's four guards on step 6: branch on `obeyRateLimit().waited`, check `isTaskCancelled`, require the cookie prompt, require the confirm prompt. Track `passwordChanged` per row exactly like `runGroup`: on any failure AFTER it is true, call `store.markHalfUsed` (terminal, never retried) — never `releaseRow`. On failure BEFORE Telegram ever saw the row, call `store.releaseRow` so the account goes back on the queue. Call `store.requeueStaleClaims(90)` once at worker startup so a hard-killed `claimed` row (password untouched) becomes queueable again; `half-used` and `inflight` are never touched by it. On step 6 success: store `new_password`, then call `output.writeFor` before moving to the next row — so the password is on disk within seconds of being applied.
 - [ ] **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit.**
 
@@ -587,7 +679,7 @@ test("re-running the same sheet the same minute does not clobber", () => {
 
 - [ ] **Step 1: Failing tests** — our cut is *measured*, not the 19% target; the warning fires when owed exceeds cash held.
 - [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement.** Without `--refresh`, read `session_state` only. With it, read balances **session by session, sequentially**, recording `rate_limit_until` on any limit.
+- [ ] **Step 3: Implement.** Without `--refresh`, read `session_state` only. With it, read balances **session by session, sequentially** via the engine's `readProviderBalance(tg)` (Task 1 export — never a copy; it returns `null` for unknown, never 0), recording `rate_limit_until` on any limit. Rate via `cachedRate`/`fetchRate`, price via `priceFromLabels` falling back to `settledPriceUsd`, split via `payoutBkt` — all engine imports.
 - [ ] **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit.**
 
@@ -597,7 +689,7 @@ test("re-running the same sheet the same minute does not clobber", () => {
 
 **Files:** Create `cli/index.js`, `cli/cli.test.ts`
 
-- [ ] **Step 1: Failing test** — arg parsing, including `--thread max` as a string and `--thread 2` as a number.
+- [ ] **Step 1: Failing test** — arg parsing, including `--thread max` as a string and `--thread 2` as a number, plus `--transfer <uid> --to <handle>`.
 - [ ] **Step 2: Run** → FAIL.
 - [ ] **Step 3: Implement** parse → dispatch → one error handler. **No `console.log` below the renderer.**
 - [ ] **Step 4: Run** → PASS.
@@ -615,24 +707,26 @@ Measured 2026-09-30: the provider's history **does** return messages — 603 and
 So the CLI walks each session's chat on startup, counts what it finds, and reconciles.
 
 **Files:** Create `cli/reconcile.js`, `cli/reconcile.test.ts`
-**Consumes:** `mineChat(tg)` — the same paging function that made `--count-from-chat` work
-**Produces:** `mineChat(tg, maxPages)`, `catchUp(s, session) → { found, matched, surplus }`, `run(s, sessions)`
+**Consumes:** `mineChat(tg, maxPages)` imported from `index.js` (Task 1) — the same paging function that made `--count-from-chat` work, never a copy. In tests the `tg` is a fake `{ client: { getMessages }, peer }`; the walk itself is never reimplemented.
+**Produces:** `catchUp(s, session) → { found, matched, surplus }`, `run(s, sessions)`
 
 **Two facts about this that must not be forgotten — both were measured, not reasoned about:**
 
-1. **`offsetId`, never `minId`.** `minId` returns the *same newest messages again*, so the walk never advances and reports one page no matter how many were requested. The first version of `--count-from-chat` had this bug and reported "1 approved" over 603 scanned messages.
-2. **Keep the first non-blank banner.** The provider's confirmation appears and vanishes within about a second; keeping the *last* value lets a blank overwrite the evidence. That is what made a real password change read as unconfirmed and lost row 25.
+1. **`offsetId`, never `minId`.** `minId` returns the *same newest messages again*, so the walk never advances and reports one page no matter how many were requested. The first version of `--count-from-chat` had this bug and reported "1 approved" over 603 scanned messages. (Engine-owned inside `mineChat`; the CLI only wraps it.)
+2. **Keep the first non-blank banner.** The provider's confirmation appears and vanishes within about a second; keeping the *last* value lets a blank overwrite the evidence. That is what made a real password change read as unconfirmed and lost row 25. (Engine-owned inside `changePassword`, pinned by `--selftest`; stated here because the submit worker depends on it.)
 
 - [ ] **Step 1: Failing tests**
 
 ```ts
+// fakeTg mimics the engine's tg surface: { client: { getMessages(peer, opts) }, peer }.
+// 250 inbound "Report approved" messages over 3 pages proves the walk advances past page one.
 test("a page walk reaches past the first hundred messages", () => {
-  expect(mineChat(fakeChat(250)).messages).toBeGreaterThan(100);
+  expect(mineChat(fakeTg(250), 10).messages).toBeGreaterThan(100);
 });
 
-test("a blank banner never overwrites a real one", () => {
-  expect(keepFirst(["Your password is shown", "", ""])).toBe("Your password is shown");
-});
+// NOTE: the first-non-blank-banner rule lives in the engine's changePassword
+// and is already pinned by `bun index.js --selftest`. reconcile.js never touches
+// banners, so no banner test belongs here.
 
 test("an approval found in the chat binds to an inflight row", () => {
   expect(catchUp(s, "A").matched).toBe(1);
@@ -650,8 +744,8 @@ test("a chat with fewer verdicts than inflight rows changes nothing", () => {
 ```
 
 - [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement `mineChat`.** Page with `offsetId`, `CHAT_PAGE = 100`, inbound only (`!m.out`), tally `approved` / `rejected` / `submitted` and the approved dollar total.
-- [ ] **Step 4: Implement `catchUp`.** Compare the chat's counts to the ledger **per session**. When the chat has more approvals than the ledger, bind the difference to the oldest `inflight` rows **for that session only**. When it has fewer, do nothing and say so. Never bind across sessions — that is the 38-vs-37 bug in its original form.
+- [ ] **Step 3: Implement `catchUp`, wrapping the engine's `mineChat`.** Do NOT reimplement the walk: call the imported `mineChat(tg, maxPages)` (`offsetId` paging, `CHAT_PAGE = 100`, inbound only `!m.out`, tally `approved` / `rejected` / `submitted` + approved dollar total — all engine-owned). `catchUp` only compares per session and binds.
+- [ ] **Step 4: Implement `catchUp`.** Compare the chat's counts to the ledger **per session**. When the chat has more approvals than the ledger, bind the difference to the oldest `inflight` rows **for that session only** — capped at `inflight` count; anything beyond is `surplus`, reported and never attached, never paid. When it has fewer, do nothing and say so. Never bind across sessions — that is the 38-vs-37 bug in its original form.
 - [ ] **Step 5: Wire it** into `--reconcile` and into the start of every submit run.
 - [ ] **Step 6: Run** `bun test` → PASS.
 - [ ] **Step 7: Prove it against the real account.** `bun cli/index.js --reconcile` must report **38** approved for `...1929` and **24** for `...2634`. Those are the numbers that settled 38-vs-37; anything else means the walk or the binding is wrong.
@@ -667,22 +761,36 @@ test("a chat with fewer verdicts than inflight rows changes nothing", () => {
 
 ```ts
 // cli/seed-sold.ts — one-time. Run once, then delete the script.
-const sold = new Set(
+const base = (p) => String(p ?? "").split(/[\\/]/).pop();   // sent.jsonl sometimes
+const sold = new Set(                                        // stores a full path
   fs.readFileSync("data/out/sent.jsonl", "utf8").split(/\r?\n/).filter(Boolean)
-    .map((l) => { const r = JSON.parse(l); return `${r.source}:${r.row}`; }));
+    .map((l) => { const r = JSON.parse(l); return `${base(r.source)}:${r.row}`; }));
 
 for (const file of ["2fa49.xlsx", "2fa100.xlsx", "2fa44.xlsx"]) {
   for (const a of readAccounts(file)) {
-    if (!sold.has(`${file}:${a.row}`)) continue;
+    if (!sold.has(`${base(file)}:${a.row}`)) continue;
+    const uid = uidOf(a.cookie);
+    if (!uid) { console.log(`SKIP (no c_user, never sellable): ${file}:${a.row}`); continue; }
     db.prepare("INSERT OR IGNORE INTO sold_guard (uid, source, row_no, at) VALUES (?,?,?,?)")
-      .run(uidOf(a.cookie), file, a.row, new Date().toISOString());
+      .run(uid, base(file), a.row, new Date().toISOString());
   }
 }
 ```
 
-Plus **the accounts that exist only in Postgres** — read them out **before** Postgres is retired. Recount immediately before running and print what was inserted; the number is rising as the current runs finish.
+Plus **the accounts that exist only in Postgres** — read them out **before** Postgres is retired:
 
-- [ ] **Step 1: Failing test** — a uid in `sold_guard` is never claimable. *(Already covered in Task 3; this task adds the seeding.)*
+```sql
+SELECT fp, source, row_no, cookie FROM sheet_rows
+ WHERE status IN ('inflight','approved','rejected');
+```
+
+Join each row back to its sheet via `(basename(source), row_no)` and take `uidOf(cookie)`. Two fallbacks, both loud:
+- `cookie` is `''` (adopted rows sent before the ledger existed) → uid is unrecoverable from the DB. Re-read the sheet at `(source, row_no)`; if the sheet no longer has that row, print `UNRECOVERABLE fp <fp> (<source>:<row>)` — the operator resolves it by hand and inserts into `sold_guard` directly. Never guess, never skip silently.
+- sheet row missing or uid-less → same `UNRECOVERABLE` line.
+
+Recount immediately before running and print what was inserted; the number is rising as the current runs finish. Skip rows with no `c_user` — they are invalid and were never sellable.
+
+- [ ] **Step 1: Failing test** — a uid in `sold_guard` is never claimable and never enqueued, no exceptions. *(Already covered in Task 3; this task adds the seeding.)*
 - [ ] **Step 2: Write `cli/seed-sold.ts`**, join on `(source, row)`.
 - [ ] **Step 3: Run it once.** Print the count. Cross-check against the ledger: it must be **at least** the number of `inflight` rows in Postgres, or the join missed something.
 - [ ] **Step 4: Verify** `bun cli/index.js --queue` shows no sold uid as `queued`.
@@ -698,10 +806,10 @@ Plus **the accounts that exist only in Postgres** — read them out **before** P
 3. **Two ledgers will exist, and they will disagree.** `index.js` writes Postgres; `cli/` writes SQLite. Neither can see the other's rows. That is the accepted cost of keeping both, and it is why **`--reconcile` and `--count-from-chat` matter more than usual** — they are the only way to know the truth when the two disagree. Pick one tool per account: an account submitted by `index.js` should not also be submitted by `cli/`, and `sold_guard` (Task 11) is what stops the overlap.
 4. **Retire Postgres only when you stop using `index.js` for submitting.** Nothing requires it.
 
-## Still open
+## Decided (was: Still open)
 
-1. **`data/cli/.env`** — assumed to hold the Telegram `TG_API_ID` / `TG_API_HASH` / `TG_PHONE` and the Facebook current password. The CLI reads its own copy of the session files, but the API credentials are the same.
-2. **`--stale` sweep** — rows the provider never rules on currently stay `inflight` for ever. Task 10 catches up on verdicts that *arrived*; it does nothing for a row that was never ruled on at all.
-3. **Whether `--reconcile` may run during an active submit.** Same reasoning as `--balance`: a history walk is Telegram traffic. The plan runs it at the start of a run and on demand, and refuses it mid-run unless forced.
+1. **`data/cli/.env` — copy, same keys.** `TG_API_ID`, `TG_API_HASH`, `TG_PHONE`, `TG_TARGET`, `FB_CURRENT_PASSWORD`, `TARGET_URL`, `COOKIE_DOMAIN`, `CHECK_URL`, `TASK_GROUP`, `TASK_NAME`, `BDT_RATE`. Same values as `data/.env`; only the path differs so the CLI never depends on the root env. Session files are still copied to `data/cli/sessions/`, never shared.
+2. **No `--stale` sweep.** Rows the provider never rules on stay `inflight` for ever (decided). Task 10 catches up on verdicts that *arrived*; a row never ruled on is a liability the report keeps visible, not a status the tool invents. Owed stays derived from approvals only, so a stuck `inflight` never pays.
+3. **`--reconcile` and `--balance --refresh` refuse mid-run unless `--allow-mid-run` is passed.** Same reasoning for both: history walk / balance read is Telegram traffic on the same chat and can extend a provider rate limit. (`--force` is deliberately NOT reused here — it was removed from the duplicate scope, so reusing the name would invite a bypass misunderstanding.) The plan runs reconcile at the start of every submit run and on demand. `--allow-mid-run` overrides with a warning, and the override is audit-logged.
 
 

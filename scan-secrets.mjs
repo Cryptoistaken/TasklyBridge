@@ -9,14 +9,14 @@
 // It reports how many files it actually READ. A scan that silently reads
 // nothing and prints "0 leaks" is worse than no scan, because it is believed.
 //
-//   bun Tool/scan-secrets.mjs            scan what git would stage
-//   bun Tool/scan-secrets.mjs --staged   scan the index only (use in a hook)
+//   bun scan-secrets.mjs            scan what git would stage
+//   bun scan-secrets.mjs --staged   scan the index only (use in a hook)
 //
 // Exits 1 on any finding, so a commit hook can stop on it.
 import fs from "node:fs";
 import path from "node:path";
 
-const ROOT = path.resolve(import.meta.dir, "..");
+const ROOT = import.meta.dir;
 const stagedOnly = process.argv.includes("--staged");
 
 function git(args) {
@@ -42,7 +42,7 @@ const SECRET_KEYS = new Set([
   "TG_SESSION", "WITHDRAW_WALLET", "WEBHOOK_SECRET", "TG_PHONE",
 ]);
 const secrets = new Map();
-for (const rel of ["Tool/data/.env", "Backend/.env"]) {
+for (const rel of ["data/.env", "Backend/.env"]) {
   const f = path.join(ROOT, rel);
   if (!fs.existsSync(f)) continue;
   for (const line of fs.readFileSync(f, "utf8").split(/\r?\n/)) {

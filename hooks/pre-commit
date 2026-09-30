@@ -1,5 +1,5 @@
 #!/bin/sh
-# Pre-commit secret scan. Installed via `git config core.hooksPath Tool/hooks`,
+# Pre-commit secret scan. Installed via `git config core.hooksPath hooks`,
 # so it is version-controlled instead of living in .git/ where it is invisible
 # to review and lost on re-clone.
 #
