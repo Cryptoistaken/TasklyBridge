@@ -1426,25 +1426,27 @@ async function selftest() {
   // itself - only the child that actually talks to Telegram may. A parent that
   // locks would make every child refuse to start, and the run would do nothing
   // with a perfectly clear error nobody reads.
-  if (/runBatch[\s\S]{0,900}holdSessionLock/.test(prod)) {
+  if (/runBatch[\s\S]{0,900}(holdSessionLock|acquire\(phone\))/.test(prod)) {
     log.error("selftest: runBatch takes the session lock, so every child it spawns will refuse to start"); bad++;
   }
   // And the lock must be taken BEFORE the session opens, and released on every
   // exit path - a lock never released is a session nobody else can ever use.
-  if (!/holdSessionLock/.test(prod)) {
+  // Either spelling counts: the Postgres advisory lock or the shared lock file
+  // both tools honour (cli/lock.js).
+  if (!/holdSessionLock|cli\/lock\.js/.test(prod)) {
     log.error("selftest: nothing takes the telegram session lock - two processes on one session will eat each other's replies"); bad++;
   }
   // Order matters and a plain "both exist" test cannot see it: the lock must be
   // taken BEFORE Taskly.open, or there is a window in which a second process
   // opens the same session and both are live at once. So the check is positional -
   // the LAST take of the lock must come before the FIRST open in the guarded path.
-  const lockAt = prod.lastIndexOf("holdSessionLock");
+  const lockAt = Math.max(prod.lastIndexOf("holdSessionLock"), prod.lastIndexOf("acquire(phone)"));
   const openAfter = prod.indexOf("Taskly.open", lockAt);
   if (lockAt === -1 || openAfter === -1) {
     log.error("selftest: cannot find the session lock and the session open, so their order is unchecked"); bad++;
   } else {
     const between = prod.slice(lockAt, openAfter);
-    if (!/holdSessionLock\(/.test(between)) {
+    if (!/(holdSessionLock|acquire)\(/.test(between)) {
       log.error("selftest: the session lock is taken AFTER the session opens - there is a window with two processes on one session"); bad++;
     }
   }
@@ -3490,9 +3492,10 @@ async function runGroup(group, args, phone, pre = {}) {
   // ONE TELEGRAM SESSION, ONE PROCESS. Telegram delivers updates to exactly one
   // consumer of a session: two processes on the same MTProto session do not share
   // the work, they fight over it, and the loser reads the winner's messages as
-  // its own replies. A Postgres advisory lock says "stop" here, with no lock file
-  // to go stale and no manual cleanup after a crash.
-  const lock = args.includes("--no-session-lock") ? { session: phone, release: async () => {} } : await (await import("./db.js")).holdSessionLock(phone);
+  // its own replies. One shared lock file says "stop" here
+  // (data/locks/<phone>.lock, honoured by index.js and cli/ alike) — a lock
+  // whose pid is dead is taken over, so no manual cleanup after a crash.
+  const lock = args.includes("--no-session-lock") ? { session: phone, release: async () => {} } : (await import("./cli/lock.js")).acquire(phone);
   if (!lock) {
     log.error(`Session ${phone} is already in use by another process.`);
     log.error("Two processes on one Telegram session fight over its messages and each loses replies.");
