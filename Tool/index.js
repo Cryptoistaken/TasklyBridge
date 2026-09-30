@@ -512,6 +512,8 @@ async function taskAvailability(tg) {
     const listed = all.filter((l) => l.toLowerCase().includes(JOB.toLowerCase()));
     return { on: listed.length > 0, listed, all };
   } catch (e) {
+    const flood = floodWaitSeconds(e);
+    if (flood) return { on: null, rateLimited: true, waitSec: flood, listed: [], why: e?.message ?? String(e) };
     return { on: null, listed: [], why: e?.message ?? String(e) };
   }
 }
@@ -1340,6 +1342,49 @@ async function selftest() {
   if (floodWaitSeconds(new Error("You are making requests too often. Please wait 9 sec.")) !== 0) {
     log.error("selftest: the provider's rate limit was read as a telegram flood wait"); bad++;
   }
+  // THE 2026-09-30 RUN. A flood thrown DURING the availability check (the knock
+  // itself throws, so obeyRateLimit never sees it) was caught as `on: null` -
+  // "could not tell" - and the child carried on into the wall, died on the next
+  // send, exited 1, and the parent spawned all 21 groups into the same flood.
+  // A thrown flood during setup is a stop, never uncertainty.
+  {
+    const throwing = {
+      obeyRateLimit: async (r) => r,
+      ensureMainMenu: async () => { throw new Error("A wait of 271 seconds is required (caused by messages.SendMessage)"); },
+      press: async () => [],
+    };
+    const fa = await taskAvailability(throwing);
+    if (!fa.rateLimited || fa.waitSec !== 271) {
+      log.error(`selftest: a flood thrown during the availability check gave rateLimited=${!!fa.rateLimited} waitSec=${fa.waitSec} - it must stop the run, not carry on`);
+      bad++;
+    }
+  }
+  // Auto-wait, not re-run. A flood thrown by send must be waited out inside the
+  // exchange and the SAME send retried - the 2026-09-30 run exited instead, and
+  // the parent spawned all 21 groups into the same wall. Fails on old code: the
+  // first send throws and the exchange rejects instead of returning the reply.
+  {
+    const t = new Taskly(null);
+    let captured = null;
+    t.client = { addEventHandler: (h) => { captured = h; }, removeEventHandler: () => { captured = null; } };
+    const peer = new Api.PeerUser({ userId: 7 });
+    t.peer = peer;
+    let sends = 0;
+    const replied = t._exchange("selftest-flood", async () => {
+      sends++;
+      if (sends === 1) throw new Error("A wait of 1 seconds is required (caused by messages.SendMessage)");
+    });
+    setTimeout(() => {
+      if (!captured) return;
+      const msg = new Api.Message({ id: 1, peerId: peer, message: "Balance", out: false });
+      captured(new Api.UpdateNewMessage({ message: msg, pts: 1, ptsCount: 1 }));
+    }, 3000);
+    const got = await replied;
+    if (sends !== 2 || !got.some((r) => /balance/i.test(r))) {
+      log.error(`selftest: the flood was not waited out and retried (sends=${sends}, replies=${JSON.stringify(got).slice(0, 80)})`);
+      bad++;
+    } else log.info("selftest: a telegram flood is waited out and the same send retried");
+  }
   // The batch parent MUST branch on the rate-limit exit code. A parent that only
   // records the failure is what turned one rate limit into 22 dead groups.
   //
@@ -1364,6 +1409,18 @@ async function selftest() {
   if (!prod) { log.error("selftest: the static-check region came out empty, so the greps below prove nothing"); bad++; }
   if (!/r\.status === EXIT_RATE_LIMITED/.test(prod)) {
     log.error("selftest: the batch parent has no circuit breaker - one rate limit would spawn every remaining group into it"); bad++;
+  }
+  // THE 2026-09-30 RUN. Two more holes from the same flood: the menu reset after
+  // the availability check threw outside the per-row handler (exit 1, so the
+  // parent kept spawning), and the top-level handler itself exited 1 on any
+  // setup flood. Both must exit 75 so the parent stops the whole run.
+  // The needle is the setup path's own log line - `floodWaitSeconds(e)` alone
+  // already existed in the per-row reset handler, so it would pass on old code.
+  if (!/Nothing was spent and no row was started/.test(prod)) {
+    log.error("selftest: a telegram flood during setup does not stop the run with the rate-limit code - the parent will spawn every group into the wall"); bad++;
+  }
+  if (!/floodWaitSeconds\(err\) \? EXIT_RATE_LIMITED/.test(prod)) {
+    log.error("selftest: the top-level handler exits 1 on a setup flood instead of the rate-limit code - the parent will not stop"); bad++;
   }
   // The batch parent SPAWNS children, so it must NOT hold the session lock
   // itself - only the child that actually talks to Telegram may. A parent that
@@ -2116,7 +2173,28 @@ export class Taskly {
     };
     this.client.addEventHandler(handler);
     return (async () => {
-      try { await send(); hard = setTimeout(done, HARD_MS); await finished; }
+      try {
+        // Telegram's flood wait arrives as a THROWN error from send, so it never
+        // reaches obeyRateLimit (which only reads replies). Wait out exactly what
+        // was asked, then retry the same send - nothing was delivered, so nothing
+        // is lost and no row needs re-running. Anything that arrived while we had
+        // sent nothing cannot be this exchange's reply, so it is dropped here
+        // (the permanent verdict watcher still records verdicts separately).
+        for (;;) {
+          try { await send(); break; }
+          catch (e) {
+            const flood = floodWaitSeconds(e);
+            if (!flood) throw e;
+            const winMark = this._window.length;
+            log.warn(`Telegram flood limit: waiting ${flood}s as instructed, then retrying ${what}`);
+            audit({ leg: "internal", what: "telegram-flood-wait", waitSec: flood });
+            await sleep(flood * 1000 + 500);
+            got.length = 0;
+            this._window.length = winMark;
+          }
+        }
+        hard = setTimeout(done, HARD_MS); await finished;
+      }
       finally { clearTimeout(idle); clearTimeout(hard); this.client.removeEventHandler(handler); }
       return got;
     })();
@@ -3439,9 +3517,9 @@ async function runGroup(group, args, phone, pre = {}) {
   if (!args.includes("--skip-task-check")) {
     const avail = await taskAvailability(tg);
     if (avail.rateLimited) {
-      log.error(`Provider rate limit: it asked for ${avail.waitSec}s before the next message.`);
+      log.error(`Rate limited: asked for ${avail.waitSec}s before the next message (${avail.why}).`);
       log.error(`Nothing was spent and no row was started. Wait ${avail.waitSec}s, then re-run the same command.`);
-      log.error("This is NOT 'could not tell' - the provider answered, and the answer was 'stop'.");
+      log.error("This is NOT 'could not tell' - the answer was 'stop'.");
       await tg.close();
       await lock.release();
       return EXIT_RATE_LIMITED;
@@ -3458,7 +3536,22 @@ async function runGroup(group, args, phone, pre = {}) {
     if (avail.on === null) log.warn(`Could not confirm the job is listed (${avail.why}) - carrying on anyway`);
     else log.success(`Job is listed: ${avail.listed.join(" | ")}`);
     // The check leaves us sitting on the job list; the walk expects the menu.
-    await tg.ensureMainMenu();
+    // This send can itself hit Telegram's flood (the availability check just
+    // did several). Uncaught it bubbles to the top handler as exit 1 and the
+    // parent spawns every remaining group into the same wall - the 2026-09-30
+    // run did exactly that 21 times. A flood here is the run's stop, code 75.
+    try {
+      await tg.ensureMainMenu();
+    } catch (e) {
+      const flood = floodWaitSeconds(e);
+      if (flood) {
+        log.error(`Telegram flood limit: ${flood}s. Nothing was spent and no row was started. Re-run the same command after the wait.`);
+        await tg.close();
+        await lock.release();
+        return EXIT_RATE_LIMITED;
+      }
+      throw e;
+    }
   }
   let ok = 0;
   const failed = [];
@@ -3798,6 +3891,10 @@ if (isMain) {
         : "Failed before any row was started - nothing was spent and nothing to record.");
     }
     if (!(err instanceof BailLogged)) log.error(err.message);
-    process.exit(1);
+    // A flood thrown during setup (open, availability check, menu reset) never
+    // reaches the per-row handler - it lands here with no row started. Exiting 1
+    // tells the batch parent "one group failed", so it spawns the next group
+    // into the same wall. Exit 75 and the parent stops the whole run instead.
+    process.exit(floodWaitSeconds(err) ? EXIT_RATE_LIMITED : 1);
   });
 }
