@@ -334,3 +334,22 @@ export function sessionState(s, phone = null) {
 export function soldUids(s) {
   return new Set(s.query("SELECT uid FROM sold_guard").all().map((r) => r.uid));
 }
+
+export function userCounts(s, userId) {
+  const c = {};
+  for (const r of s.query("SELECT status, count(*) AS n FROM rows WHERE user_id=? GROUP BY status").all(userId)) {
+    c[r.status] = Number(r.n);
+  }
+  return c;
+}
+
+export function paidFor(s, userId) {
+  const r = s.query("SELECT count(*) AS n, COALESCE(sum(amount_bkt),0) AS t FROM payments WHERE user_id=?").get(userId);
+  return { count: Number(r?.n ?? 0), total: Number(r?.t ?? 0) };
+}
+
+export function queueDetail(s) {
+  return s.query(`SELECT r.uid, u.handle, r.source, r.row_no, r.status, r.claimed_by, r.taskly_session
+       FROM rows r JOIN users u ON u.id = r.user_id
+      WHERE r.status IN ('queued','claimed','inflight') ORDER BY r.created_at`).all();
+}

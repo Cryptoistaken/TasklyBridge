@@ -25,6 +25,22 @@ export function holder(phone) {
   } catch { return null; }
 }
 
+// Live cross-tool holders, for refusing Telegram traffic mid-run. Stale
+// (dead pid) files are someone else's cleanup, not an active run.
+export function liveHolders() {
+  let files = [];
+  try {
+    files = fs.readdirSync(process.env.CLI_LOCK_DIR ?? lockDir).filter((f) => f.endsWith(".lock"));
+  } catch { return []; }
+  const out = [];
+  for (const f of files) {
+    const phone = f.slice(0, -".lock".length);
+    const pid = holder(phone);
+    if (pid != null && isAlive(pid)) out.push({ phone, pid });
+  }
+  return out;
+}
+
 const handle = (phone) => {
   let out = false;
   return {

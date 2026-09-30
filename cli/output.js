@@ -6,12 +6,13 @@ import { readAccounts, uidOf } from "../index.js";
 import { userRows } from "./store.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const outRoot = path.join(here, "..", "data", "cli", "output");
+// CLI_OUTPUT_DIR exists for tests only, so the suite never writes real output.
+const outRoot = () => process.env.CLI_OUTPUT_DIR ?? path.join(here, "..", "data", "cli", "output");
 const base = (p) => String(p ?? "").split(/[\\/]/).pop();
 
 export function outputDir(handle, date = new Date()) {
   const day = (date instanceof Date ? date : new Date(date)).toISOString().slice(0, 10);
-  return path.join(outRoot, "users", String(handle), day);
+  return path.join(outRoot(), "users", String(handle), day);
 }
 
 // Rewrites the user's file for one source from what SQLite says succeeded.
